@@ -1,0 +1,76 @@
+name = "packkit"
+version = "0.1.0"
+description = "Archive, compression, and recipe planning primitives for Gleam on Erlang and JavaScript targets"
+licences = ["MIT"]
+repository = { type = "github", user = "nao1215", repo = "packkit" }
+links = [
+  { title = "Repository", href = "https://github.com/nao1215/packkit" },
+  { title = "Documentation", href = "https://hexdocs.pm/packkit" },
+  { title = "Changelog", href = "https://github.com/nao1215/packkit/blob/main/CHANGELOG.md" },
+  { title = "Specification", href = "https://github.com/nao1215/packkit/blob/main/doc/reference/spec.md" },
+]
+internal_modules = [
+  "packkit/internal",
+  "packkit/internal/*",
+]
+gleam = ">= 1.15.0"
+
+[dependencies]
+gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
+glinter = ">= 2.14.0 and < 3.0.0"
+metamon = ">= 0.8.0 and < 2.0.0"
+
+[tools.glinter]
+warnings_as_errors = true
+include = ["src/", "test/"]
+
+[tools.glinter.rules]
+label_possible = "off"
+unused_exports = "off"
+
+[tools.glinter.ignore]
+"test/**/*.gleam" = [
+  "assert_ok_pattern",
+  "missing_type_annotation",
+  "short_variable_name",
+  "unused_exports",
+]
+"src/packkit/detect.gleam" = ["deep_nesting"]
+"src/packkit/entry.gleam" = ["avoid_panic", "thrown_away_error"]
+"src/packkit/level.gleam" = ["avoid_panic"]
+"src/packkit/limit.gleam" = ["avoid_panic"]
+"src/packkit/ar.gleam" = [
+  "assert_ok_pattern",
+  "deep_nesting",
+  "prefer_guard_clause",
+]
+"src/packkit/cpio.gleam" = [
+  "assert_ok_pattern",
+  "prefer_guard_clause",
+]
+"src/packkit/checksum.gleam" = ["short_variable_name"]
+"src/packkit/deflate.gleam" = [
+  "assert_ok_pattern",
+  "discarded_result",
+  "prefer_guard_clause",
+  "short_variable_name",
+]
+"src/packkit/gzip.gleam" = [
+  "assert_ok_pattern",
+  "discarded_result",
+]
+"src/packkit/tar.gleam" = [
+  "assert_ok_pattern",
+  "prefer_guard_clause",
+  "thrown_away_error",
+]
+"src/packkit/zip.gleam" = [
+  "prefer_guard_clause",
+  "thrown_away_error",
+]
+"src/packkit/zlib.gleam" = [
+  "assert_ok_pattern",
+]
