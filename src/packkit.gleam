@@ -13,6 +13,7 @@ import packkit/deflate
 import packkit/detect
 import packkit/error
 import packkit/gzip
+import packkit/lz4
 import packkit/recipe
 import packkit/tar
 import packkit/zip as zip_archive
@@ -57,6 +58,7 @@ pub fn compress(
     "deflate" -> deflate.encode(bytes: bytes)
     "zlib" -> zlib.encode(bytes: bytes)
     "gzip" -> gzip.encode(bytes: bytes, header: gzip.default_header())
+    "lz4-frame" -> lz4.encode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
@@ -73,6 +75,7 @@ pub fn decompress(
     "gzip" ->
       gzip.decode(bytes: bytes)
       |> result.map(fn(decoded) { decoded.payload })
+    "lz4-frame" -> lz4.decode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }
