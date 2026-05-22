@@ -7,7 +7,6 @@ links = [
   { title = "Repository", href = "https://github.com/nao1215/packkit" },
   { title = "Documentation", href = "https://hexdocs.pm/packkit" },
   { title = "Changelog", href = "https://github.com/nao1215/packkit/blob/main/CHANGELOG.md" },
-  { title = "Specification", href = "https://github.com/nao1215/packkit/blob/main/doc/reference/spec.md" },
 ]
 internal_modules = [
   "packkit/internal",

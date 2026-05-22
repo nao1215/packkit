@@ -26,17 +26,12 @@ the current shell.
 
 ## Project status
 
-This repository is currently **spec-first**:
+Implemented engines: checksum (Adler-32, CRC-32), tar, cpio (newc), ar,
+zip (stored), deflate (full decoder, stored-only encoder), zlib, gzip.
 
-- the public API shape is present and compiles
-- the safety model is defined
-- many encode/decode operations still return typed
-  `*NotImplemented` errors
-
-Before implementing a new family, read
-[`doc/reference/spec.md`](doc/reference/spec.md). That document is the
-source of truth for module ownership, invariants, and implementation
-order.
+Pending engines (lz4, snappy, bzip2, xz, brotli, zstd, 7z, ZIP deflate
+method, Huffman-coded DEFLATE encoder) return typed `*NotImplemented`
+errors from the facade.
 
 ## Running checks
 
@@ -61,11 +56,8 @@ You can also run individual steps:
 
 ## Project structure
 
-- `src/` contains the public library surface and the early scaffolding
-  modules
-- `test/` contains the `gleeunit` smoke tests
-- `doc/reference/spec.md` is the implementation contract for future
-  contributors
+- `src/` contains the public library surface and codec engines
+- `test/` contains the `gleeunit` unit tests
 - `scripts/lib/mise_bootstrap.sh` makes the mise-managed toolchain
   visible to `just` and shell scripts
 

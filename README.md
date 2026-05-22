@@ -1,18 +1,7 @@
 # packkit
 
-`packkit` is a spec-first Gleam library for archive, compression, and
-container workflows on the Erlang and JavaScript targets.
-
-The repository now contains:
-
-- a compileable cross-target project scaffold
-- an opaque-first public API skeleton
-- a detailed implementation spec for follow-up LLM or human work
-
-Most encode/decode operations are intentionally stubbed and currently
-return typed `*NotImplemented` errors. That is deliberate: the goal of
-this first step is to lock in the API shape, safety model, module
-boundaries, and implementation order before the heavy codec work begins.
+`packkit` is a Gleam library for archive, compression, and container
+workflows on the Erlang and JavaScript targets.
 
 ## Design stance
 
@@ -28,12 +17,28 @@ recipes just because they may compress their members internally.
 
 ## Status
 
-- Path-safe `Entry` constructors are implemented.
-- `Codec`, `ArchiveFormat`, `Archive`, `Recipe`, `Limits`, and
-  `Detected` are opaque and documented.
-- Filename-based detection works for common extensions.
-- The implementation roadmap lives in
-  [`doc/reference/spec.md`](doc/reference/spec.md).
+Implemented codecs and archive families:
+
+- **checksum**: Adler-32 and CRC-32
+- **tar**: USTAR encode/decode (regular files, directories, symlinks,
+  hardlinks, prefix/name split)
+- **cpio**: newc encode/decode
+- **ar**: BSD long-name encode/decode
+- **zip**: stored-method encode/decode with CRC-32 verification
+- **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
+  encoder currently emits stored blocks only
+- **zlib**: RFC 1950 wrapper with Adler-32 trailer
+- **gzip**: RFC 1952 wrapper with header metadata and CRC/ISIZE
+  verification
+
+The facade (`packkit.compress`, `packkit.decompress`, `packkit.read`,
+`packkit.write`, `packkit.pack`, `packkit.unpack`) is wired to these
+engines.  Filename- and byte-signature-based detection are both
+available.
+
+Pending codecs (`lz4`, `snappy`, `bzip2`, `xz`, `brotli`, `zstd`),
+`7z`, ZIP deflate method, and a Huffman-coded DEFLATE encoder return
+typed `*NotImplemented` errors.
 
 ## Install
 
@@ -41,10 +46,9 @@ recipes just because they may compress their members internally.
 gleam add packkit
 ```
 
-## Current examples
+## Examples
 
-The constructors already work and are intended to be the stable shape
-future implementations fill in:
+### Build and inspect an archive
 
 ```gleam
 import packkit/recipe
@@ -62,12 +66,36 @@ pub fn build_plan() {
 }
 ```
 
-The actual archive and codec engines are still pending, so calls such as
-`packkit.pack`, `packkit.unpack`, `packkit.compress`, and
-`packkit.decompress` currently return typed `NotImplemented` errors.
+### Pack a tar.gz
+
+```gleam
+import packkit
+import packkit/recipe
+import packkit/tar
+
+pub fn build_tar_gz() {
+  let archive =
+    tar.new()
+    |> tar.add_file("hello.txt", <<"hello":utf8>>)
+    |> tar.add_file("world.txt", <<"world":utf8>>)
+
+  let assert Ok(bytes) =
+    packkit.pack(archive_value: archive, using: recipe.tar_gzip())
+  bytes
+}
+```
+
+### Decompress gzip data
+
+```gleam
+import packkit/gzip
+
+pub fn read_gzip(bytes: BitArray) {
+  let assert Ok(decoded) = gzip.decode(bytes: bytes)
+  decoded.payload
+}
+```
 
 ## Development
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local workflow and
-[`doc/reference/spec.md`](doc/reference/spec.md) for the architecture
-and implementation order.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the local workflow.
