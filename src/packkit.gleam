@@ -15,6 +15,7 @@ import packkit/error
 import packkit/gzip
 import packkit/lz4
 import packkit/recipe
+import packkit/seven_z
 import packkit/snappy
 import packkit/tar
 import packkit/zip as zip_archive
@@ -93,6 +94,7 @@ pub fn read(
     "zip" -> zip_archive.decode(bytes: bytes)
     "cpio-newc" -> cpio.decode(bytes: bytes)
     "ar" -> ar.decode(bytes: bytes)
+    "7z" -> seven_z.decode(bytes: bytes)
     other -> Error(error.ArchiveNotImplemented(feature: "read " <> other))
   }
 }
@@ -107,6 +109,7 @@ pub fn write(
     "zip" -> zip_archive.encode(archive: archive_value)
     "cpio-newc" -> cpio.encode(archive: archive_value)
     "ar" -> ar.encode(archive: archive_value)
+    "7z" -> seven_z.encode(archive: archive_value)
     other -> Error(error.ArchiveNotImplemented(feature: "write " <> other))
   }
 }
