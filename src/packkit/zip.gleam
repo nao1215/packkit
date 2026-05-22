@@ -16,6 +16,7 @@ import gleam/string
 import packkit/archive as archives
 import packkit/checksum
 import packkit/codec as codecs
+import packkit/deflate
 import packkit/entry
 import packkit/error
 import packkit/level
@@ -28,6 +29,8 @@ const central_directory_signature: Int = 0x02014b50
 const eocd_signature: Int = 0x06054b50
 
 const method_store: Int = 0
+
+const method_deflate: Int = 8
 
 const version_made_by_unix: Int = 0x0314
 
@@ -84,10 +87,23 @@ pub fn inner_codec(method: Method) -> Option(codecs.Codec) {
 pub fn encode(
   archive archive_value: archives.Archive,
 ) -> Result(BitArray, error.ArchiveError) {
+  encode_with_method(archive: archive_value, method: store())
+}
+
+/// Encode a logical archive into a ZIP byte stream using a chosen
+/// per-entry method.  Currently `store` and `deflate` are supported.
+pub fn encode_with_method(
+  archive archive_value: archives.Archive,
+  method method: Method,
+) -> Result(BitArray, error.ArchiveError) {
   let entries = archives.entries(archive_value)
-  use #(local_blocks, central_blocks) <- result.try(
-    encode_entries(entries, 0, [], []),
-  )
+  use #(local_blocks, central_blocks) <- result.try(encode_entries(
+    entries,
+    0,
+    [],
+    [],
+    method,
+  ))
 
   let local_bytes = bit_array.concat(local_blocks)
   let central_bytes = bit_array.concat(central_blocks)
@@ -163,16 +179,20 @@ fn encode_entries(
   offset: Int,
   local_acc: List(BitArray),
   central_acc: List(BitArray),
+  method: Method,
 ) -> Result(#(List(BitArray), List(BitArray)), error.ArchiveError) {
   case remaining {
     [] -> Ok(#(list.reverse(local_acc), list.reverse(central_acc)))
     [head, ..rest] -> {
-      use built <- result.try(encode_entry(head, offset))
+      use built <- result.try(encode_entry(head, offset, method))
       let #(local_record, central_record, advance) = built
-      encode_entries(rest, offset + advance, [local_record, ..local_acc], [
-        central_record,
-        ..central_acc
-      ])
+      encode_entries(
+        rest,
+        offset + advance,
+        [local_record, ..local_acc],
+        [central_record, ..central_acc],
+        method,
+      )
     }
   }
 }
@@ -180,6 +200,7 @@ fn encode_entries(
 fn encode_entry(
   value: entry.Entry,
   offset: Int,
+  method: Method,
 ) -> Result(#(BitArray, BitArray, Int), error.ArchiveError) {
   let kind = entry.kind(value)
   let raw_path = entry.to_string(entry.path_of(value))
@@ -208,16 +229,33 @@ fn encode_entry(
     )),
   )
 
-  let body = case kind {
+  let raw_body = case kind {
     "directory" -> <<>>
     _ -> entry.body(value)
   }
 
-  let size = bit_array.byte_size(body)
+  let uncomp_size = bit_array.byte_size(raw_body)
   let crc = case kind {
     "directory" -> 0
-    _ -> checksum.crc32(body)
+    _ -> checksum.crc32(raw_body)
   }
+
+  let entry_method = case kind {
+    "directory" -> store()
+    _ -> method
+  }
+
+  use #(method_code, compressed_body) <- result.try(case entry_method.name {
+    "store" -> Ok(#(method_store, raw_body))
+    "deflate" ->
+      deflate.encode(bytes: raw_body)
+      |> result.map(fn(b) { #(method_deflate, b) })
+      |> result.map_error(codec_to_archive_error(_, canonical_path))
+    other -> Error(error.ArchiveNotImplemented(feature: "ZIP method " <> other))
+  })
+
+  let comp_size = bit_array.byte_size(compressed_body)
+
   let metadata = entry.metadata(value)
   let mode = entry.mode(metadata)
   let external_attrs = case kind {
@@ -226,37 +264,42 @@ fn encode_entry(
     _ -> int.bitwise_shift_left(mode, 16)
   }
 
+  let version_needed = case method_code {
+    m if m == method_deflate -> 20
+    _ -> version_needed_store
+  }
+
   let local_header =
     bit_array.concat([
       le32(local_file_signature),
-      le16(version_needed_store),
+      le16(version_needed),
       le16(0),
-      le16(method_store),
+      le16(method_code),
       le16(default_mtime_dos),
       le16(default_mdate_dos),
       le32(crc),
-      le32(size),
-      le32(size),
+      le32(comp_size),
+      le32(uncomp_size),
       le16(name_length),
       le16(0),
       name_bytes,
     ])
 
-  let local_record = bit_array.concat([local_header, body])
+  let local_record = bit_array.concat([local_header, compressed_body])
   let local_record_size = bit_array.byte_size(local_record)
 
   let central_record =
     bit_array.concat([
       le32(central_directory_signature),
       le16(version_made_by_unix),
-      le16(version_needed_store),
+      le16(version_needed),
       le16(0),
-      le16(method_store),
+      le16(method_code),
       le16(default_mtime_dos),
       le16(default_mdate_dos),
       le32(crc),
-      le32(size),
-      le32(size),
+      le32(comp_size),
+      le32(uncomp_size),
       le16(name_length),
       le16(0),
       le16(0),
@@ -373,7 +416,7 @@ fn parse_central_directory(
       )
 
       use <- bool.guard(
-        when: method != method_store,
+        when: method != method_store && method != method_deflate,
         return: Error(error.ArchiveNotImplemented(
           feature: "ZIP method " <> int.to_string(method),
         )),
@@ -387,6 +430,7 @@ fn parse_central_directory(
         uncomp_size,
         comp_size,
         external_attrs,
+        limits,
       ))
 
       let record_size = 46 + name_length + extra_length + comment_length
@@ -418,8 +462,9 @@ fn read_local_entry(
   name: String,
   expected_crc: Int,
   uncomp_size: Int,
-  _comp_size: Int,
+  comp_size: Int,
   external_attrs: Int,
+  limits: limit.Limits,
 ) -> Result(entry.Entry, error.ArchiveError) {
   use signature <- result.try(read_le32_at(full, local_offset))
   use <- bool.guard(
@@ -431,7 +476,7 @@ fn read_local_entry(
 
   use method <- result.try(read_le16_at(full, local_offset + 8))
   use <- bool.guard(
-    when: method != method_store,
+    when: method != method_store && method != method_deflate,
     return: Error(error.ArchiveNotImplemented(
       feature: "ZIP method " <> int.to_string(method),
     )),
@@ -442,7 +487,14 @@ fn read_local_entry(
 
   let data_offset = local_offset + 30 + local_name_length + local_extra_length
 
-  use body <- result.try(slice_or_error(full, data_offset, uncomp_size))
+  use body <- result.try(case method {
+    m if m == method_store -> slice_or_error(full, data_offset, uncomp_size)
+    _ -> {
+      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      deflate.decode_with_limits(bytes: compressed, limits: limits)
+      |> result.map_error(codec_to_archive_error(_, name))
+    }
+  })
 
   use <- bool.guard(
     when: checksum.crc32(body) != expected_crc,
@@ -479,6 +531,30 @@ fn strip_trailing_slash(value: String) -> String {
   case string.ends_with(value, "/") {
     True -> string.drop_end(value, 1)
     False -> value
+  }
+}
+
+fn codec_to_archive_error(
+  err: error.CodecError,
+  path: String,
+) -> error.ArchiveError {
+  case err {
+    error.CodecInvalidData(message) ->
+      error.ArchiveEntryRejected(
+        path: path,
+        reason: "deflate decode failed: " <> message,
+      )
+    error.CodecLimitExceeded(limit, value) ->
+      error.ArchiveLimitExceeded(limit: limit, value: value)
+    error.CodecUnsupported(name) ->
+      error.ArchiveNotImplemented(feature: "ZIP method " <> name)
+    error.CodecDictionaryRequired(_) ->
+      error.ArchiveEntryRejected(
+        path: path,
+        reason: "deflate decode requires preset dictionary (not supported)",
+      )
+    error.CodecNotImplemented(feature) ->
+      error.ArchiveNotImplemented(feature: feature)
   }
 }
 
