@@ -184,11 +184,26 @@ pub fn from_filename(path: String) -> Result(Detected, error.DetectError) {
                                                                                 ),
                                                                               )
                                                                             False ->
-                                                                              Error(
-                                                                                error.DetectUnknownFormat(
-                                                                                  input: path,
-                                                                                ),
-                                                                              )
+                                                                              case
+                                                                                string.ends_with(
+                                                                                  lower,
+                                                                                  ".z",
+                                                                                )
+                                                                              {
+                                                                                True ->
+                                                                                  Ok(
+                                                                                    detected_codec(
+                                                                                      codec.lzw(),
+                                                                                      extension: "Z",
+                                                                                    ),
+                                                                                  )
+                                                                                False ->
+                                                                                  Error(
+                                                                                    error.DetectUnknownFormat(
+                                                                                      input: path,
+                                                                                    ),
+                                                                                  )
+                                                                              }
                                                                           }
                                                                       }
                                                                   }
@@ -231,6 +246,7 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
       Ok(detected_codec(codec.lz4_frame(), extension: "lz4"))
     <<0x42, 0x5A, 0x68, _:bytes>> ->
       Ok(detected_codec(codec.bzip2(), extension: "bz2"))
+    <<0x1F, 0x9D, _:bytes>> -> Ok(detected_codec(codec.lzw(), extension: "Z"))
     <<"!<arch>\n":utf8, _:bytes>> ->
       Ok(detected_archive(archive.ar(), extension: "ar"))
     <<"070701":utf8, _:bytes>> ->

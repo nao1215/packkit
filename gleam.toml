@@ -76,6 +76,12 @@ unused_exports = "off"
   "deep_nesting",
   "prefer_guard_clause",
 ]
+"src/packkit/lzw.gleam" = [
+  "assert_ok_pattern",
+  "deep_nesting",
+  "prefer_guard_clause",
+  "thrown_away_error",
+]
 "src/packkit/snappy.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",

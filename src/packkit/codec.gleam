@@ -65,6 +65,11 @@ pub fn zstd() -> Codec {
   Codec(name: "zstd", level: Some(level.default()), dictionary: None)
 }
 
+/// Unix LZW `.Z` stream.
+pub fn lzw() -> Codec {
+  Codec(name: "lzw", level: None, dictionary: None)
+}
+
 /// Build a dictionary value from raw bytes.
 pub fn dictionary(bytes bytes: BitArray) -> Dictionary {
   Dictionary(bytes: bytes)
