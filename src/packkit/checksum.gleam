@@ -90,6 +90,49 @@ pub fn crc32c(data data: BitArray) -> Int {
   int.bitwise_and(int.bitwise_exclusive_or(crc, crc32_init), u32_mask)
 }
 
+/// Compute the bzip2 CRC-32 of `data`.
+///
+/// bzip2 reuses the IEEE 802.3 polynomial `0x04C11DB7` but processes
+/// each byte MSB-first (without reflection) and XORs the final value
+/// with `0xFFFFFFFF`, matching the per-block and stream CRC fields
+/// that appear in `.bz2` files.
+pub fn bzip2_crc32(data data: BitArray) -> Int {
+  let crc = bzip2_crc32_loop(data, crc32_init)
+  int.bitwise_and(int.bitwise_exclusive_or(crc, crc32_init), u32_mask)
+}
+
+fn bzip2_crc32_loop(data: BitArray, crc: Int) -> Int {
+  case data {
+    <<b, rest:bytes>> -> {
+      let crc =
+        int.bitwise_exclusive_or(crc, int.bitwise_shift_left(b, 24))
+        |> int.bitwise_and(u32_mask)
+      let crc = bzip2_step_byte(crc)
+      bzip2_crc32_loop(rest, crc)
+    }
+    _ -> crc
+  }
+}
+
+fn bzip2_step_byte(crc: Int) -> Int {
+  bzip2_step_bit(crc)
+  |> bzip2_step_bit
+  |> bzip2_step_bit
+  |> bzip2_step_bit
+  |> bzip2_step_bit
+  |> bzip2_step_bit
+  |> bzip2_step_bit
+  |> bzip2_step_bit
+}
+
+fn bzip2_step_bit(crc: Int) -> Int {
+  let shifted = int.bitwise_and(int.bitwise_shift_left(crc, 1), u32_mask)
+  case int.bitwise_and(crc, 0x80000000) {
+    0 -> shifted
+    _ -> int.bitwise_exclusive_or(shifted, 0x04C11DB7)
+  }
+}
+
 /// Mask a CRC-32C value as Snappy's framing layer requires.
 ///
 /// The masking is `((crc >> 15) | (crc << 17)) + 0xa282ead8` taken

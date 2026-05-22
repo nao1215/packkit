@@ -46,3 +46,9 @@ pub fn crc32_continue_matches_single_pass_test() -> Nil {
   direct
   |> should.equal(chained)
 }
+
+pub fn bzip2_crc32_check_value_test() -> Nil {
+  // Block CRC produced by `printf 'hello' | bzip2 -1 -c`.
+  checksum.bzip2_crc32(<<"hello":utf8>>)
+  |> should.equal(0x1931653D)
+}

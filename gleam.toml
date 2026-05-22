@@ -50,6 +50,14 @@ unused_exports = "off"
   "assert_ok_pattern",
   "prefer_guard_clause",
 ]
+"src/packkit/bzip2.gleam" = [
+  "assert_ok_pattern",
+  "deep_nesting",
+  "discarded_result",
+  "prefer_guard_clause",
+  "short_variable_name",
+  "thrown_away_error",
+]
 "src/packkit/checksum.gleam" = ["short_variable_name"]
 "src/packkit/deflate.gleam" = [
   "assert_ok_pattern",

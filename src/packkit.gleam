@@ -7,6 +7,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import packkit/ar
 import packkit/archive
+import packkit/bzip2
 import packkit/codec
 import packkit/cpio
 import packkit/deflate
@@ -62,6 +63,7 @@ pub fn compress(
     "gzip" -> gzip.encode(bytes: bytes, header: gzip.default_header())
     "lz4-frame" -> lz4.encode(bytes: bytes)
     "snappy-frame" -> snappy.encode(bytes: bytes)
+    "bzip2" -> bzip2.encode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
@@ -80,6 +82,7 @@ pub fn decompress(
       |> result.map(fn(decoded) { decoded.payload })
     "lz4-frame" -> lz4.decode(bytes: bytes)
     "snappy-frame" -> snappy.decode(bytes: bytes)
+    "bzip2" -> bzip2.decode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }
