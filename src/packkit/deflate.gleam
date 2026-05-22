@@ -2,13 +2,13 @@
 ////
 //// The decoder handles all three RFC 1951 block types (stored, fixed
 //// Huffman, dynamic Huffman) and enforces the `Limits` resource budget
-//// while decoding.  The encoder currently emits a sequence of stored
-//// blocks: the output is a valid DEFLATE stream but does not compress
-//// the payload.  A Huffman-coded encoder is intentionally left as
-//// future work.
+//// while decoding.  The encoder emits a single fixed-Huffman block
+//// (BTYPE=01) built from a greedy LZ77 match-finder with a 3-byte
+//// hash chain over a 32 KiB sliding window.
 
 import gleam/bit_array
 import gleam/bool
+import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/result
@@ -23,6 +23,12 @@ const max_length_code: Int = 285
 const max_distance_code: Int = 29
 
 const stored_block_max: Int = 65_535
+
+const max_match_length: Int = 258
+
+const min_match_length: Int = 3
+
+const max_window: Int = 32_768
 
 /// Raw deflate codec smart constructor.
 pub fn codec() -> codecs.Codec {
@@ -54,12 +60,22 @@ pub fn decode_with_limits(
   }
 }
 
-/// Encode a byte stream as a sequence of stored DEFLATE blocks.
+/// Encode a byte stream as a fixed-Huffman DEFLATE block.
 ///
-/// The output is a valid DEFLATE stream that any conforming decoder
-/// can decompress, but it does not actually compress the payload.
-/// A Huffman-coded encoder is a follow-up work item.
+/// The encoder uses a greedy LZ77 match-finder with a 3-byte hash
+/// chain and a 32 KiB sliding window, then emits the resulting
+/// literal/length/distance tokens through the RFC 1951 fixed
+/// Huffman table.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+  Ok(encode_huffman(bytes))
+}
+
+/// Encode a byte stream as a sequence of stored (uncompressed)
+/// DEFLATE blocks.  Useful when the caller wants to bypass the
+/// match-finder, for instance to test the framing in isolation.
+pub fn encode_stored_only(
+  bytes bytes: BitArray,
+) -> Result(BitArray, error.CodecError) {
   Ok(encode_stored(bytes))
 }
 
@@ -910,6 +926,361 @@ fn encode_stored_blocks(
         [bit_array.concat([header, chunk]), ..acc],
       )
     }
+  }
+}
+
+// -- fixed-Huffman encoder ----------------------------------------------
+
+fn encode_huffman(bytes: BitArray) -> BitArray {
+  let size = bit_array.byte_size(bytes)
+  case size {
+    0 -> {
+      let writer =
+        new_writer()
+        |> write_bits(1, 1)
+        |> write_bits(1, 2)
+        |> write_fixed_literal_code(256)
+      flush_writer(writer)
+    }
+    _ -> {
+      let byte_table = build_byte_table(bytes, 0, dict.new())
+      let writer =
+        new_writer()
+        |> write_bits(1, 1)
+        |> write_bits(1, 2)
+      let writer = emit_lz77(byte_table, size, 0, dict.new(), writer)
+      let writer = write_fixed_literal_code(writer, 256)
+      flush_writer(writer)
+    }
+  }
+}
+
+fn build_byte_table(
+  bytes: BitArray,
+  index: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case bytes {
+    <<b, rest:bytes>> ->
+      build_byte_table(rest, index + 1, dict.insert(acc, index, b))
+    _ -> acc
+  }
+}
+
+fn byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
+  case dict.get(table, index) {
+    Ok(value) -> value
+    Error(_) -> 0
+  }
+}
+
+fn hash3(b0: Int, b1: Int, b2: Int) -> Int {
+  int.bitwise_and(
+    int.bitwise_exclusive_or(
+      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
+      b2 * 2_246_822_519,
+    ),
+    0xFFFF,
+  )
+}
+
+fn emit_lz77(
+  table: dict.Dict(Int, Int),
+  size: Int,
+  pos: Int,
+  hashes: dict.Dict(Int, Int),
+  writer: Writer,
+) -> Writer {
+  case pos >= size {
+    True -> writer
+    False ->
+      case pos + min_match_length > size {
+        True -> {
+          let writer = write_fixed_literal_code(writer, byte_at(table, pos))
+          emit_lz77(table, size, pos + 1, hashes, writer)
+        }
+        False -> {
+          let b0 = byte_at(table, pos)
+          let b1 = byte_at(table, pos + 1)
+          let b2 = byte_at(table, pos + 2)
+          let key = hash3(b0, b1, b2)
+          case dict.get(hashes, key) {
+            Error(_) -> {
+              let writer = write_fixed_literal_code(writer, b0)
+              emit_lz77(
+                table,
+                size,
+                pos + 1,
+                dict.insert(hashes, key, pos),
+                writer,
+              )
+            }
+            Ok(prev) -> {
+              let distance = pos - prev
+              case distance <= 0 || distance > max_window {
+                True -> {
+                  let writer = write_fixed_literal_code(writer, b0)
+                  emit_lz77(
+                    table,
+                    size,
+                    pos + 1,
+                    dict.insert(hashes, key, pos),
+                    writer,
+                  )
+                }
+                False -> {
+                  let match =
+                    match_length(table, prev, pos, size, max_match_length, 0)
+                  case match >= min_match_length {
+                    True -> {
+                      let writer = write_match(writer, match, distance)
+                      let next_hashes =
+                        insert_hashes_in_range(
+                          table,
+                          dict.insert(hashes, key, pos),
+                          pos + 1,
+                          pos + match - 1,
+                          size,
+                        )
+                      emit_lz77(table, size, pos + match, next_hashes, writer)
+                    }
+                    False -> {
+                      let writer = write_fixed_literal_code(writer, b0)
+                      emit_lz77(
+                        table,
+                        size,
+                        pos + 1,
+                        dict.insert(hashes, key, pos),
+                        writer,
+                      )
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+  }
+}
+
+fn match_length(
+  table: dict.Dict(Int, Int),
+  base: Int,
+  cursor: Int,
+  size: Int,
+  max: Int,
+  acc: Int,
+) -> Int {
+  case acc >= max || cursor + acc >= size {
+    True -> acc
+    False ->
+      case byte_at(table, base + acc) == byte_at(table, cursor + acc) {
+        True -> match_length(table, base, cursor, size, max, acc + 1)
+        False -> acc
+      }
+  }
+}
+
+fn insert_hashes_in_range(
+  table: dict.Dict(Int, Int),
+  hashes: dict.Dict(Int, Int),
+  from: Int,
+  to: Int,
+  size: Int,
+) -> dict.Dict(Int, Int) {
+  case from > to || from + min_match_length > size {
+    True -> hashes
+    False -> {
+      let key =
+        hash3(
+          byte_at(table, from),
+          byte_at(table, from + 1),
+          byte_at(table, from + 2),
+        )
+      insert_hashes_in_range(
+        table,
+        dict.insert(hashes, key, from),
+        from + 1,
+        to,
+        size,
+      )
+    }
+  }
+}
+
+fn write_match(writer: Writer, length: Int, distance: Int) -> Writer {
+  let #(length_sym, length_extra_count, length_extra_value) =
+    length_code(length)
+  let writer = write_fixed_literal_code(writer, length_sym)
+  let writer = write_bits(writer, length_extra_value, length_extra_count)
+  let #(dist_sym, dist_extra_count, dist_extra_value) = distance_code(distance)
+  let writer = write_fixed_distance_code(writer, dist_sym)
+  write_bits(writer, dist_extra_value, dist_extra_count)
+}
+
+fn length_code(length: Int) -> #(Int, Int, Int) {
+  case length {
+    n if n >= 3 && n <= 10 -> #(254 + n, 0, 0)
+    n if n >= 11 && n <= 18 -> #(265 + { n - 11 } / 2, 1, { n - 11 } % 2)
+    n if n >= 19 && n <= 34 -> #(269 + { n - 19 } / 4, 2, { n - 19 } % 4)
+    n if n >= 35 && n <= 66 -> #(273 + { n - 35 } / 8, 3, { n - 35 } % 8)
+    n if n >= 67 && n <= 130 -> #(277 + { n - 67 } / 16, 4, { n - 67 } % 16)
+    n if n >= 131 && n <= 257 -> #(281 + { n - 131 } / 32, 5, { n - 131 } % 32)
+    _ -> #(285, 0, 0)
+  }
+}
+
+fn distance_code(distance: Int) -> #(Int, Int, Int) {
+  case distance {
+    n if n >= 1 && n <= 4 -> #(n - 1, 0, 0)
+    n if n >= 5 && n <= 8 -> #(4 + { n - 5 } / 2, 1, { n - 5 } % 2)
+    n if n >= 9 && n <= 16 -> #(6 + { n - 9 } / 4, 2, { n - 9 } % 4)
+    n if n >= 17 && n <= 32 -> #(8 + { n - 17 } / 8, 3, { n - 17 } % 8)
+    n if n >= 33 && n <= 64 -> #(10 + { n - 33 } / 16, 4, { n - 33 } % 16)
+    n if n >= 65 && n <= 128 -> #(12 + { n - 65 } / 32, 5, { n - 65 } % 32)
+    n if n >= 129 && n <= 256 -> #(14 + { n - 129 } / 64, 6, { n - 129 } % 64)
+    n if n >= 257 && n <= 512 -> #(16 + { n - 257 } / 128, 7, { n - 257 } % 128)
+    n if n >= 513 && n <= 1024 -> #(
+      18 + { n - 513 } / 256,
+      8,
+      { n - 513 } % 256,
+    )
+    n if n >= 1025 && n <= 2048 -> #(
+      20 + { n - 1025 } / 512,
+      9,
+      { n - 1025 } % 512,
+    )
+    n if n >= 2049 && n <= 4096 -> #(
+      22 + { n - 2049 } / 1024,
+      10,
+      { n - 2049 } % 1024,
+    )
+    n if n >= 4097 && n <= 8192 -> #(
+      24 + { n - 4097 } / 2048,
+      11,
+      { n - 4097 } % 2048,
+    )
+    n if n >= 8193 && n <= 16_384 -> #(
+      26 + { n - 8193 } / 4096,
+      12,
+      { n - 8193 } % 4096,
+    )
+    n if n >= 16_385 && n <= 32_768 -> #(
+      28 + { n - 16_385 } / 8192,
+      13,
+      { n - 16_385 } % 8192,
+    )
+    _ -> #(0, 0, 0)
+  }
+}
+
+fn fixed_literal_code(symbol: Int) -> #(Int, Int) {
+  case symbol {
+    s if s >= 0 && s <= 143 -> #(48 + s, 8)
+    s if s >= 144 && s <= 255 -> #(400 + { s - 144 }, 9)
+    s if s >= 256 && s <= 279 -> #(s - 256, 7)
+    s if s >= 280 && s <= 287 -> #(192 + { s - 280 }, 8)
+    _ -> #(0, 8)
+  }
+}
+
+fn write_fixed_literal_code(writer: Writer, symbol: Int) -> Writer {
+  let #(code, length) = fixed_literal_code(symbol)
+  write_huffman_code(writer, code, length)
+}
+
+fn write_fixed_distance_code(writer: Writer, symbol: Int) -> Writer {
+  write_huffman_code(writer, symbol, 5)
+}
+
+fn write_huffman_code(writer: Writer, code: Int, length: Int) -> Writer {
+  write_bits(writer, reverse_bits(code, length), length)
+}
+
+fn reverse_bits(value: Int, count: Int) -> Int {
+  reverse_bits_loop(value, count, 0)
+}
+
+fn reverse_bits_loop(value: Int, count: Int, acc: Int) -> Int {
+  case count {
+    0 -> acc
+    _ ->
+      reverse_bits_loop(
+        int.bitwise_shift_right(value, 1),
+        count - 1,
+        int.bitwise_or(
+          int.bitwise_shift_left(acc, 1),
+          int.bitwise_and(value, 1),
+        ),
+      )
+  }
+}
+
+// -- bit writer ----------------------------------------------------------
+
+type Writer {
+  Writer(bytes: List(Int), buffer: Int, bits: Int)
+}
+
+fn new_writer() -> Writer {
+  Writer(bytes: [], buffer: 0, bits: 0)
+}
+
+fn write_bits(writer: Writer, value: Int, count: Int) -> Writer {
+  case count {
+    0 -> writer
+    _ -> {
+      let buffer =
+        int.bitwise_or(
+          writer.buffer,
+          int.bitwise_shift_left(
+            int.bitwise_and(value, mask_for(count)),
+            writer.bits,
+          ),
+        )
+      flush_full_bytes(Writer(
+        bytes: writer.bytes,
+        buffer: buffer,
+        bits: writer.bits + count,
+      ))
+    }
+  }
+}
+
+fn mask_for(count: Int) -> Int {
+  int.bitwise_shift_left(1, count) - 1
+}
+
+fn flush_full_bytes(writer: Writer) -> Writer {
+  case writer.bits >= 8 {
+    False -> writer
+    True ->
+      flush_full_bytes(Writer(
+        bytes: [int.bitwise_and(writer.buffer, 0xFF), ..writer.bytes],
+        buffer: int.bitwise_shift_right(writer.buffer, 8),
+        bits: writer.bits - 8,
+      ))
+  }
+}
+
+fn flush_writer(writer: Writer) -> BitArray {
+  let writer = case writer.bits {
+    0 -> writer
+    _ ->
+      Writer(
+        bytes: [int.bitwise_and(writer.buffer, 0xFF), ..writer.bytes],
+        buffer: 0,
+        bits: 0,
+      )
+  }
+  list_to_bit_array(list.reverse(writer.bytes), <<>>)
+}
+
+fn list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
+  case values {
+    [] -> acc
+    [head, ..rest] -> list_to_bit_array(rest, <<acc:bits, head>>)
   }
 }
 

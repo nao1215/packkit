@@ -38,17 +38,53 @@ pub fn decode_dynamic_huffman_lorem_test() -> Nil {
   ))
 }
 
-pub fn roundtrip_stored_encoder_test() -> Nil {
-  let payload = <<"packkit roundtrip via stored deflate":utf8>>
+pub fn roundtrip_huffman_encoder_test() -> Nil {
+  let payload = <<"packkit roundtrip via fixed-huffman deflate":utf8>>
   let assert Ok(compressed) = deflate.encode(bytes: payload)
   let assert Ok(restored) = deflate.decode(bytes: compressed)
   restored
   |> should.equal(payload)
 }
 
-pub fn roundtrip_empty_stored_encoder_test() -> Nil {
+pub fn roundtrip_empty_encoder_test() -> Nil {
   let assert Ok(compressed) = deflate.encode(bytes: <<>>)
   let assert Ok(restored) = deflate.decode(bytes: compressed)
   restored
   |> should.equal(<<>>)
+}
+
+pub fn roundtrip_stored_encoder_test() -> Nil {
+  let payload = <<"packkit roundtrip via stored deflate":utf8>>
+  let assert Ok(compressed) = deflate.encode_stored_only(bytes: payload)
+  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn huffman_encoder_compresses_repetition_test() -> Nil {
+  // 1 KiB of the same byte should compress significantly via LZ77
+  // back-references.
+  let payload = repeat_byte(0x41, 1024, <<>>)
+  let assert Ok(compressed) = deflate.encode(bytes: payload)
+  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  restored
+  |> should.equal(payload)
+  should.be_true(bit_array.byte_size(compressed) < 64)
+}
+
+pub fn huffman_encoder_handles_long_runs_test() -> Nil {
+  // Mixed content that requires the encoder to emit literals and
+  // length/distance pairs back to back.
+  let payload = <<"abcdef":utf8, "abcdef":utf8, "abcdef":utf8, "xyz":utf8>>
+  let assert Ok(compressed) = deflate.encode(bytes: payload)
+  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  restored
+  |> should.equal(payload)
+}
+
+fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
+  }
 }
