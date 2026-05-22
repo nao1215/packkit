@@ -66,6 +66,11 @@ unused_exports = "off"
   "deep_nesting",
   "prefer_guard_clause",
 ]
+"src/packkit/snappy.gleam" = [
+  "assert_ok_pattern",
+  "deep_nesting",
+  "prefer_guard_clause",
+]
 "src/packkit/tar.gleam" = [
   "assert_ok_pattern",
   "prefer_guard_clause",

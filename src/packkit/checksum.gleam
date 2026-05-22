@@ -82,6 +82,25 @@ pub fn crc32_continue(previous previous: Int, data data: BitArray) -> Int {
   int.bitwise_and(int.bitwise_exclusive_or(crc, crc32_init), u32_mask)
 }
 
+/// Compute the CRC-32C (Castagnoli) checksum of `data` using the
+/// reflected polynomial `0x82F63B78`.  CRC-32C underlies the masked
+/// checksums in Snappy's frame format.
+pub fn crc32c(data data: BitArray) -> Int {
+  let crc = crc32c_loop(data, crc32_init)
+  int.bitwise_and(int.bitwise_exclusive_or(crc, crc32_init), u32_mask)
+}
+
+/// Mask a CRC-32C value as Snappy's framing layer requires.
+///
+/// The masking is `((crc >> 15) | (crc << 17)) + 0xa282ead8` taken
+/// modulo `2^32`.
+pub fn snappy_mask(crc crc: Int) -> Int {
+  let high = int.bitwise_shift_right(crc, 15)
+  let low = int.bitwise_and(int.bitwise_shift_left(crc, 17), u32_mask)
+  let rotated = int.bitwise_or(high, low)
+  int.bitwise_and(rotated + 0xA282EAD8, u32_mask)
+}
+
 fn crc32_loop(data: BitArray, crc: Int) -> Int {
   case data {
     <<b, rest:bytes>> -> {
@@ -118,6 +137,45 @@ fn crc32_nibble(index: Int) -> Int {
     13 -> 0x86D3D2D4
     14 -> 0xA00AE278
     _ -> 0xBDBDF21C
+  }
+}
+
+fn crc32c_loop(data: BitArray, crc: Int) -> Int {
+  case data {
+    <<b, rest:bytes>> -> {
+      let crc = int.bitwise_exclusive_or(crc, b)
+      let crc = step4_c(crc)
+      let crc = step4_c(crc)
+      crc32c_loop(rest, crc)
+    }
+    _ -> crc
+  }
+}
+
+fn step4_c(crc: Int) -> Int {
+  let low = int.bitwise_and(crc, 15)
+  let shifted = int.bitwise_shift_right(crc, 4)
+  int.bitwise_exclusive_or(crc32c_nibble(low), shifted)
+}
+
+fn crc32c_nibble(index: Int) -> Int {
+  case index {
+    0 -> 0x00000000
+    1 -> 0x105EC76F
+    2 -> 0x20BD8EDE
+    3 -> 0x30E349B1
+    4 -> 0x417B1DBC
+    5 -> 0x5125DAD3
+    6 -> 0x61C69362
+    7 -> 0x7198540D
+    8 -> 0x82F63B78
+    9 -> 0x92A8FC17
+    10 -> 0xA24BB5A6
+    11 -> 0xB21572C9
+    12 -> 0xC38D26C4
+    13 -> 0xD3D3E1AB
+    14 -> 0xE330A81A
+    _ -> 0xF36E6F75
   }
 }
 

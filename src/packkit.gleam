@@ -15,6 +15,7 @@ import packkit/error
 import packkit/gzip
 import packkit/lz4
 import packkit/recipe
+import packkit/snappy
 import packkit/tar
 import packkit/zip as zip_archive
 import packkit/zlib
@@ -59,6 +60,7 @@ pub fn compress(
     "zlib" -> zlib.encode(bytes: bytes)
     "gzip" -> gzip.encode(bytes: bytes, header: gzip.default_header())
     "lz4-frame" -> lz4.encode(bytes: bytes)
+    "snappy-frame" -> snappy.encode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
@@ -76,6 +78,7 @@ pub fn decompress(
       gzip.decode(bytes: bytes)
       |> result.map(fn(decoded) { decoded.payload })
     "lz4-frame" -> lz4.decode(bytes: bytes)
+    "snappy-frame" -> snappy.decode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }
