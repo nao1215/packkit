@@ -26,9 +26,41 @@ pub fn codec() -> codecs.Codec {
   codecs.zstd()
 }
 
-/// Encode `bytes` as a Zstandard frame.  Not yet implemented.
-pub fn encode(bytes _bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  Error(error.CodecNotImplemented(feature: "zstd.encode"))
+/// Encode `bytes` as a Zstandard frame.  The encoder always emits a
+/// single raw block (no compression, no checksum, FCS omitted) — the
+/// output is a valid Zstandard frame that any conforming decoder can
+/// read, but it preserves the original byte count rather than shrinking
+/// it.  A compression-aware encoder is intentionally future work.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+  let size = bit_array.byte_size(bytes)
+  use <- bool.guard(
+    when: size > 0x1F_FFFF,
+    return: Error(error.CodecInvalidData(
+      message: "zstd raw-block encoder caps blocks at 2 MiB - 1; split externally",
+    )),
+  )
+  // Frame header descriptor:
+  //   - FCS_flag = 0
+  //   - Single_Segment_flag = 1 (no Window_Descriptor)
+  //   - reserved bit = 0
+  //   - Content_Checksum_flag = 0
+  //   - Dictionary_ID_flag = 0
+  // ⇒ descriptor = 0x20.  When Single_Segment_flag is 1 and FCS_flag
+  // is 0, the spec requires a 1-byte FCS, so we emit `size` there.
+  use <- bool.guard(
+    when: size > 0xFF,
+    return: Error(error.CodecNotImplemented(
+      feature: "zstd raw-block encoder for inputs above 255 bytes",
+    )),
+  )
+  let header = <<0x28, 0xB5, 0x2F, 0xFD, 0x20, size>>
+  let block_header_value = int.bitwise_or(int.bitwise_shift_left(size, 3), 0x01)
+  let bh0 = int.bitwise_and(block_header_value, 0xFF)
+  let bh1 =
+    int.bitwise_and(int.bitwise_shift_right(block_header_value, 8), 0xFF)
+  let bh2 =
+    int.bitwise_and(int.bitwise_shift_right(block_header_value, 16), 0xFF)
+  Ok(bit_array.concat([header, <<bh0, bh1, bh2>>, bytes]))
 }
 
 /// Decode a Zstandard frame using default limits.

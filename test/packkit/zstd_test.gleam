@@ -9,9 +9,20 @@ pub fn codec_marker_test() -> Nil {
   |> should.equal("zstd")
 }
 
-pub fn encode_reports_not_implemented_test() -> Nil {
-  zstd.encode(bytes: <<>>)
-  |> should.equal(Error(error.CodecNotImplemented(feature: "zstd.encode")))
+pub fn encode_roundtrip_hi_test() -> Nil {
+  let payload = <<"hi":utf8>>
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+}
+
+pub fn encode_roundtrip_pangram_test() -> Nil {
+  let payload = <<"The quick brown fox jumps over the lazy dog.":utf8>>
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
 }
 
 pub fn decode_raw_block_hi_test() -> Nil {
