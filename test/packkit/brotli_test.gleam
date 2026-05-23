@@ -49,61 +49,51 @@ pub fn decode_hi_with_wbits_18_test() -> Nil {
   |> should.equal(Ok(<<"hi":utf8>>))
 }
 
-pub fn compressed_metablock_reaches_command_loop_test() -> Nil {
-  // `printf 'aaaaaaaaaa' | brotli -c` — brotli chooses a compressed
-  // metablock for inputs around 10 bytes.  The decoder now parses the
-  // metablock prelude (NBLTYPES, NPOSTFIX, NDIRECT, context modes),
-  // the NTREES counts, and three simple-form prefix-code descriptors
-  // (literal, insert-and-copy, distance) before erroring at the
-  // command-loop stage.  This proves the full header pipeline lines
-  // up bit-for-bit with brotli's encoder output.
+pub fn decode_compressed_10a_test() -> Nil {
+  // `printf 'aaaaaaaaaa' | brotli -c` — end-to-end round-trip of a
+  // compressed metablock using simple-form prefix codes plus a single
+  // in-window LZ77 copy (1 literal 'a' + 9-byte copy at distance 1).
   let stream = <<0x1F, 0x09, 0x00, 0xF8, 0x25, 0xC2, 0x82, 0x84, 0x00, 0x00>>
-  let expected_feature =
-    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
   brotli.decode(bytes: stream)
-  |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
+  |> should.equal(Ok(<<"aaaaaaaaaa":utf8>>))
 }
 
-pub fn compressed_metablock_with_small_wbits_reaches_command_loop_test() -> Nil {
-  // `printf 'aaaaaaaaaa' | brotli -c --lgwin=10` — the same 10-byte
-  // payload encoded with a smaller window.  Because WBITS doesn't
-  // change the bit positions of later fields, this also reaches the
-  // command-loop stage.  Regression coverage for the `triple == 0`
-  // branch of `read_wbits` and for simple-form prefix-code parsing
-  // with a small (NDIRECT-derived) distance alphabet.
+pub fn decode_compressed_10a_with_small_wbits_test() -> Nil {
+  // `printf 'aaaaaaaaaa' | brotli -c --lgwin=10` — same payload, but
+  // the WBITS prefix exercises the `triple == 0` branch of
+  // `read_wbits` (fixed earlier this session) and the distance
+  // decoder's NPOSTFIX/NDIRECT-derived parameters.
   let stream = <<0xA1, 0x48, 0x00, 0xC0, 0x2F, 0x11, 0x16, 0x24, 0x04, 0x00>>
-  let expected_feature =
-    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
   brotli.decode(bytes: stream)
-  |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
+  |> should.equal(Ok(<<"aaaaaaaaaa":utf8>>))
 }
 
-pub fn compressed_metablock_complex_form_reaches_command_loop_test() -> Nil {
+pub fn decode_compressed_16a_test() -> Nil {
+  // `printf 'aaaaaaaaaaaaaaaa' | brotli -c` (16 `a`s).
+  let stream = <<0x1F, 0x0F, 0x00, 0xF8, 0x25, 0xC2, 0x22, 0x8C, 0x00, 0x00>>
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(<<"aaaaaaaaaaaaaaaa":utf8>>))
+}
+
+pub fn complex_form_static_dict_pending_test() -> Nil {
   // `printf 'Hello, World! This is brotli testing.' | brotli -c` —
-  // text input that triggers complex-form prefix codes (mixed-
-  // alphabet literals encoded via the 18-symbol code-length code
-  // and 16/17 run-length symbols, RFC 7932 §3.5).  Successful parse
-  // through to the command-loop stub is the strongest evidence
-  // that the complex-form pipeline reproduces brotli's output.
+  // text input that triggers complex-form prefix codes AND a static
+  // dictionary reference (first command has insert_len = 0 and
+  // copy_len > 0 with `distance > pos`).  We've parsed the header
+  // and entered the command loop, but resolving the dictionary lookup
+  // is the next big piece of work.
   let stream = <<
     0x1F, 0x24, 0x00, 0xE0, 0xC5, 0x6D, 0x6C, 0x5D, 0x1D, 0xA7, 0x77, 0xFB, 0xD1,
     0x09, 0x04, 0x41, 0xEA, 0x41, 0x14, 0xA9, 0xE5, 0x16, 0xC5, 0xD2, 0x91, 0x58,
     0x5D, 0x3B, 0x5A, 0xB2, 0x77, 0xE2, 0xD7, 0xC1, 0xD6, 0x02,
   >>
-  let expected_feature =
-    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
-  brotli.decode(bytes: stream)
-  |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
-}
-
-pub fn compressed_metablock_16a_reaches_command_loop_test() -> Nil {
-  // `printf 'aaaaaaaaaaaaaaaa' | brotli -c` (16 `a`s).  brotli's
-  // encoder still uses simple-form prefix codes for this length, so
-  // the literal/insert-and-copy/distance descriptors parse cleanly
-  // and we reach the same command-loop stage as the 10-byte fixture.
-  let stream = <<0x1F, 0x0F, 0x00, 0xF8, 0x25, 0xC2, 0x22, 0x8C, 0x00, 0x00>>
-  let expected_feature =
-    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
-  brotli.decode(bytes: stream)
-  |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
+  case brotli.decode(bytes: stream) {
+    Error(error.CodecNotImplemented(feature: feature)) ->
+      // Match prefix so the test stays robust to small wording tweaks.
+      case feature {
+        "brotli static dictionary reference" <> _ -> Nil
+        _ -> should.fail()
+      }
+    _ -> should.fail()
+  }
 }

@@ -4,18 +4,20 @@
 ////
 //// * The canonical empty stream `0x3F`.
 //// * Any stream that uses only uncompressed metablocks
-////   (`ISUNCOMPRESSED` bit set) — i.e. payloads that brotli chose
-////   not to compress.
+////   (`ISUNCOMPRESSED` bit set).
+//// * Compressed metablocks whose copies stay inside the sliding
+////   window — full header (NBLTYPES, NPOSTFIX, NDIRECT, context
+////   modes, NTREES, both simple and complex prefix-code
+////   descriptors) is parsed, the I+C alphabet is decoded into
+////   `(insert_len, copy_len, distance)` per command, and literals
+////   are emitted from the literal prefix code while distances pull
+////   from a 4-entry recent-distance ring buffer.
 ////
-//// For compressed metablocks the decoder parses the metablock header
-//// (NBLTYPES, NPOSTFIX, NDIRECT, context modes), the NTREES counts
-//// for the literal and distance categories, and every prefix-code
-//// descriptor — both *simple* (RFC 7932 §3.4) and *complex* (§3.5,
-//// the 18-symbol code-length code with 16/17 run-length symbols).
-//// Context maps for `NTREES > 1`, the command loop itself, and the
-//// ~120 KiB built-in static dictionary still return a typed
-//// `CodecNotImplemented` whose `feature` string names the missing
-//// stage.
+//// What still returns a typed `CodecNotImplemented`:
+////
+//// * Block switching (NBLTYPES > 1) and context maps (NTREES > 1).
+//// * Distance references into the ~120 KiB RFC 7932 static
+////   dictionary (any command with `distance > pos`).
 
 import gleam/bit_array
 import gleam/bool
@@ -56,7 +58,7 @@ pub fn decode_with_limits(
 
   let reader = new_reader(bytes)
   use #(_wbits, reader) <- result.try(read_wbits(reader))
-  decode_metablocks(reader, <<>>, limits)
+  decode_metablocks(reader, <<>>, new_ring(), limits)
 }
 
 // -- metablock loop -----------------------------------------------------
@@ -64,6 +66,7 @@ pub fn decode_with_limits(
 fn decode_metablocks(
   reader: Reader,
   output: BitArray,
+  ring: DistRing,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   use #(is_last, reader) <- result.try(read_bits(reader, 1))
@@ -73,9 +76,10 @@ fn decode_metablocks(
       case is_last_empty {
         1 -> Ok(output)
         _ -> {
-          use #(output, _reader) <- result.try(decode_one_metablock(
+          use #(output, _ring, _reader) <- result.try(decode_one_metablock(
             reader,
             output,
+            ring,
             limits,
             True,
           ))
@@ -84,13 +88,14 @@ fn decode_metablocks(
       }
     }
     _ -> {
-      use #(output, reader) <- result.try(decode_one_metablock(
+      use #(output, ring, reader) <- result.try(decode_one_metablock(
         reader,
         output,
+        ring,
         limits,
         False,
       ))
-      decode_metablocks(reader, output, limits)
+      decode_metablocks(reader, output, ring, limits)
     }
   }
 }
@@ -98,9 +103,10 @@ fn decode_metablocks(
 fn decode_one_metablock(
   reader: Reader,
   output: BitArray,
+  ring: DistRing,
   limits: limit.Limits,
   is_last: Bool,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
   use #(mnibbles_raw, reader) <- result.try(read_bits(reader, 2))
   let mnibbles = case mnibbles_raw {
     0 -> 4
@@ -109,45 +115,45 @@ fn decode_one_metablock(
     _ -> 0
   }
   case mnibbles {
-    0 -> decode_skip_metablock(reader, output)
-    _ -> {
-      use #(mlen_minus_1, reader) <- result.try(read_bits(reader, mnibbles * 4))
-      let mlen = mlen_minus_1 + 1
-      use #(is_uncompressed, reader) <- result.try(case is_last {
-        True -> Ok(#(0, reader))
-        False -> read_bits(reader, 1)
-      })
-      case is_uncompressed {
-        1 -> decode_uncompressed_metablock(reader, output, mlen, limits)
-        _ -> decode_compressed_metablock(reader, output, mlen, limits)
-      }
-    }
+    0 -> decode_skip_metablock(reader, output, ring)
+    _ -> decode_sized_metablock(reader, output, ring, limits, is_last, mnibbles)
+  }
+}
+
+fn decode_sized_metablock(
+  reader: Reader,
+  output: BitArray,
+  ring: DistRing,
+  limits: limit.Limits,
+  is_last: Bool,
+  mnibbles: Int,
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+  use #(mlen_minus_1, reader) <- result.try(read_bits(reader, mnibbles * 4))
+  let mlen = mlen_minus_1 + 1
+  use #(is_uncompressed, reader) <- result.try(case is_last {
+    True -> Ok(#(0, reader))
+    False -> read_bits(reader, 1)
+  })
+  case is_uncompressed {
+    1 -> decode_uncompressed_metablock(reader, output, ring, mlen, limits)
+    _ -> decode_compressed_metablock(reader, output, ring, mlen, limits)
   }
 }
 
 // -- Compressed metablock (RFC 7932 §9.2) ------------------------------
 //
-// What this implementation parses:
-//
-//   * NBLTYPES for the literal, insert-and-copy, and distance
-//     categories (the var-len uint8 from RFC 7932 §9.2).
-//   * NPOSTFIX + NDIRECT and the literal context modes.
-//   * NTREES counts for literals and distances.
-//   * Every prefix-code descriptor — both simple (RFC 7932 §3.4)
-//     and complex (§3.5).
-//
-// What still returns `CodecNotImplemented`:
-//
-//   * Block switching (NBLTYPES > 1) and context maps (NTREES > 1).
-//   * The command loop and the ~120 KiB static dictionary
-//     (RFC 7932 §4 and §8).
+// Parses the full header, builds the three prefix codes, then enters
+// the command loop in `run_commands`.  Block switching (NBLTYPES > 1),
+// context maps (NTREES > 1), and static-dictionary references are
+// still surfaced as `CodecNotImplemented`.
 
 fn decode_compressed_metablock(
   reader: Reader,
-  _output: BitArray,
-  _mlen: Int,
-  _limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+  output: BitArray,
+  ring: DistRing,
+  mlen: Int,
+  limits: limit.Limits,
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
   use #(nbl_literal, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_command, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_distance, reader) <- result.try(decode_var_len_uint8(reader))
@@ -159,7 +165,8 @@ fn decode_compressed_metablock(
   use _ <- result.try(reject_block_switching("distance", nbl_distance))
 
   use #(npostfix, reader) <- result.try(read_bits(reader, 2))
-  use #(ndirect, reader) <- result.try(read_bits(reader, 4))
+  use #(ndirect_code, reader) <- result.try(read_bits(reader, 4))
+  let ndirect = int.bitwise_shift_left(ndirect_code, npostfix)
 
   // Per RFC 7932 §7.3 the literal context mode is 2 bits per literal
   // block type (1 entry when NBLTYPES_L == 1).
@@ -180,10 +187,10 @@ fn decode_compressed_metablock(
   let command_alphabet = 704
   let distance_alphabet = 16 + ndirect + int.bitwise_shift_left(48, npostfix)
 
-  use #(_literal_codes, reader) <- result.try(
+  use #(literal_codes, reader) <- result.try(
     decode_prefix_codes(reader, ntrees_literal, literal_alphabet, "literal", []),
   )
-  use #(_command_codes, reader) <- result.try(
+  use #(command_codes, reader) <- result.try(
     decode_prefix_codes(
       reader,
       nbl_command,
@@ -192,7 +199,7 @@ fn decode_compressed_metablock(
       [],
     ),
   )
-  use #(_distance_codes, _reader) <- result.try(
+  use #(distance_codes, reader) <- result.try(
     decode_prefix_codes(
       reader,
       ntrees_distance,
@@ -202,9 +209,509 @@ fn decode_compressed_metablock(
     ),
   )
 
-  Error(error.CodecNotImplemented(
-    feature: "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)",
+  let assert [literal_code, ..] = literal_codes
+  let assert [command_code, ..] = command_codes
+  let assert [distance_code, ..] = distance_codes
+
+  let state =
+    CommandState(
+      output: output,
+      ring: ring,
+      remaining: mlen,
+      literal: literal_code,
+      command: command_code,
+      distance: distance_code,
+      npostfix: npostfix,
+      ndirect: ndirect,
+      limits: limits,
+    )
+  use #(new_output, new_ring, reader) <- result.try(run_commands(reader, state))
+  Ok(#(new_output, new_ring, reader))
+}
+
+// -- Distance ring buffer (RFC 7932 §4) --------------------------------
+
+/// Brotli's 4-entry recent-distance buffer.  `idx` advances on every
+/// recorded distance; reading the kᵗʰ-most-recent distance uses
+/// `slots[(idx - 1 - k) & 3]`.  Initial values from RFC 7932 §4.
+type DistRing {
+  DistRing(idx: Int, d0: Int, d1: Int, d2: Int, d3: Int)
+}
+
+fn new_ring() -> DistRing {
+  DistRing(idx: 0, d0: 16, d1: 15, d2: 11, d3: 4)
+}
+
+fn ring_get(r: DistRing, slot: Int) -> Int {
+  case int.bitwise_and(slot, 3) {
+    0 -> r.d0
+    1 -> r.d1
+    2 -> r.d2
+    _ -> r.d3
+  }
+}
+
+fn ring_set(r: DistRing, slot: Int, value: Int) -> DistRing {
+  case int.bitwise_and(slot, 3) {
+    0 -> DistRing(..r, d0: value)
+    1 -> DistRing(..r, d1: value)
+    2 -> DistRing(..r, d2: value)
+    _ -> DistRing(..r, d3: value)
+  }
+}
+
+/// Write `distance` to the current slot then advance `idx`.  This is
+/// the post-decode step for every command's distance, including the
+/// reused "code 0" case (where the same value is written back).
+fn ring_push(ring: DistRing, distance: Int) -> DistRing {
+  let updated = ring_set(ring, ring.idx, distance)
+  DistRing(..updated, idx: updated.idx + 1)
+}
+
+// -- Command loop (RFC 7932 §4) ----------------------------------------
+//
+// One pass through the metablock body emits literals and copies until
+// MLEN bytes have been produced.  Each iteration:
+//
+//   1. Decode an insert-and-copy symbol from the command prefix code
+//      and turn it into `(insert_len, copy_len, dist_code, context)`
+//      via `cmd_lut`.
+//   2. Read `insert_len_extra` and `copy_len_extra` bits.
+//   3. Emit `insert_len` literals from the literal prefix code.
+//   4. If we still have bytes to produce, decode a distance code from
+//      the distance prefix code (unless the I+C entry's `dist_code`
+//      is `-1`, meaning "reuse the most recent distance"), resolve it
+//      against the ring buffer, and copy `copy_len` bytes from
+//      `output[pos - distance ..]`.
+//
+// The runtime state for one metablock is bundled in `CommandState` so
+// the (already pretty long) command-loop recurrences stay readable.
+
+type CommandState {
+  CommandState(
+    output: BitArray,
+    ring: DistRing,
+    remaining: Int,
+    literal: PrefixCode,
+    command: PrefixCode,
+    distance: PrefixCode,
+    npostfix: Int,
+    ndirect: Int,
+    limits: limit.Limits,
+  )
+}
+
+fn run_commands(
+  reader: Reader,
+  state: CommandState,
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+  case state.remaining <= 0 {
+    True -> Ok(#(state.output, state.ring, reader))
+    False -> {
+      use #(cmd, reader) <- result.try(decode_command(reader, state.command))
+      use #(state, reader) <- result.try(emit_literals(
+        reader,
+        state,
+        cmd.insert_len,
+      ))
+      case state.remaining <= 0 {
+        True -> Ok(#(state.output, state.ring, reader))
+        False -> execute_copy_step(reader, state, cmd)
+      }
+    }
+  }
+}
+
+fn execute_copy_step(
+  reader: Reader,
+  state: CommandState,
+  cmd: Command,
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+  use #(distance_code, reader) <- result.try(case cmd.distance_code {
+    -1 -> Ok(#(0, reader))
+    _ -> decode_prefix_symbol(reader, state.distance)
+  })
+  use #(distance, ring) <- result.try(resolve_distance(
+    distance_code,
+    state.ring,
+    state.npostfix,
+    state.ndirect,
+    cmd.distance_code,
   ))
+  use #(distance, ring, reader) <- result.try(
+    case cmd.distance_code != -1 && distance_code >= 16 + state.ndirect {
+      True ->
+        apply_long_distance(
+          reader,
+          distance_code,
+          state.npostfix,
+          state.ndirect,
+          state.ring,
+        )
+      False -> Ok(#(distance, ring, reader))
+    },
+  )
+  let state = CommandState(..state, ring: ring)
+  use state <- result.try(perform_copy(state, distance, cmd.copy_len))
+  run_commands(reader, state)
+}
+
+/// `resolve_distance` handles the short-code (0..15) path and direct
+/// codes.  Long codes need additional extra-bits reads and are routed
+/// through `apply_long_distance` after this call.
+fn resolve_distance(
+  distance_code: Int,
+  ring: DistRing,
+  _npostfix: Int,
+  ndirect: Int,
+  reuse_marker: Int,
+) -> Result(#(Int, DistRing), error.CodecError) {
+  case reuse_marker {
+    -1 -> {
+      // Implicit reuse of the most recent distance (no code read).
+      let distance = ring_get(ring, ring.idx - 1)
+      Ok(#(distance, ring))
+    }
+    _ ->
+      case distance_code < 16 {
+        True -> Ok(short_distance(distance_code, ring))
+        False ->
+          case distance_code < 16 + ndirect {
+            True -> {
+              let distance = distance_code - 15
+              Ok(#(distance, ring_push(ring, distance)))
+            }
+            // Long code — caller fills in via apply_long_distance.
+            False -> Ok(#(0, ring))
+          }
+      }
+  }
+}
+
+fn short_distance(code: Int, ring: DistRing) -> #(Int, DistRing) {
+  case code <= 3 {
+    True -> {
+      let dist_context = case code {
+        0 -> 1
+        _ -> 0
+      }
+      let offset = code - 3
+      let slot = ring.idx - offset
+      let distance = ring_get(ring, slot)
+      // Per RFC 7932 §4: rb_idx -= distance_context, then ring_push
+      // (which re-increments).  Net for code 0: no change; for codes
+      // 1..3: the reused distance becomes the new most recent.
+      let ring = DistRing(..ring, idx: ring.idx - dist_context)
+      #(distance, ring_push(ring, distance))
+    }
+    False -> {
+      // Codes 4..15: 6 derived offsets from ring[0] or ring[3].
+      // delta table from C `0x605142` packed-nibble lookup.
+      let #(base, index_delta) = case code < 10 {
+        True -> #(code - 4, 3)
+        False -> #(code - 10, 2)
+      }
+      let nibbles = 0x605142
+      let pre_delta =
+        int.bitwise_and(int.bitwise_shift_right(nibbles, 4 * base), 0xF)
+      let delta = pre_delta - 3
+      let slot = ring.idx + index_delta
+      let distance = ring_get(ring, slot) + delta
+      #(distance, ring_push(ring, distance))
+    }
+  }
+}
+
+/// Long-distance branch: read `extra_bits` extra bits and combine with
+/// the per-code base offset.  Pushes the result onto the supplied
+/// ring buffer.
+fn apply_long_distance(
+  reader: Reader,
+  distance_code: Int,
+  npostfix: Int,
+  ndirect: Int,
+  ring: DistRing,
+) -> Result(#(Int, DistRing, Reader), error.CodecError) {
+  let #(extra_bits, base) =
+    long_distance_params(distance_code, npostfix, ndirect)
+  use #(extra, reader) <- result.try(read_bits(reader, extra_bits))
+  let distance = base + int.bitwise_shift_left(extra, npostfix)
+  Ok(#(distance, ring_push(ring, distance), reader))
+}
+
+/// Per RFC 7932 §4 the long-distance code group `g` (counting from 0)
+/// has `bits = g/2 + 1` extra bits.  Each group holds `2^npostfix`
+/// codes that share `bits` and differ in their low `npostfix` bits.
+/// The base offset for group `g`, sub-code `j`, is
+///   NDIRECT + (((2 + (g % 2)) << bits - 4) << npostfix) + 1 + j
+fn long_distance_params(code: Int, npostfix: Int, ndirect: Int) -> #(Int, Int) {
+  let postfix = int.bitwise_shift_left(1, npostfix)
+  let i_relative = code - 16 - ndirect
+  let group_idx = i_relative / postfix
+  let within_group = i_relative % postfix
+  let bits = group_idx / 2 + 1
+  let half = group_idx % 2
+  let pre = int.bitwise_shift_left(2 + half, bits) - 4
+  let base = ndirect + int.bitwise_shift_left(pre, npostfix) + 1 + within_group
+  #(bits, base)
+}
+
+fn perform_copy(
+  state: CommandState,
+  distance: Int,
+  copy_len: Int,
+) -> Result(CommandState, error.CodecError) {
+  let pos = bit_array.byte_size(state.output)
+  case distance > pos {
+    True ->
+      Error(error.CodecNotImplemented(
+        feature: "brotli static dictionary reference (RFC 7932 §8) — distance "
+        <> int.to_string(distance)
+        <> " > output position "
+        <> int.to_string(pos),
+      ))
+    False -> {
+      let actual = int.min(copy_len, state.remaining)
+      let new_output = lz77_copy(state.output, distance, actual, pos)
+      let projected = bit_array.byte_size(new_output)
+      use <- bool.guard(
+        when: projected > limit.max_output_bytes(state.limits),
+        return: Error(error.CodecLimitExceeded(
+          limit: "max_output_bytes",
+          value: projected,
+        )),
+      )
+      Ok(
+        CommandState(
+          ..state,
+          output: new_output,
+          remaining: state.remaining - actual,
+        ),
+      )
+    }
+  }
+}
+
+/// LZ77-style self-overlapping copy: emit `count` bytes by reading
+/// `output[pos - distance]` and appending it, then incrementing pos.
+/// Works correctly for `distance < count` because each emitted byte
+/// updates the source.
+fn lz77_copy(output: BitArray, distance: Int, count: Int, pos: Int) -> BitArray {
+  case count {
+    0 -> output
+    _ -> {
+      let src = pos - distance
+      let assert Ok(<<byte>>) = bit_array.slice(output, src, 1)
+      lz77_copy(<<output:bits, byte>>, distance, count - 1, pos + 1)
+    }
+  }
+}
+
+/// Emit `count` literals decoded one by one from the literal prefix
+/// code.  Honours the metablock's `remaining` budget.
+fn emit_literals(
+  reader: Reader,
+  state: CommandState,
+  count: Int,
+) -> Result(#(CommandState, Reader), error.CodecError) {
+  let actual = int.min(count, state.remaining)
+  emit_literals_loop(reader, state, actual)
+}
+
+fn emit_literals_loop(
+  reader: Reader,
+  state: CommandState,
+  remaining: Int,
+) -> Result(#(CommandState, Reader), error.CodecError) {
+  case remaining {
+    0 -> Ok(#(state, reader))
+    _ -> {
+      use #(byte, reader) <- result.try(decode_prefix_symbol(
+        reader,
+        state.literal,
+      ))
+      let projected = bit_array.byte_size(state.output) + 1
+      use <- bool.guard(
+        when: projected > limit.max_output_bytes(state.limits),
+        return: Error(error.CodecLimitExceeded(
+          limit: "max_output_bytes",
+          value: projected,
+        )),
+      )
+      let new_state =
+        CommandState(
+          ..state,
+          output: <<state.output:bits, byte>>,
+          remaining: state.remaining - 1,
+        )
+      emit_literals_loop(reader, new_state, remaining - 1)
+    }
+  }
+}
+
+// -- Insert-and-copy alphabet (RFC 7932 §5 / brotli `kCmdLut`) ---------
+
+type Command {
+  Command(
+    insert_len: Int,
+    copy_len: Int,
+    /// `-1` for "no distance code follows; reuse most recent
+    /// distance"; `0` for "decode a distance code".  Mirrors brotli's
+    /// `kCmdLut[code].distance_code` field.
+    distance_code: Int,
+    distance_context: Int,
+  )
+}
+
+fn decode_command(
+  reader: Reader,
+  code: PrefixCode,
+) -> Result(#(Command, Reader), error.CodecError) {
+  use #(symbol, reader) <- result.try(decode_prefix_symbol(reader, code))
+  let lut = cmd_lut_entry(symbol)
+  use #(ins_extra, reader) <- result.try(read_bits(reader, lut.ins_extra_bits))
+  use #(copy_extra, reader) <- result.try(read_bits(reader, lut.copy_extra_bits))
+  let command =
+    Command(
+      insert_len: lut.ins_offset + ins_extra,
+      copy_len: lut.copy_offset + copy_extra,
+      distance_code: lut.distance_code,
+      distance_context: lut.context,
+    )
+  Ok(#(command, reader))
+}
+
+type CmdLut {
+  CmdLut(
+    ins_extra_bits: Int,
+    copy_extra_bits: Int,
+    distance_code: Int,
+    context: Int,
+    ins_offset: Int,
+    copy_offset: Int,
+  )
+}
+
+/// Compute the `kCmdLut`-equivalent entry for an insert-and-copy
+/// symbol (0..703).  Algorithm matches `BrotliDecoderInitCmdLut` in
+/// `brotli/c/dec/prefix.c`:
+///
+///   cell_idx = symbol >> 6
+///   cell_pos = kCellPos[cell_idx]
+///   copy_code   = ((cell_pos << 3) & 0x18) | (symbol & 0x7)
+///   insert_code = (cell_pos & 0x18) | ((symbol >> 3) & 0x7)
+///
+/// distance_code = -1 for cell_idx ≥ 2 (literal-and-copy with reused
+/// distance), 0 otherwise.  context = 3 when copy_offset > 4, else
+/// copy_offset - 2.
+fn cmd_lut_entry(symbol: Int) -> CmdLut {
+  let cell_idx = int.bitwise_shift_right(symbol, 6)
+  let cell_pos = cell_pos_table(cell_idx)
+  let copy_code =
+    int.bitwise_or(
+      int.bitwise_and(int.bitwise_shift_left(cell_pos, 3), 0x18),
+      int.bitwise_and(symbol, 0x7),
+    )
+  let insert_code =
+    int.bitwise_or(
+      int.bitwise_and(cell_pos, 0x18),
+      int.bitwise_and(int.bitwise_shift_right(symbol, 3), 0x7),
+    )
+  let copy_off = cumulative_copy_offset(copy_code)
+  let dist_code = case cell_idx >= 2 {
+    True -> -1
+    False -> 0
+  }
+  let context = case copy_off > 4 {
+    True -> 3
+    False -> copy_off - 2
+  }
+  CmdLut(
+    ins_extra_bits: insert_extra_bits(insert_code),
+    copy_extra_bits: copy_extra_bits(copy_code),
+    distance_code: dist_code,
+    context: context,
+    ins_offset: cumulative_insert_offset(insert_code),
+    copy_offset: copy_off,
+  )
+}
+
+fn cell_pos_table(idx: Int) -> Int {
+  case idx {
+    0 -> 0
+    1 -> 1
+    2 -> 0
+    3 -> 1
+    4 -> 8
+    5 -> 9
+    6 -> 2
+    7 -> 16
+    8 -> 10
+    9 -> 17
+    _ -> 18
+  }
+}
+
+fn insert_extra_bits(code: Int) -> Int {
+  case code {
+    0 | 1 | 2 | 3 | 4 | 5 -> 0
+    6 | 7 -> 1
+    8 | 9 -> 2
+    10 | 11 -> 3
+    12 | 13 -> 4
+    14 | 15 -> 5
+    16 -> 6
+    17 -> 7
+    18 -> 8
+    19 -> 9
+    20 -> 10
+    21 -> 12
+    22 -> 14
+    _ -> 24
+  }
+}
+
+fn copy_extra_bits(code: Int) -> Int {
+  case code {
+    0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 -> 0
+    8 | 9 -> 1
+    10 | 11 -> 2
+    12 | 13 -> 3
+    14 | 15 -> 4
+    16 | 17 -> 5
+    18 -> 6
+    19 -> 7
+    20 -> 8
+    21 -> 9
+    22 -> 10
+    _ -> 24
+  }
+}
+
+fn cumulative_insert_offset(target: Int) -> Int {
+  cumulative_offset_loop(0, 0, target, insert_extra_bits)
+}
+
+fn cumulative_copy_offset(target: Int) -> Int {
+  cumulative_offset_loop(2, 0, target, copy_extra_bits)
+}
+
+fn cumulative_offset_loop(
+  cur: Int,
+  idx: Int,
+  target: Int,
+  extra: fn(Int) -> Int,
+) -> Int {
+  case idx == target {
+    True -> cur
+    False ->
+      cumulative_offset_loop(
+        cur + int.bitwise_shift_left(1, extra(idx)),
+        idx + 1,
+        target,
+        extra,
+      )
+  }
 }
 
 fn reject_block_switching(
@@ -815,7 +1322,8 @@ fn decode_var_len_uint8(
 fn decode_skip_metablock(
   reader: Reader,
   output: BitArray,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+  ring: DistRing,
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
   use #(reserved, reader) <- result.try(read_bits(reader, 1))
   use <- bool.guard(
     when: reserved != 0,
@@ -831,15 +1339,16 @@ fn decode_skip_metablock(
   let skip = mskiplen + 1
   let reader = align_to_byte(reader)
   let reader = consume_bytes(reader, skip)
-  Ok(#(output, reader))
+  Ok(#(output, ring, reader))
 }
 
 fn decode_uncompressed_metablock(
   reader: Reader,
   output: BitArray,
+  ring: DistRing,
   mlen: Int,
   limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
   let reader = align_to_byte(reader)
   use #(chunk, reader) <- result.try(take_bytes(reader, mlen))
   let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
@@ -849,7 +1358,7 @@ fn decode_uncompressed_metablock(
         limit: "max_output_bytes",
         value: projected,
       ))
-    False -> Ok(#(bit_array.concat([output, chunk]), reader))
+    False -> Ok(#(bit_array.concat([output, chunk]), ring, reader))
   }
 }
 
