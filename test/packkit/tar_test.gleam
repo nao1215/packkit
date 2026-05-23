@@ -1,6 +1,7 @@
 import gleam/bit_array
 import gleam/list
 import gleam/option.{Some}
+import gleam/string
 import gleeunit/should
 import packkit/archive
 import packkit/entry
@@ -108,6 +109,196 @@ pub fn member_count_limit_is_enforced_test() -> Nil {
     Error(error.ArchiveLimitExceeded(limit: "max_members", value: _)) -> Nil
     _ -> should.fail()
   }
+}
+
+// ===== GNU long-name / long-link fixture builders =====
+//
+// These helpers stitch together hand-crafted USTAR blocks so the test
+// can feed packkit a stream that mirrors what GNU tar emits for long
+// paths (a `././@LongLink` record with typeflag 'L' or 'K' followed by
+// the real entry).  They intentionally duplicate the field layout from
+// `src/packkit/tar.gleam` so the test stays independent of internals.
+
+const tar_block_size: Int = 512
+
+fn tar_zero_block() -> BitArray {
+  tar_byte_repeat(0, tar_block_size)
+}
+
+fn tar_byte_repeat(byte: Int, count: Int) -> BitArray {
+  tar_byte_repeat_loop(byte, count, <<>>)
+}
+
+fn tar_byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> tar_byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
+/// Overlay `bytes` into `block` starting at `offset`.  Assumes the
+/// region fits inside the 512-byte block.
+fn tar_write_at(block: BitArray, offset: Int, bytes: BitArray) -> BitArray {
+  let written = bit_array.byte_size(bytes)
+  let assert Ok(prefix) = bit_array.slice(block, 0, offset)
+  let assert Ok(suffix) =
+    bit_array.slice(block, offset + written, tar_block_size - offset - written)
+  bit_array.concat([prefix, bytes, suffix])
+}
+
+fn tar_octal_digits(value: Int, remaining: Int, acc: BitArray) -> BitArray {
+  case remaining {
+    0 -> acc
+    _ -> {
+      let digit = value % 8
+      let next = value / 8
+      let ch = 0x30 + digit
+      tar_octal_digits(next, remaining - 1, <<ch, acc:bits>>)
+    }
+  }
+}
+
+/// `width` covers the digit run plus the trailing NUL terminator.
+fn tar_octal_field(value: Int, width: Int) -> BitArray {
+  bit_array.concat([tar_octal_digits(value, width - 1, <<>>), <<0>>])
+}
+
+fn tar_checksum_loop(block: BitArray, pos: Int, acc: Int) -> Int {
+  case block {
+    <<>> -> acc
+    <<b, rest:bytes>> -> {
+      let contribution = case pos >= 148 && pos < 156 {
+        True -> 0x20
+        False -> b
+      }
+      tar_checksum_loop(rest, pos + 1, acc + contribution)
+    }
+    _ -> acc
+  }
+}
+
+/// USTAR-style checksum: byte sum of the block, treating the 8-byte
+/// chksum field at offset 148 as ASCII spaces.
+fn tar_checksum(block: BitArray) -> Int {
+  tar_checksum_loop(block, 0, 0)
+}
+
+/// `"ustar  \\0"` — GNU's variant of the USTAR magic+version field.
+fn tar_gnu_magic_version() -> BitArray {
+  <<0x75, 0x73, 0x74, 0x61, 0x72, 0x20, 0x20, 0>>
+}
+
+/// Build a 512-byte header block with GNU magic.  `linkname` is empty
+/// for non-link entries.
+fn tar_build_header(
+  name name: String,
+  size size: Int,
+  typeflag typeflag: Int,
+  linkname linkname: String,
+) -> BitArray {
+  let blanked =
+    tar_zero_block()
+    |> tar_write_at(0, bit_array.from_string(name))
+    |> tar_write_at(100, tar_octal_field(0o644, 8))
+    |> tar_write_at(108, tar_octal_field(0, 8))
+    |> tar_write_at(116, tar_octal_field(0, 8))
+    |> tar_write_at(124, tar_octal_field(size, 12))
+    |> tar_write_at(136, tar_octal_field(0, 12))
+    |> tar_write_at(148, tar_byte_repeat(0x20, 8))
+    |> tar_write_at(156, <<typeflag>>)
+    |> tar_write_at(157, bit_array.from_string(linkname))
+    |> tar_write_at(257, tar_gnu_magic_version())
+  let cs = tar_checksum(blanked)
+  let chksum_field =
+    bit_array.concat([tar_octal_digits(cs, 6, <<>>), <<0, 0x20>>])
+  tar_write_at(blanked, 148, chksum_field)
+}
+
+/// Pad a body to the next 512-byte boundary with NULs.
+fn tar_pad_body(body: BitArray) -> BitArray {
+  let n = bit_array.byte_size(body)
+  let pad = case n % tar_block_size {
+    0 -> 0
+    rem -> tar_block_size - rem
+  }
+  bit_array.concat([body, tar_byte_repeat(0, pad)])
+}
+
+// ===== GNU long-name / long-link decode tests =====
+
+pub fn ustar_decodes_100_char_name_test() -> Nil {
+  // 100 ASCII bytes exactly fit the USTAR `name` field, so no GNU
+  // LongLink record is required.  Regresses the boundary case where
+  // packkit should not need any extension support.
+  let name = string.repeat("a", times: 100)
+  let body = <<"hello100":utf8>>
+  let header =
+    tar_build_header(name: name, size: 8, typeflag: 0x30, linkname: "")
+  let stream =
+    bit_array.concat([
+      header,
+      tar_pad_body(body),
+      tar_zero_block(),
+      tar_zero_block(),
+    ])
+
+  let assert Ok(decoded) = tar.decode(bytes: stream)
+  let assert [file_entry] = archive.entries(decoded)
+  file_entry
+  |> entry.path_of
+  |> entry.to_string
+  |> should.equal(name)
+  entry.body(file_entry)
+  |> should.equal(body)
+}
+
+pub fn decodes_gnu_long_name_test() -> Nil {
+  // 124 ASCII bytes overflow the 100-byte USTAR `name` field, so GNU
+  // tar prefixes the file entry with a `././@LongLink` record
+  // (typeflag 'L') whose body carries the real name terminated by a
+  // single NUL — the `size` field therefore reports 125 = 124 + NUL.
+  // The follow-up entry header keeps the first 100 bytes of the long
+  // name in its `name` field; packkit must override that with the
+  // LongLink value.
+  let long_name = string.repeat("a", times: 124)
+  let truncated_name = string.repeat("a", times: 100)
+  let body = <<"hello124":utf8>>
+
+  let longlink_body =
+    bit_array.concat([bit_array.from_string(long_name), <<0>>])
+  let longlink_header =
+    tar_build_header(
+      name: "././@LongLink",
+      size: 125,
+      typeflag: 0x4C,
+      linkname: "",
+    )
+  let entry_header =
+    tar_build_header(
+      name: truncated_name,
+      size: 8,
+      typeflag: 0x30,
+      linkname: "",
+    )
+
+  let stream =
+    bit_array.concat([
+      longlink_header,
+      tar_pad_body(longlink_body),
+      entry_header,
+      tar_pad_body(body),
+      tar_zero_block(),
+      tar_zero_block(),
+    ])
+
+  let assert Ok(decoded) = tar.decode(bytes: stream)
+  let assert [file_entry] = archive.entries(decoded)
+  file_entry
+  |> entry.path_of
+  |> entry.to_string
+  |> should.equal(long_name)
+  entry.body(file_entry)
+  |> should.equal(body)
 }
 
 pub fn round_trips_metadata_test() -> Nil {
