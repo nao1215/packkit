@@ -36,7 +36,8 @@ Implemented codecs and archive families:
 - **zlib**: RFC 1950 wrapper with Adler-32 trailer
 - **gzip**: RFC 1952 wrapper with header metadata and CRC/ISIZE
   verification
-- **lz4**: frame decoder + uncompressed-block encoder
+- **lz4**: frame decoder + LZ77 block encoder (greedy 4-byte hash-
+  chain match-finder with uncompressed-block fallback)
 - **snappy**: raw-block and framed codec
 - **bzip2**: round-trip (BWT inverse + MTF + Huffman + RUNA/RUNB + RLE1
   for decode; naive forward BWT + length-limited Huffman for encode)

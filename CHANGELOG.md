@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Replaced the LZ4 frame encoder's uncompressed-only path with a
+  real LZ77 block compressor.  Each block runs a greedy 4-byte hash-
+  chain match-finder (16-bit hash table, max distance 65 535,
+  minimum match 4) and emits the LZ77 sequences in the canonical
+  block layout (token byte with 4-bit literal-length / 4-bit match-
+  length nibbles, 0xFF-terminated extensions for either field >=15,
+  literals, little-endian 16-bit offset, match-length extension).
+  Blocks whose compressed form would grow are still emitted in the
+  uncompressed form so the frame never gets larger than the input.
 - Extended the Zstandard sequences-section parser to recognise the
   non-`Predefined_Mode` symbol-description selectors.  `RLE_Mode`
   builds a one-state FSE table from the inline byte and

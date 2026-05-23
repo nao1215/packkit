@@ -1,13 +1,17 @@
 //// LZ4 frame format codec.
 ////
-//// This module decodes LZ4 frames (magic `0x184D2204`) as specified
-//// in the LZ4 Frame Format Description and emits frames that store
-//// every block in the uncompressed form.  Round-trip correctness is
-//// guaranteed for any conforming decoder; the encoder simply leaves
-//// real LZ4 block compression as future work.
+//// Decodes LZ4 frames (magic `0x184D2204`) as specified in the LZ4
+//// Frame Format Description.  The encoder runs a greedy 4-byte hash-
+//// chain match-finder over each block and emits the LZ77 sequences
+//// in the canonical block layout (token byte + optional length
+//// extensions + literals + 16-bit little-endian offset + optional
+//// match-length extensions).  Blocks that don't shrink are emitted
+//// in the uncompressed form to guarantee the frame never grows
+//// beyond `1 + ceil(input_size / block_max) * (4 + block_max)`.
 
 import gleam/bit_array
 import gleam/bool
+import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/result
@@ -132,11 +136,329 @@ fn encode_blocks(remaining: BitArray, acc: List(BitArray)) -> BitArray {
       let assert Ok(chunk) = bit_array.slice(remaining, 0, chunk_size)
       let assert Ok(after) =
         bit_array.slice(remaining, chunk_size, total - chunk_size)
-      let header_bits = <<
-        int.bitwise_or(uncompressed_block_bit, chunk_size):size(32)-little,
-      >>
-      encode_blocks(after, [bit_array.concat([header_bits, chunk]), ..acc])
+      // Try real LZ77 compression first; fall back to an uncompressed
+      // block when the result doesn't shrink (or matches the input
+      // byte-for-byte) so the frame is never larger than the original
+      // payload + framing overhead.
+      let compressed = compress_block(chunk, chunk_size)
+      let compressed_size = bit_array.byte_size(compressed)
+      let framed = case compressed_size < chunk_size {
+        True -> <<compressed_size:size(32)-little, compressed:bits>>
+        False -> <<
+          int.bitwise_or(uncompressed_block_bit, chunk_size):size(32)-little,
+          chunk:bits,
+        >>
+      }
+      encode_blocks(after, [framed, ..acc])
     }
+  }
+}
+
+// -- LZ77 block compressor ---------------------------------------------
+//
+// The LZ4 block format (Yann Collet's spec) encodes a sequence of
+// `(token | optional literal-length extensions | literals | 16-bit
+// little-endian offset | optional match-length extensions)` records,
+// with the final record carrying only literals.  Two parsing rules
+// the reference decoder enforces:
+//
+// 1. The last 5 bytes of input are always literals.
+// 2. The last match must start at least 12 bytes before the end of
+//    block.
+//
+// The encoder runs a greedy 4-byte hash-chain match-finder honouring
+// both rules.  Min match length is 4; the stored match length is the
+// actual length minus 4 (so the low nibble of the token covers
+// matches of length 4..18 inline).
+
+const lz4_min_match: Int = 4
+
+const lz4_max_distance: Int = 65_535
+
+const lz4_last_literals: Int = 5
+
+const lz4_safety_margin: Int = 12
+
+fn compress_block(bytes: BitArray, size: Int) -> BitArray {
+  case size <= lz4_safety_margin {
+    True -> emit_literal_only_block(bytes, 0, size)
+    False -> {
+      let table = build_byte_table(bytes, 0, dict.new())
+      compress_loop(table, size, 0, 0, dict.new(), [])
+    }
+  }
+}
+
+fn compress_loop(
+  table: dict.Dict(Int, Int),
+  size: Int,
+  pos: Int,
+  last_lit_start: Int,
+  hashes: dict.Dict(Int, Int),
+  acc: List(BitArray),
+) -> BitArray {
+  let last_search = size - lz4_safety_margin
+  case pos > last_search {
+    True -> {
+      // Tail: emit the remaining bytes as a literal-only sequence.
+      let lit_len = size - last_lit_start
+      let tail = emit_literal_only_chunk(table, last_lit_start, lit_len)
+      bit_array.concat(list.reverse([tail, ..acc]))
+    }
+    False -> step_compress(table, size, pos, last_lit_start, hashes, acc)
+  }
+}
+
+fn step_compress(
+  table: dict.Dict(Int, Int),
+  size: Int,
+  pos: Int,
+  last_lit_start: Int,
+  hashes: dict.Dict(Int, Int),
+  acc: List(BitArray),
+) -> BitArray {
+  let key =
+    hash4(
+      byte_at(table, pos),
+      byte_at(table, pos + 1),
+      byte_at(table, pos + 2),
+      byte_at(table, pos + 3),
+    )
+  case dict.get(hashes, key) {
+    Ok(prev) -> {
+      let distance = pos - prev
+      let valid =
+        distance >= 1
+        && distance <= lz4_max_distance
+        && bytes4_equal(table, prev, pos)
+      case valid {
+        False ->
+          compress_loop(
+            table,
+            size,
+            pos + 1,
+            last_lit_start,
+            dict.insert(hashes, key, pos),
+            acc,
+          )
+        True -> {
+          // The last `lz4_last_literals` bytes of the block can't be
+          // consumed by a match, so cap the search horizon to keep
+          // those bytes for the trailing literal sequence.
+          let search_end = size - lz4_last_literals
+          let match_len = lz4_match_length(table, prev, pos, search_end, 0)
+          case match_len < lz4_min_match {
+            True ->
+              compress_loop(
+                table,
+                size,
+                pos + 1,
+                last_lit_start,
+                dict.insert(hashes, key, pos),
+                acc,
+              )
+            False -> {
+              let lit_len = pos - last_lit_start
+              let seq =
+                emit_sequence(
+                  table,
+                  last_lit_start,
+                  lit_len,
+                  distance,
+                  match_len,
+                )
+              let next_pos = pos + match_len
+              let new_hashes =
+                lz4_insert_hashes(
+                  table,
+                  dict.insert(hashes, key, pos),
+                  pos + 1,
+                  next_pos - 1,
+                  size,
+                )
+              compress_loop(table, size, next_pos, next_pos, new_hashes, [
+                seq,
+                ..acc
+              ])
+            }
+          }
+        }
+      }
+    }
+    _ ->
+      compress_loop(
+        table,
+        size,
+        pos + 1,
+        last_lit_start,
+        dict.insert(hashes, key, pos),
+        acc,
+      )
+  }
+}
+
+fn build_byte_table(
+  bytes: BitArray,
+  index: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case bytes {
+    <<b, rest:bytes>> ->
+      build_byte_table(rest, index + 1, dict.insert(acc, index, b))
+    _ -> acc
+  }
+}
+
+fn byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
+  case dict.get(table, index) {
+    Ok(b) -> b
+    _ -> 0
+  }
+}
+
+fn hash4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int {
+  // Mix the four bytes through the Fibonacci multiplier and truncate
+  // to 16 bits.  The exact hash isn't part of the LZ4 wire format —
+  // any hash that produces good 4-byte uniqueness suffices.
+  let combined =
+    int.bitwise_or(
+      b0,
+      int.bitwise_or(
+        int.bitwise_shift_left(b1, 8),
+        int.bitwise_or(
+          int.bitwise_shift_left(b2, 16),
+          int.bitwise_shift_left(b3, 24),
+        ),
+      ),
+    )
+  int.bitwise_and(combined * 2_654_435_761, 0xFFFF)
+}
+
+fn bytes4_equal(table: dict.Dict(Int, Int), p1: Int, p2: Int) -> Bool {
+  byte_at(table, p1) == byte_at(table, p2)
+  && byte_at(table, p1 + 1) == byte_at(table, p2 + 1)
+  && byte_at(table, p1 + 2) == byte_at(table, p2 + 2)
+  && byte_at(table, p1 + 3) == byte_at(table, p2 + 3)
+}
+
+fn lz4_match_length(
+  table: dict.Dict(Int, Int),
+  base: Int,
+  cursor: Int,
+  limit_pos: Int,
+  acc: Int,
+) -> Int {
+  case cursor + acc >= limit_pos {
+    True -> acc
+    False ->
+      case byte_at(table, base + acc) == byte_at(table, cursor + acc) {
+        True -> lz4_match_length(table, base, cursor, limit_pos, acc + 1)
+        False -> acc
+      }
+  }
+}
+
+fn lz4_insert_hashes(
+  table: dict.Dict(Int, Int),
+  hashes: dict.Dict(Int, Int),
+  from: Int,
+  to: Int,
+  size: Int,
+) -> dict.Dict(Int, Int) {
+  case from > to || from + lz4_min_match > size {
+    True -> hashes
+    False -> {
+      let key =
+        hash4(
+          byte_at(table, from),
+          byte_at(table, from + 1),
+          byte_at(table, from + 2),
+          byte_at(table, from + 3),
+        )
+      lz4_insert_hashes(
+        table,
+        dict.insert(hashes, key, from),
+        from + 1,
+        to,
+        size,
+      )
+    }
+  }
+}
+
+fn emit_sequence(
+  table: dict.Dict(Int, Int),
+  lit_start: Int,
+  lit_len: Int,
+  distance: Int,
+  match_len: Int,
+) -> BitArray {
+  let ml_stored = match_len - lz4_min_match
+  let lit_high = case lit_len >= 15 {
+    True -> 15
+    False -> lit_len
+  }
+  let ml_high = case ml_stored >= 15 {
+    True -> 15
+    False -> ml_stored
+  }
+  let token = int.bitwise_or(int.bitwise_shift_left(lit_high, 4), ml_high)
+  let lit_ext = case lit_len >= 15 {
+    True -> encode_length_extension(lit_len - 15)
+    False -> <<>>
+  }
+  let literals = collect_bytes(table, lit_start, lit_len, <<>>)
+  let offset = <<distance:size(16)-little>>
+  let ml_ext = case ml_stored >= 15 {
+    True -> encode_length_extension(ml_stored - 15)
+    False -> <<>>
+  }
+  bit_array.concat([<<token>>, lit_ext, literals, offset, ml_ext])
+}
+
+fn emit_literal_only_block(bytes: BitArray, start: Int, size: Int) -> BitArray {
+  let table = build_byte_table(bytes, 0, dict.new())
+  emit_literal_only_chunk(table, start, size)
+}
+
+fn emit_literal_only_chunk(
+  table: dict.Dict(Int, Int),
+  start: Int,
+  lit_len: Int,
+) -> BitArray {
+  let lit_high = case lit_len >= 15 {
+    True -> 15
+    False -> lit_len
+  }
+  let token = int.bitwise_shift_left(lit_high, 4)
+  let lit_ext = case lit_len >= 15 {
+    True -> encode_length_extension(lit_len - 15)
+    False -> <<>>
+  }
+  let literals = collect_bytes(table, start, lit_len, <<>>)
+  bit_array.concat([<<token>>, lit_ext, literals])
+}
+
+fn encode_length_extension(n: Int) -> BitArray {
+  case n {
+    n if n < 255 -> <<n>>
+    _ -> bit_array.concat([<<0xFF>>, encode_length_extension(n - 255)])
+  }
+}
+
+fn collect_bytes(
+  table: dict.Dict(Int, Int),
+  start: Int,
+  count: Int,
+  acc: BitArray,
+) -> BitArray {
+  case count {
+    0 -> acc
+    _ ->
+      collect_bytes(table, start + 1, count - 1, <<
+        acc:bits,
+        byte_at(table, start),
+      >>)
   }
 }
 

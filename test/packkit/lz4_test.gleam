@@ -59,3 +59,55 @@ pub fn roundtrip_empty_payload_test() -> Nil {
   restored
   |> should.equal(<<>>)
 }
+
+pub fn encoder_compresses_repeating_payload_test() -> Nil {
+  // Highly compressible input — 1 KiB of 'a'.  The new LZ77 encoder
+  // must shrink it well below the input size (the previous
+  // uncompressed-only encoder added ~12 bytes of framing).
+  let payload = repeat_byte(0x61, 1024, <<>>)
+  let assert Ok(frame) = lz4.encode(bytes: payload)
+  let assert Ok(restored) = lz4.decode(bytes: frame)
+  restored
+  |> should.equal(payload)
+  { bit_array.byte_size(frame) < 100 }
+  |> should.be_true
+}
+
+pub fn encoder_compresses_repeating_pattern_test() -> Nil {
+  let payload =
+    bit_array.concat(list_repeat(
+      <<"The quick brown fox jumps over the lazy dog.":utf8>>,
+      20,
+    ))
+  let assert Ok(frame) = lz4.encode(bytes: payload)
+  let assert Ok(restored) = lz4.decode(bytes: frame)
+  restored
+  |> should.equal(payload)
+  { bit_array.byte_size(frame) < bit_array.byte_size(payload) }
+  |> should.be_true
+}
+
+pub fn roundtrip_random_short_test() -> Nil {
+  let assert Ok(payload) =
+    bit_array.base16_decode(
+      "DE7374EF0634215A02948D5CBADC072B286F8175B5FE2FA00B1FCCB187702CF8",
+    )
+  let assert Ok(frame) = lz4.encode(bytes: payload)
+  let assert Ok(restored) = lz4.decode(bytes: frame)
+  restored
+  |> should.equal(payload)
+}
+
+fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
+fn list_repeat(value: a, n: Int) -> List(a) {
+  case n {
+    0 -> []
+    _ -> [value, ..list_repeat(value, n - 1)]
+  }
+}
