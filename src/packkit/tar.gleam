@@ -169,7 +169,12 @@ fn decode_loop_with_pending(
     )),
   )
   let assert Ok(header_bits) = bit_array.slice(bytes, 0, block_size)
-  use <- bool.guard(when: is_zero_block(header_bits), return: Ok(acc))
+  // POSIX 1003.1 requires two consecutive zero blocks at end-of-archive;
+  // a single zero block followed by truncation is malformed.
+  use <- bool.lazy_guard(
+    when: is_zero_block(header_bits),
+    return: fn() { verify_double_zero_terminator(bytes, acc) },
+  )
   use header <- result.try(parse_header(header_bits))
   let body_padded = round_up_to_block(header.size)
   let total_advance = block_size + body_padded
@@ -524,14 +529,40 @@ fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
     kind: "linkname",
   ))
 
+  // USTAR encodes integers as zero-padded octal terminated by NUL.
+  // A `width=8` field thus holds 7 octal digits → max 2^21-1; a
+  // `width=12` field holds 11 octal digits → max 2^33-1.  Reject
+  // overflow instead of silently dropping high bits.
+  use mode_field <- result.try(checked_octal_field(
+    entry.mode(metadata),
+    8,
+    "mode",
+  ))
+  use uid_field <- result.try(checked_octal_field(
+    entry.user_id(metadata),
+    8,
+    "uid",
+  ))
+  use gid_field <- result.try(checked_octal_field(
+    entry.group_id(metadata),
+    8,
+    "gid",
+  ))
+  use size_field <- result.try(checked_octal_field(size, 12, "size"))
+  use mtime_field <- result.try(checked_octal_field(
+    entry.modified_at_unix(metadata),
+    12,
+    "mtime",
+  ))
+
   let initial =
     bit_array.concat([
       name_field,
-      octal_field(entry.mode(metadata), 8),
-      octal_field(entry.user_id(metadata), 8),
-      octal_field(entry.group_id(metadata), 8),
-      octal_field(size, 12),
-      octal_field(entry.modified_at_unix(metadata), 12),
+      mode_field,
+      uid_field,
+      gid_field,
+      size_field,
+      mtime_field,
       checksum_blank_field(),
       <<typeflag>>,
       linkname_field,
@@ -684,6 +715,35 @@ fn octal_field(value: Int, width: Int) -> BitArray {
   let digit_width = width - 1
   let digits = to_octal_digits(value, digit_width)
   bit_array.concat([digits, <<0>>])
+}
+
+fn checked_octal_field(
+  value: Int,
+  width: Int,
+  field: String,
+) -> Result(BitArray, error.ArchiveError) {
+  let digit_width = width - 1
+  let max_value = pow_int(8, digit_width) - 1
+  case value < 0 || value > max_value {
+    True ->
+      Error(error.ArchiveFieldOverflow(
+        field: "tar " <> field,
+        value: value,
+        max: max_value,
+      ))
+    False -> Ok(octal_field(value, width))
+  }
+}
+
+fn pow_int(base: Int, exponent: Int) -> Int {
+  pow_int_loop(base, exponent, 1)
+}
+
+fn pow_int_loop(base: Int, exponent: Int, acc: Int) -> Int {
+  case exponent {
+    0 -> acc
+    _ -> pow_int_loop(base, exponent - 1, acc * base)
+  }
 }
 
 fn checksum_blank_field() -> BitArray {
@@ -888,6 +948,26 @@ fn trim_trailing_slash(value: String) -> String {
   case string.ends_with(value, "/") {
     True -> string.drop_end(value, 1)
     False -> value
+  }
+}
+
+fn verify_double_zero_terminator(
+  bytes: BitArray,
+  acc: List(entry.Entry),
+) -> Result(List(entry.Entry), error.ArchiveError) {
+  case bit_array.slice(bytes, block_size, block_size) {
+    Ok(second) ->
+      case is_zero_block(second) {
+        True -> Ok(acc)
+        False ->
+          Error(error.ArchiveInvalid(
+            message: "tar stream ended after a single zero block",
+          ))
+      }
+    Error(_) ->
+      Error(error.ArchiveInvalid(
+        message: "tar stream ended after a single zero block",
+      ))
   }
 }
 

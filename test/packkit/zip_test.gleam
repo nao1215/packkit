@@ -133,6 +133,26 @@ fn python_deflate_zip() -> BitArray {
   >>
 }
 
+pub fn encoder_rejects_external_attrs_overflow_test() -> Nil {
+  // `external_attrs = mode << 16` and the field is 32 bits wide.  A
+  // mode of 0x10000 would push external_attrs to 2^32, overflowing the
+  // u32 field and previously corrupting the central directory record
+  // through silent truncation.
+  let assert Ok(file_entry) =
+    entry.file_checked(path: "x.txt", body: <<"x":utf8>>)
+  let with_huge_mode = file_entry |> entry.with_mode(mode: 0x10000)
+  let archive_value =
+    archive.new(format: zip.format()) |> archive.add(entry: with_huge_mode)
+  case zip.encode(archive: archive_value) {
+    Error(error.ArchiveFieldOverflow(
+      field: "zip external_attributes",
+      value: _,
+      max: _,
+    )) -> Nil
+    _ -> should.fail()
+  }
+}
+
 fn archive_add_file(
   archive_value: archive.Archive,
   path: String,

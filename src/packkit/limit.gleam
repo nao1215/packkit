@@ -157,6 +157,15 @@ pub fn with_max_entry_depth_checked(
   |> result.map(fn(_) { Limits(..limits, max_entry_depth: depth) })
 }
 
+/// Update `max_entry_name_bytes` after validation.
+pub fn with_max_entry_name_bytes_checked(
+  limits: Limits,
+  bytes bytes: Int,
+) -> Result(Limits, LimitError) {
+  positive(name: "max_entry_name_bytes", value: bytes)
+  |> result.map(fn(_) { Limits(..limits, max_entry_name_bytes: bytes) })
+}
+
 /// Update `max_window_bits` after validation.
 pub fn with_max_window_bits_checked(
   limits: Limits,
@@ -187,6 +196,12 @@ pub fn with_max_members(limits: Limits, count count: Int) -> Limits {
 /// Unchecked setter for `max_entry_depth`.
 pub fn with_max_entry_depth(limits: Limits, depth depth: Int) -> Limits {
   Limits(..limits, max_entry_depth: clamp_positive(depth))
+}
+
+/// Unchecked setter for `max_entry_name_bytes`.  See
+/// [with_max_input_bytes] for the contract.
+pub fn with_max_entry_name_bytes(limits: Limits, bytes bytes: Int) -> Limits {
+  Limits(..limits, max_entry_name_bytes: clamp_positive(bytes))
 }
 
 /// Unchecked setter for `max_window_bits`.  Out-of-range values are

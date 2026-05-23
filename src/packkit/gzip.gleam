@@ -249,7 +249,7 @@ pub fn decode_with_limits(
   )
 
   case bytes {
-    <<m1, m2, cm, flg, _mtime:size(32)-little, _xfl, _os, rest:bytes>> -> {
+    <<m1, m2, cm, flg, mtime:size(32)-little, _xfl, _os, rest:bytes>> -> {
       use <- bool.guard(
         when: m1 != magic_byte_1 || m2 != magic_byte_2,
         return: Error(error.CodecInvalidData(message: "gzip magic mismatch")),
@@ -260,7 +260,12 @@ pub fn decode_with_limits(
           message: "gzip compression method is not deflate",
         )),
       )
-      decode_header(rest, flg, default_header(), limits)
+      // RFC 1952 §2.3.1: MTIME=0 means "no time stamp available".
+      let initial = case mtime {
+        0 -> default_header()
+        n -> Header(..default_header(), modified_at_unix: Some(n))
+      }
+      decode_header(rest, flg, initial, limits)
     }
     _ -> Error(error.CodecInvalidData(message: "gzip header truncated"))
   }

@@ -301,6 +301,86 @@ pub fn decodes_gnu_long_name_test() -> Nil {
   |> should.equal(body)
 }
 
+pub fn encoder_rejects_mtime_overflow_test() -> Nil {
+  // USTAR mtime is 11 octal digits + NUL, so 2^33-1 is the largest
+  // value that fits.  Anything bigger silently dropped its high bits
+  // before, corrupting the timestamp on round-trip.
+  let assert Ok(base) = entry.file_checked(path: "x.txt", body: <<>>)
+  let overflowing =
+    base |> entry.with_modified_at(unix_seconds: 8_589_934_592)
+  let archive_value =
+    archive.new(format: tar.format()) |> archive.add(entry: overflowing)
+  case tar.encode(archive: archive_value) {
+    Error(error.ArchiveFieldOverflow(field: "tar mtime", value: _, max: _)) ->
+      Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn encoder_accepts_boundary_mtime_test() -> Nil {
+  // 2^33-1 is exactly representable in the 11-octal-digit field.
+  let assert Ok(base) = entry.file_checked(path: "x.txt", body: <<>>)
+  let max_mtime =
+    base |> entry.with_modified_at(unix_seconds: 8_589_934_591)
+  let archive_value =
+    archive.new(format: tar.format()) |> archive.add(entry: max_mtime)
+  case tar.encode(archive: archive_value) {
+    Ok(_) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn encoder_rejects_uid_overflow_test() -> Nil {
+  // USTAR uid is 7 octal digits + NUL, so 2^21-1 is the boundary.
+  let assert Ok(base) = entry.file_checked(path: "x.txt", body: <<>>)
+  let huge =
+    base |> entry.with_owner(user_id: 2_097_152, group_id: 0)
+  let archive_value =
+    archive.new(format: tar.format()) |> archive.add(entry: huge)
+  case tar.encode(archive: archive_value) {
+    Error(error.ArchiveFieldOverflow(field: "tar uid", value: _, max: _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn rejects_single_zero_block_terminator_test() -> Nil {
+  // POSIX 1003.1 requires two consecutive zero blocks at end-of-archive.
+  // Truncating after only one zero block must be rejected, otherwise we
+  // silently accept malformed (or maliciously truncated) streams.
+  let archive_value =
+    tar.new()
+    |> tar.add_file(path: "a.txt", body: <<"data":utf8>>)
+  let assert Ok(bytes) = tar.encode(archive: archive_value)
+  let total = bit_array.byte_size(bytes)
+  // Drop the trailing zero block, leaving exactly one zero block as EOF.
+  let assert Ok(truncated) = bit_array.slice(bytes, 0, total - tar_block_size)
+
+  case tar.decode(bytes: truncated) {
+    Error(error.ArchiveInvalid(_)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn rejects_single_zero_block_truncation_via_with_limits_test() -> Nil {
+  // `decode_with_limits` must apply the same EOF validation.
+  let bytes =
+    bit_array.concat([
+      tar_build_header(
+        name: "x",
+        size: 1,
+        typeflag: 0x30,
+        linkname: "",
+      ),
+      tar_pad_body(<<"y":utf8>>),
+      tar_zero_block(),
+    ])
+
+  case tar.decode_with_limits(bytes: bytes, limits: limit.default()) {
+    Error(error.ArchiveInvalid(_)) -> Nil
+    _ -> should.fail()
+  }
+}
+
 pub fn round_trips_metadata_test() -> Nil {
   let assert Ok(base) = entry.file_checked(path: "data.bin", body: <<1, 2, 3>>)
   let with_metadata =

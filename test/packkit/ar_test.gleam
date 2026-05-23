@@ -47,6 +47,31 @@ pub fn rejects_directory_entries_test() -> Nil {
   }
 }
 
+pub fn encoder_rejects_uid_overflow_test() -> Nil {
+  // The ar uid field is 6 ASCII decimal digits.  999_999 fits;
+  // 1_000_000 does not, and used to silently truncate via
+  // `right_pad`.
+  let assert Ok(base) = entry.file_checked(path: "a.o", body: <<>>)
+  let huge = base |> entry.with_owner(user_id: 1_000_000, group_id: 0)
+  let archive_value = archive.new(format: ar.format()) |> archive.add(entry: huge)
+  case ar.encode(archive: archive_value) {
+    Error(error.ArchiveFieldOverflow(field: "ar uid", value: 1_000_000, max: _)) ->
+      Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn encoder_accepts_uid_boundary_test() -> Nil {
+  let assert Ok(base) = entry.file_checked(path: "a.o", body: <<>>)
+  let max_uid = base |> entry.with_owner(user_id: 999_999, group_id: 0)
+  let archive_value =
+    archive.new(format: ar.format()) |> archive.add(entry: max_uid)
+  case ar.encode(archive: archive_value) {
+    Ok(_) -> Nil
+    _ -> should.fail()
+  }
+}
+
 fn archive_add_file(
   archive_value: archive.Archive,
   path: String,

@@ -10,6 +10,7 @@ import packkit/detect
 import packkit/entry
 import packkit/error
 import packkit/level
+import packkit/limit
 import packkit/recipe
 import packkit/tar
 import packkit/zip
@@ -281,6 +282,119 @@ pub fn facade_rejects_level_on_levelless_codec_test() -> Nil {
   |> should.equal(
     Error(error.CodecOptionUnsupported(option: "level", codec_name: "lz4")),
   )
+}
+
+pub fn write_rejects_format_mismatch_test() -> Nil {
+  // An `Archive` is bound to one format at construction time. Asking
+  // `packkit.write` to serialise it as a different format would silently
+  // corrupt the output, so the facade refuses with a typed error.
+  let tar_archive =
+    tar.new() |> tar.add_file(path: "x.txt", body: <<"x":utf8>>)
+  packkit.write(archive_value: tar_archive, format: archive.zip())
+  |> should.equal(
+    Error(error.ArchiveFormatMismatch(archive: "tar", requested: "zip")),
+  )
+}
+
+pub fn write_accepts_matching_format_test() -> Nil {
+  let tar_archive =
+    tar.new() |> tar.add_file(path: "x.txt", body: <<"x":utf8>>)
+  case packkit.write(archive_value: tar_archive, format: archive.tar()) {
+    Ok(_) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn pack_rejects_recipe_format_mismatch_test() -> Nil {
+  // The recipe declares the archive layer; if the supplied archive
+  // value was constructed for a different format, `pack` must refuse
+  // before touching the codec chain.
+  let zip_archive_value =
+    zip.new() |> archive.add(entry: entry.file(path: "x", body: <<"x":utf8>>))
+
+  packkit.pack(archive_value: zip_archive_value, using: recipe.tar_gzip())
+  |> should.equal(
+    Error(error.ArchiveFormatMismatch(archive: "zip", requested: "tar")),
+  )
+}
+
+pub fn decompress_with_limits_propagates_input_limit_test() -> Nil {
+  // The supplied Limits value must reach the underlying codec; if it
+  // didn't, an oversized stream would still decode under the codec's
+  // own default limits.  Use gzip because it has a cheap, deterministic
+  // encoding for any payload.
+  let payload = <<"limits propagation regression":utf8>>
+  let assert Ok(stream) = packkit.compress(bytes: payload, with: codec.gzip())
+  let tight =
+    limit.default()
+    |> limit.with_max_input_bytes(bytes: 4)
+  case
+    packkit.decompress_with_limits(
+      bytes: stream,
+      with: codec.gzip(),
+      limits: tight,
+    )
+  {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn decompress_with_limits_identity_enforces_input_limit_test() -> Nil {
+  // Even the identity codec must observe `max_input_bytes` when given
+  // explicit limits, so the no-op path is consistent with every other
+  // codec.
+  let tight = limit.default() |> limit.with_max_input_bytes(bytes: 4)
+  case
+    packkit.decompress_with_limits(
+      bytes: <<"longer than 4":utf8>>,
+      with: codec.identity(),
+      limits: tight,
+    )
+  {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn read_with_limits_propagates_to_archive_decoder_test() -> Nil {
+  // `packkit.read_with_limits` must hand the Limits to the archive
+  // family's `decode_with_limits` rather than re-defaulting them.
+  let archive_value =
+    tar.new()
+    |> tar.add_file(path: "a.txt", body: <<>>)
+    |> tar.add_file(path: "b.txt", body: <<>>)
+    |> tar.add_file(path: "c.txt", body: <<>>)
+  let assert Ok(bytes) = packkit.write(archive_value: archive_value, format: tar.format())
+  let tight = limit.default() |> limit.with_max_members(count: 2)
+  case
+    packkit.read_with_limits(
+      bytes: bytes,
+      format: tar.format(),
+      limits: tight,
+    )
+  {
+    Error(error.ArchiveLimitExceeded(limit: "max_members", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn unpack_with_limits_propagates_to_codec_chain_test() -> Nil {
+  // `unpack_with_limits` must thread Limits through both the codec
+  // chain *and* the archive decoder.  Hit the codec leg by setting a
+  // tight max_input_bytes that's smaller than the packed gzip stream.
+  let archive_value =
+    tar.new() |> tar.add_file(path: "a.txt", body: <<"a":utf8>>)
+  let assert Ok(bytes) =
+    packkit.pack(archive_value: archive_value, using: recipe.tar_gzip())
+  let tight = limit.default() |> limit.with_max_input_bytes(bytes: 4)
+  case packkit.unpack_with_limits(bytes: bytes, using: recipe.tar_gzip(), limits: tight) {
+    Error(error.ArchiveCodecFailed(
+      step: "decode",
+      cause: error.CodecLimitExceeded(limit: "max_input_bytes", actual: _),
+    )) -> Nil
+    _ -> should.fail()
+  }
 }
 
 pub fn facade_bzip2_default_codec_uses_canonical_level_test() -> Nil {

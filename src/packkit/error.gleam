@@ -29,6 +29,17 @@ pub type ArchiveError {
   /// parsing a flattened string.  `step` is a short label such as
   /// "encode" or "decode".
   ArchiveCodecFailed(step: String, cause: CodecError)
+  /// The format requested for write/pack does not match the format
+  /// stored on the supplied archive value.  An `Archive` is an opaque
+  /// value bound to one format at construction time; pretending it is
+  /// a different format would silently corrupt the output, so the
+  /// facade refuses up-front.
+  ArchiveFormatMismatch(archive: String, requested: String)
+  /// A numeric metadata field (size, count, offset, timestamp, uid/gid,
+  /// mode, ...) is too large for the on-disk representation chosen by
+  /// the format.  Surfaced instead of silently truncating to the
+  /// field's modulus, which would corrupt the archive.
+  ArchiveFieldOverflow(field: String, value: Int, max: Int)
 }
 
 /// Errors returned by recipe constructors or validators.

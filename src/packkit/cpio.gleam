@@ -278,18 +278,32 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
 
   let mode = int.bitwise_or(mode_bits, entry.mode(metadata))
   let body_size = bit_array.byte_size(body)
+  let uid = entry.user_id(metadata)
+  let gid = entry.group_id(metadata)
+  let mtime = entry.modified_at_unix(metadata)
+
+  // newc encodes every integer field as 8 ASCII hex digits, capping
+  // each at 0xFFFFFFFF.  Reject larger values up-front so we never
+  // silently emit a header whose decoded fields disagree with the
+  // logical entry.
+  use _ <- result.try(check_hex_field(mode, "mode"))
+  use _ <- result.try(check_hex_field(uid, "uid"))
+  use _ <- result.try(check_hex_field(gid, "gid"))
+  use _ <- result.try(check_hex_field(mtime, "mtime"))
+  use _ <- result.try(check_hex_field(body_size, "filesize"))
+  use _ <- result.try(check_hex_field(name_size, "namesize"))
 
   let header =
     build_header(
       ino: 0,
       mode: mode,
-      uid: entry.user_id(metadata),
-      gid: entry.group_id(metadata),
+      uid: uid,
+      gid: gid,
       nlink: case kind {
         "directory" -> 2
         _ -> 1
       },
-      mtime: entry.modified_at_unix(metadata),
+      mtime: mtime,
       filesize: body_size,
       namesize: name_size,
     )
@@ -305,6 +319,23 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   let body_with_padding = bit_array.concat([body, align_padding(body_size)])
 
   Ok(bit_array.concat([header_with_name, body_with_padding]))
+}
+
+const newc_field_max: Int = 0xFFFFFFFF
+
+fn check_hex_field(
+  value: Int,
+  field: String,
+) -> Result(Nil, error.ArchiveError) {
+  case value < 0 || value > newc_field_max {
+    True ->
+      Error(error.ArchiveFieldOverflow(
+        field: "cpio-newc " <> field,
+        value: value,
+        max: newc_field_max,
+      ))
+    False -> Ok(Nil)
+  }
 }
 
 fn trailer_record() -> BitArray {

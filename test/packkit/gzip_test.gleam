@@ -3,6 +3,7 @@ import gleam/option.{None, Some}
 import gleeunit/should
 import packkit/error
 import packkit/gzip
+import packkit/limit
 
 pub fn decode_python_gzip_hello_test() -> Nil {
   // Produced by Python's gzip.GzipFile(mtime=0).write(b"hello packkit").
@@ -35,6 +36,41 @@ pub fn roundtrip_with_metadata_test() -> Nil {
   |> should.equal(Some("data.txt"))
   gzip.comment(decoded.header)
   |> should.equal(Some("packkit test"))
+  gzip.modified_at_unix(decoded.header)
+  |> should.equal(Some(1_700_000_000))
+}
+
+pub fn decode_preserves_mtime_test() -> Nil {
+  // Regression: the decoder used to drop the MTIME field on the floor,
+  // so `with_modified_at` round-trips were silently lossy.
+  let header =
+    gzip.default_header() |> gzip.with_modified_at(unix_seconds: 1_234_567_890)
+  let payload = <<"mtime round trip":utf8>>
+  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(decoded) = gzip.decode(bytes: bytes)
+  gzip.modified_at_unix(decoded.header)
+  |> should.equal(Some(1_234_567_890))
+}
+
+pub fn decode_with_limits_preserves_mtime_test() -> Nil {
+  let header =
+    gzip.default_header() |> gzip.with_modified_at(unix_seconds: 42)
+  let payload = <<"mtime via decode_with_limits":utf8>>
+  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(decoded) =
+    gzip.decode_with_limits(bytes: bytes, limits: limit.default())
+  gzip.modified_at_unix(decoded.header)
+  |> should.equal(Some(42))
+}
+
+pub fn decode_treats_zero_mtime_as_unset_test() -> Nil {
+  // RFC 1952 §2.3.1: MTIME=0 means "no time stamp available".  We surface
+  // that as `None` rather than `Some(0)` so callers can tell the cases apart.
+  let assert Ok(bytes) =
+    gzip.encode(bytes: <<"no mtime":utf8>>, header: gzip.default_header())
+  let assert Ok(decoded) = gzip.decode(bytes: bytes)
+  gzip.modified_at_unix(decoded.header)
+  |> should.equal(None)
 }
 
 pub fn rejects_bad_magic_test() -> Nil {

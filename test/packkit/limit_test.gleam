@@ -35,6 +35,44 @@ pub fn unchecked_with_max_entry_depth_sets_value_test() -> Nil {
   |> should.equal(5)
 }
 
+pub fn unchecked_with_max_entry_name_bytes_sets_value_test() -> Nil {
+  limit.default()
+  |> limit.with_max_entry_name_bytes(bytes: 64)
+  |> limit.max_entry_name_bytes
+  |> should.equal(64)
+}
+
+pub fn unchecked_with_max_entry_name_bytes_clamps_non_positive_test() -> Nil {
+  limit.default()
+  |> limit.with_max_entry_name_bytes(bytes: 0)
+  |> limit.max_entry_name_bytes
+  |> should.equal(1)
+}
+
+pub fn checked_with_max_entry_name_bytes_rejects_non_positive_test() -> Nil {
+  case
+    limit.with_max_entry_name_bytes_checked(limit.default(), bytes: 0)
+  {
+    Error(limit.LimitMustBePositive(name: "max_entry_name_bytes", value: 0)) ->
+      Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn tar_decoder_enforces_max_entry_name_bytes_test() -> Nil {
+  // The new public setter must actually flow into the tar decoder.
+  let archive_value =
+    tar.new() |> tar.add_file(path: "ten-bytes!", body: <<>>)
+  let assert Ok(bytes) = tar.encode(archive: archive_value)
+  let assert Ok(tight) =
+    limit.with_max_entry_name_bytes_checked(limit.default(), bytes: 5)
+  case tar.decode_with_limits(bytes: bytes, limits: tight) {
+    Error(error.ArchiveLimitExceeded(limit: "max_entry_name_bytes", actual: _)) ->
+      Nil
+    _ -> should.fail()
+  }
+}
+
 pub fn unchecked_with_max_window_bits_clamps_low_test() -> Nil {
   limit.default()
   |> limit.with_max_window_bits(bits: 4)

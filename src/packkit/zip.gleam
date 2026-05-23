@@ -111,6 +111,13 @@ pub fn encode_with_method(
   let central_size = bit_array.byte_size(central_bytes)
   let count = list.length(entries)
 
+  // Pre-Zip64 the EOCD record only has 16-bit entry counts and 32-bit
+  // offsets / sizes.  Reject overflows up-front instead of silently
+  // wrapping into a corrupted archive.
+  use _ <- result.try(check_u16(count, "total_entries"))
+  use _ <- result.try(check_u32(central_size, "central_directory_size"))
+  use _ <- result.try(check_u32(central_offset, "central_directory_offset"))
+
   let eocd =
     bit_array.concat([
       le32(eocd_signature),
@@ -124,6 +131,34 @@ pub fn encode_with_method(
     ])
 
   Ok(bit_array.concat([local_bytes, central_bytes, eocd]))
+}
+
+const u16_max: Int = 0xFFFF
+
+const u32_max: Int = 0xFFFFFFFF
+
+fn check_u16(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
+  case value < 0 || value > u16_max {
+    True ->
+      Error(error.ArchiveFieldOverflow(
+        field: "zip " <> field,
+        value: value,
+        max: u16_max,
+      ))
+    False -> Ok(Nil)
+  }
+}
+
+fn check_u32(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
+  case value < 0 || value > u32_max {
+    True ->
+      Error(error.ArchiveFieldOverflow(
+        field: "zip " <> field,
+        value: value,
+        max: u32_max,
+      ))
+    False -> Ok(Nil)
+  }
 }
 
 /// Decode a ZIP archive using default limits.
@@ -256,6 +291,12 @@ fn encode_entry(
 
   let comp_size = bit_array.byte_size(compressed_body)
 
+  // Each per-entry field is constrained by Zip's pre-Zip64 layout.
+  use _ <- result.try(check_u32(uncomp_size, "uncompressed_size"))
+  use _ <- result.try(check_u32(comp_size, "compressed_size"))
+  use _ <- result.try(check_u32(offset, "local_header_offset"))
+  use _ <- result.try(check_u32(crc, "crc32"))
+
   let metadata = entry.metadata(value)
   let mode = entry.mode(metadata)
   let external_attrs = case kind {
@@ -263,6 +304,7 @@ fn encode_entry(
       int.bitwise_or(external_attr_dir, int.bitwise_shift_left(mode, 16))
     _ -> int.bitwise_shift_left(mode, 16)
   }
+  use _ <- result.try(check_u32(external_attrs, "external_attributes"))
 
   let version_needed = case method_code {
     m if m == method_deflate -> 20

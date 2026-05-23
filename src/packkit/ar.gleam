@@ -271,14 +271,36 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
     False -> #(text_field(path, 16), <<>>, body_size)
   }
 
+  use mtime_field <- result.try(checked_decimal_field(
+    entry.modified_at_unix(metadata),
+    12,
+    "mtime",
+  ))
+  use uid_field <- result.try(checked_decimal_field(
+    entry.user_id(metadata),
+    6,
+    "uid",
+  ))
+  use gid_field <- result.try(checked_decimal_field(
+    entry.group_id(metadata),
+    6,
+    "gid",
+  ))
+  use mode_field <- result.try(checked_octal_field(
+    entry.mode(metadata),
+    8,
+    "mode",
+  ))
+  use size_field <- result.try(checked_decimal_field(total_size, 10, "size"))
+
   let header =
     bit_array.concat([
       name_field,
-      decimal_field(entry.modified_at_unix(metadata), 12),
-      decimal_field(entry.user_id(metadata), 6),
-      decimal_field(entry.group_id(metadata), 6),
-      octal_field(entry.mode(metadata), 8),
-      decimal_field(total_size, 10),
+      mtime_field,
+      uid_field,
+      gid_field,
+      mode_field,
+      size_field,
       <<end_marker_byte, newline>>,
     ])
 
@@ -300,6 +322,57 @@ fn decimal_field(value: Int, width: Int) -> BitArray {
   let raw = int.to_string(value)
   let raw_bits = bit_array.from_string(raw)
   right_pad(raw_bits, width, 0x20)
+}
+
+fn checked_decimal_field(
+  value: Int,
+  width: Int,
+  field: String,
+) -> Result(BitArray, error.ArchiveError) {
+  let raw = int.to_string(value)
+  let raw_size = string.byte_size(raw)
+  case value < 0 || raw_size > width {
+    True -> {
+      let max_value = pow_int(10, width) - 1
+      Error(error.ArchiveFieldOverflow(
+        field: "ar " <> field,
+        value: value,
+        max: max_value,
+      ))
+    }
+    False -> Ok(decimal_field(value, width))
+  }
+}
+
+fn checked_octal_field(
+  value: Int,
+  width: Int,
+  field: String,
+) -> Result(BitArray, error.ArchiveError) {
+  let raw = int.to_base8(value)
+  let raw_size = string.byte_size(raw)
+  case value < 0 || raw_size > width {
+    True -> {
+      let max_value = pow_int(8, width) - 1
+      Error(error.ArchiveFieldOverflow(
+        field: "ar " <> field,
+        value: value,
+        max: max_value,
+      ))
+    }
+    False -> Ok(octal_field(value, width))
+  }
+}
+
+fn pow_int(base: Int, exponent: Int) -> Int {
+  pow_int_loop(base, exponent, 1)
+}
+
+fn pow_int_loop(base: Int, exponent: Int, acc: Int) -> Int {
+  case exponent {
+    0 -> acc
+    _ -> pow_int_loop(base, exponent - 1, acc * base)
+  }
 }
 
 fn octal_field(value: Int, width: Int) -> BitArray {
