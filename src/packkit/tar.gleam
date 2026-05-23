@@ -1,10 +1,11 @@
 //// USTAR (POSIX 1003.1-1988) tar archive encoder and decoder.
 ////
 //// The implementation is target-neutral and supports regular files,
-//// directories, symbolic links, and hard links.  Names longer than the
-//// USTAR `prefix`/`name` split allows are rejected with a typed
-//// archive error; GNU and PAX long-name extensions are out of scope
-//// for this module.
+//// directories, symbolic links, and hard links.  The encoder rejects
+//// names longer than the USTAR `prefix`/`name` split allows with a
+//// typed archive error.  The decoder additionally consumes GNU
+//// `LongName`/`LongLink` extension entries (typeflags `L` and `K`)
+//// and skips PAX extended attribute headers (`x` and `g`).
 
 import gleam/bit_array
 import gleam/bool
@@ -137,44 +138,164 @@ pub fn decode_with_limits(
   |> result.map(archives.from_entries(format: format(), entries: _))
 }
 
+type PendingOverride {
+  PendingOverride(name: String, linkname: String)
+}
+
+fn no_pending() -> PendingOverride {
+  PendingOverride(name: "", linkname: "")
+}
+
 fn decode_loop(
   bytes: BitArray,
   acc: List(entry.Entry),
   count: Int,
   limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
-  case bit_array.byte_size(bytes) < block_size {
-    True ->
-      Error(error.ArchiveInvalid(
-        message: "tar stream ended before terminator blocks",
+  decode_loop_with_pending(bytes, acc, count, limits, no_pending())
+}
+
+fn decode_loop_with_pending(
+  bytes: BitArray,
+  acc: List(entry.Entry),
+  count: Int,
+  limits: limit.Limits,
+  pending: PendingOverride,
+) -> Result(List(entry.Entry), error.ArchiveError) {
+  use <- bool.guard(
+    when: bit_array.byte_size(bytes) < block_size,
+    return: Error(error.ArchiveInvalid(
+      message: "tar stream ended before terminator blocks",
+    )),
+  )
+  let assert Ok(header_bits) = bit_array.slice(bytes, 0, block_size)
+  use <- bool.guard(when: is_zero_block(header_bits), return: Ok(acc))
+  use header <- result.try(parse_header(header_bits))
+  let body_padded = round_up_to_block(header.size)
+  let total_advance = block_size + body_padded
+  use <- bool.guard(
+    when: bit_array.byte_size(bytes) < total_advance,
+    return: Error(error.ArchiveInvalid(
+      message: "tar entry body extends beyond the input",
+    )),
+  )
+  let assert Ok(rest) =
+    bit_array.slice(
+      bytes,
+      total_advance,
+      bit_array.byte_size(bytes) - total_advance,
+    )
+  dispatch_typeflag(bytes, rest, acc, count, limits, pending, header)
+}
+
+fn dispatch_typeflag(
+  bytes: BitArray,
+  rest: BitArray,
+  acc: List(entry.Entry),
+  count: Int,
+  limits: limit.Limits,
+  pending: PendingOverride,
+  header: ParsedHeader,
+) -> Result(List(entry.Entry), error.ArchiveError) {
+  case header.typeflag {
+    // GNU LongName ('L'): body holds the next entry's name.
+    0x4C -> {
+      use long_name <- result.try(read_string_body(
+        bytes,
+        block_size,
+        header.size,
+        "GNU long name",
       ))
-    False -> {
-      let assert Ok(header_bits) = bit_array.slice(bytes, 0, block_size)
-      case is_zero_block(header_bits) {
-        True -> Ok(acc)
-        False -> {
-          use header <- result.try(parse_header(header_bits))
-          let size = header.size
-          let body_padded = round_up_to_block(size)
-          let total_advance = block_size + body_padded
-          use <- bool.guard(
-            when: bit_array.byte_size(bytes) < total_advance,
-            return: Error(error.ArchiveInvalid(
-              message: "tar entry body extends beyond the input",
-            )),
-          )
-          use _ <- result.try(check_member_limit(count + 1, limits))
-          use entry_value <- result.try(header_to_entry(header, bytes, limits))
-          let assert Ok(rest) =
-            bit_array.slice(
-              bytes,
-              total_advance,
-              bit_array.byte_size(bytes) - total_advance,
-            )
-          decode_loop(rest, [entry_value, ..acc], count + 1, limits)
-        }
+      decode_loop_with_pending(
+        rest,
+        acc,
+        count,
+        limits,
+        PendingOverride(..pending, name: long_name),
+      )
+    }
+    // GNU LongLink ('K'): body holds the next entry's linkname.
+    0x4B -> {
+      use long_link <- result.try(read_string_body(
+        bytes,
+        block_size,
+        header.size,
+        "GNU long linkname",
+      ))
+      decode_loop_with_pending(
+        rest,
+        acc,
+        count,
+        limits,
+        PendingOverride(..pending, linkname: long_link),
+      )
+    }
+    // PAX extended attribute headers ('x' = local, 'g' = global) —
+    // we don't currently parse the key=value records, but skipping
+    // them keeps decode marching forward.
+    0x78 | 0x67 -> decode_loop_with_pending(rest, acc, count, limits, pending)
+    _ -> {
+      let merged_header = apply_pending(header, pending)
+      use _ <- result.try(check_member_limit(count + 1, limits))
+      use entry_value <- result.try(header_to_entry(
+        merged_header,
+        bytes,
+        limits,
+      ))
+      decode_loop_with_pending(
+        rest,
+        [entry_value, ..acc],
+        count + 1,
+        limits,
+        no_pending(),
+      )
+    }
+  }
+}
+
+fn apply_pending(header: ParsedHeader, pending: PendingOverride) -> ParsedHeader {
+  let name = case pending.name {
+    "" -> header.name
+    n -> n
+  }
+  let linkname = case pending.linkname {
+    "" -> header.linkname
+    l -> l
+  }
+  ParsedHeader(..header, name: name, linkname: linkname)
+}
+
+fn read_string_body(
+  bytes: BitArray,
+  start: Int,
+  size: Int,
+  label: String,
+) -> Result(String, error.ArchiveError) {
+  case bit_array.slice(bytes, start, size) {
+    Ok(chunk) -> {
+      // Drop a trailing NUL if present.
+      let trimmed_size = trim_trailing_nul_size(chunk, size)
+      let assert Ok(name_bits) = bit_array.slice(chunk, 0, trimmed_size)
+      case bit_array.to_string(name_bits) {
+        Ok(value) -> Ok(value)
+        Error(_) ->
+          Error(error.ArchiveInvalid(
+            message: "tar " <> label <> " is not valid UTF-8",
+          ))
       }
     }
+    Error(_) -> Error(error.ArchiveInvalid(message: "truncated tar " <> label))
+  }
+}
+
+fn trim_trailing_nul_size(bytes: BitArray, size: Int) -> Int {
+  case size {
+    0 -> 0
+    n ->
+      case bit_array.slice(bytes, n - 1, 1) {
+        Ok(<<0>>) -> trim_trailing_nul_size(bytes, n - 1)
+        _ -> n
+      }
   }
 }
 
