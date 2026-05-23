@@ -7,6 +7,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import packkit/ar
 import packkit/archive
+import packkit/brotli
 import packkit/bzip2
 import packkit/codec
 import packkit/cpio
@@ -70,6 +71,7 @@ pub fn compress(
     "lzw" -> lzw.encode(bytes: bytes)
     "xz" -> xz.encode(bytes: bytes)
     "zstd" -> zstd.encode(bytes: bytes)
+    "brotli" -> brotli.encode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
@@ -92,6 +94,7 @@ pub fn decompress(
     "lzw" -> lzw.decode(bytes: bytes)
     "xz" -> xz.decode(bytes: bytes)
     "zstd" -> zstd.decode(bytes: bytes)
+    "brotli" -> brotli.decode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }

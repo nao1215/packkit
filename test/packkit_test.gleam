@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleam/option.{Some}
 import gleeunit
 import gleeunit/should
@@ -93,8 +94,23 @@ pub fn facade_gzip_roundtrip_test() -> Nil {
 }
 
 pub fn facade_reports_unimplemented_codecs_test() -> Nil {
+  // Brotli encode is not yet implemented; the facade should dispatch
+  // to brotli.encode so the user sees the codec module's actual error
+  // (not a stale "compress brotli" string from a facade fallthrough).
   packkit.compress(bytes: <<"x":utf8>>, with: codec.brotli())
-  |> should.equal(Error(error.CodecNotImplemented(feature: "compress brotli")))
+  |> should.equal(Error(error.CodecNotImplemented(feature: "brotli.encode")))
+}
+
+pub fn facade_decompresses_brotli_stream_test() -> Nil {
+  // Decoding a brotli stream through the facade must work — brotli.decode
+  // is fully implemented, so packkit.decompress(..., with: codec.brotli())
+  // should succeed.  Regression for the bug where the facade had no
+  // `"brotli" ->` dispatch and returned `CodecNotImplemented("decompress brotli")`.
+  let assert Ok(stream) =
+    bit_array.base16_decode("8F0480636C6F7564792064617903")
+  let assert Ok(plain) = packkit.decompress(bytes: stream, with: codec.brotli())
+  plain
+  |> should.equal(<<"cloudy day":utf8>>)
 }
 
 pub fn facade_pack_unpack_tar_gzip_test() -> Nil {

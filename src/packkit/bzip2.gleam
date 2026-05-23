@@ -1171,9 +1171,12 @@ fn rle1_loop(bytes: BitArray, last: Int, run: Int, acc: List(Int)) -> List(Int) 
             r if r < 4 -> rle1_loop(rest, last, run + 1, [b, ..acc])
             r if r < 259 -> {
               // run is currently 4..258, but bzip2 caps at 259 (extra
-              // byte stores 0..255).  If we hit 259 we close the run.
+              // byte stores 0..255).  When we hit r==258 we're about to
+              // consume the 259th byte of the run — emit the count byte
+              // 255 (= 4 + 255 = 259 total) and reset, but do NOT emit
+              // `b` as raw: it is already counted by the closing 255.
               case r >= 4 + 254 {
-                True -> rle1_loop(rest, -1, 0, [b, 255, ..acc])
+                True -> rle1_loop(rest, -1, 0, [255, ..acc])
                 False -> rle1_loop(rest, last, run + 1, acc)
               }
             }

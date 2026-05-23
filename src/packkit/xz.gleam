@@ -34,7 +34,8 @@ pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let size = bit_array.byte_size(bytes)
   let stream_header = encode_stream_header()
   let lzma2_payload = encode_lzma2_uncompressed(bytes, size)
-  let block_header = encode_block_header(bit_array.byte_size(lzma2_payload))
+  let block_header =
+    encode_block_header(bit_array.byte_size(lzma2_payload), size)
   let block_check = <<checksum.crc32(bytes):size(32)-little>>
   let block_body = bit_array.concat([block_header, lzma2_payload])
   let block_padding =
@@ -60,22 +61,17 @@ fn encode_stream_header() -> BitArray {
   ])
 }
 
-fn encode_block_header(compressed_size: Int) -> BitArray {
+fn encode_block_header(compressed_size: Int, uncompressed_size: Int) -> BitArray {
   // Block_Flags = 0xC0: 1 filter, both sizes present.  Compressed size
-  // = `compressed_size`, uncompressed size = compressed_size (since
-  // every chunk is uncompressed).  Filter: LZMA2 (id 0x21) with a
-  // 1-byte properties value of 0x16 (matches what `xz -c` emits).
+  // = `compressed_size` (the LZMA2 byte stream we just emitted).
+  // Filter: LZMA2 (id 0x21) with a 1-byte properties value of 0x16
+  // (matches what `xz -c` emits).
   let comp_vi = encode_varint(compressed_size)
-  let uncomp_vi = encode_varint(compressed_size - 1 - 2 - 1)
-  // Header size is rounded up to a multiple of 4 and stored as
-  // `(size / 4) - 1` in the first byte.  We pad with zeros and append
-  // a CRC32 over the header.
-  let _ = uncomp_vi
   let pre_pad =
     bit_array.concat([
       <<0xC0>>,
       comp_vi,
-      encode_varint(payload_uncompressed_size(compressed_size)),
+      encode_varint(uncompressed_size),
       <<0x21, 0x01, 0x16>>,
     ])
   let body_len_no_size_byte = bit_array.byte_size(pre_pad) + 1
@@ -89,14 +85,6 @@ fn encode_block_header(compressed_size: Int) -> BitArray {
     bit_array.concat([<<header_size_byte>>, pre_pad, padding])
   let crc = checksum.crc32(body_with_size)
   bit_array.concat([body_with_size, <<crc:size(32)-little>>])
-}
-
-fn payload_uncompressed_size(compressed_size: Int) -> Int {
-  // Each uncompressed LZMA2 chunk has a 3-byte header (control + size)
-  // plus the body, and the stream is terminated by a 1-byte end marker.
-  // Knowing the compressed size, the uncompressed size is therefore
-  // `compressed_size - 3 - 1` per chunk (we emit a single chunk).
-  compressed_size - 3 - 1
 }
 
 fn encode_lzma2_uncompressed(bytes: BitArray, size: Int) -> BitArray {

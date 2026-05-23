@@ -25,6 +25,19 @@ pub fn encode_roundtrip_pangram_test() -> Nil {
   |> should.equal(payload)
 }
 
+pub fn encode_roundtrip_empty_test() -> Nil {
+  // Regression: `encode_block_header` used to reverse-derive the
+  // uncompressed size from `compressed_size - 3 - 1`, which underflows
+  // to -3 when the LZMA2 payload is just the 1-byte end marker (i.e.
+  // no chunks, i.e. empty input).  The corrupted varint then made the
+  // decoder fail with "truncated xz filter properties".
+  let payload = <<>>
+  let assert Ok(encoded) = xz.encode(bytes: payload)
+  let assert Ok(decoded) = xz.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+}
+
 pub fn decode_empty_stream_test() -> Nil {
   // `printf '' | xz -c` — empty stream is just header + empty index + footer.
   let fixture = <<
