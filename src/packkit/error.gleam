@@ -17,6 +17,12 @@ pub type ArchiveError {
   ArchiveEntryRejected(path: String, reason: String)
   ArchiveLimitExceeded(limit: String, value: Int)
   ArchiveNotImplemented(feature: String)
+  /// Surfaces a structured codec failure that occurred during a
+  /// recipe-driven pack/unpack step.  Preserves the underlying
+  /// `CodecError` so callers can pattern-match on it instead of
+  /// parsing a flattened string.  `step` is a short label such as
+  /// "encode" or "decode".
+  ArchiveCodecFailed(step: String, cause: CodecError)
 }
 
 /// Errors returned by recipe constructors or validators.

@@ -42,3 +42,14 @@ pub fn rejects_bad_magic_test() -> Nil {
     _ -> should.fail()
   }
 }
+
+pub fn decode_payload_returns_bitarray_for_parity_test() -> Nil {
+  // decode_payload mirrors the (BitArray) signature every other codec
+  // exposes — no need to reach into a Decoded record for the common path.
+  let payload = <<"parity check":utf8>>
+  let assert Ok(encoded) =
+    gzip.encode(bytes: payload, header: gzip.default_header())
+  let assert Ok(plain) = gzip.decode_payload(bytes: encoded)
+  plain
+  |> should.equal(payload)
+}

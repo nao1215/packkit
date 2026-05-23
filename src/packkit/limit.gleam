@@ -166,6 +166,47 @@ pub fn with_max_window_bits_checked(
   |> result.map(fn(_) { Limits(..limits, max_window_bits: bits) })
 }
 
+/// Unchecked setter for `max_input_bytes`.  The caller is responsible
+/// for passing a positive value; non-positive values are clamped to 1
+/// to keep downstream decoders well-behaved.
+pub fn with_max_input_bytes(limits: Limits, bytes bytes: Int) -> Limits {
+  Limits(..limits, max_input_bytes: clamp_positive(bytes))
+}
+
+/// Unchecked setter for `max_output_bytes`.  See [with_max_input_bytes]
+/// for the contract.
+pub fn with_max_output_bytes(limits: Limits, bytes bytes: Int) -> Limits {
+  Limits(..limits, max_output_bytes: clamp_positive(bytes))
+}
+
+/// Unchecked setter for `max_members`.
+pub fn with_max_members(limits: Limits, count count: Int) -> Limits {
+  Limits(..limits, max_members: clamp_positive(count))
+}
+
+/// Unchecked setter for `max_entry_depth`.
+pub fn with_max_entry_depth(limits: Limits, depth depth: Int) -> Limits {
+  Limits(..limits, max_entry_depth: clamp_positive(depth))
+}
+
+/// Unchecked setter for `max_window_bits`.  Out-of-range values are
+/// clamped to the valid 8..30 window.
+pub fn with_max_window_bits(limits: Limits, bits bits: Int) -> Limits {
+  let clamped = case bits {
+    n if n < 8 -> 8
+    n if n > 30 -> 30
+    n -> n
+  }
+  Limits(..limits, max_window_bits: clamped)
+}
+
+fn clamp_positive(value: Int) -> Int {
+  case value {
+    n if n < 1 -> 1
+    n -> n
+  }
+}
+
 fn positive(name name: String, value value: Int) -> Result(Nil, LimitError) {
   use <- bool.guard(
     when: value <= 0,

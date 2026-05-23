@@ -143,7 +143,7 @@ pub fn pack(
   })
 
   apply_codec_chain_forward(archive_bytes, recipe.codecs(recipe_value))
-  |> codec_to_archive_error
+  |> codec_to_archive_error(step: "encode")
 }
 
 /// Unpack a byte stream produced by `recipe`.
@@ -153,7 +153,7 @@ pub fn unpack(
 ) -> Result(Archive, error.ArchiveError) {
   use raw_bytes <- result.try(
     apply_codec_chain_reverse(bytes, list.reverse(recipe.codecs(recipe_value)))
-    |> codec_to_archive_error,
+    |> codec_to_archive_error(step: "decode"),
   )
 
   case recipe.archive_format(recipe_value) {
@@ -203,23 +203,10 @@ fn apply_codec_chain_reverse(
 
 fn codec_to_archive_error(
   value: Result(a, error.CodecError),
+  step step: String,
 ) -> Result(a, error.ArchiveError) {
   case value {
     Ok(v) -> Ok(v)
-    Error(err) ->
-      Error(error.ArchiveInvalid(
-        message: "codec error during recipe step: " <> codec_error_message(err),
-      ))
-  }
-}
-
-fn codec_error_message(err: error.CodecError) -> String {
-  case err {
-    error.CodecUnsupported(name) -> "unsupported codec " <> name
-    error.CodecInvalidData(message) -> "invalid data: " <> message
-    error.CodecLimitExceeded(limit, _) -> "limit exceeded: " <> limit
-    error.CodecDictionaryRequired(name) ->
-      "codec " <> name <> " requires a preset dictionary"
-    error.CodecNotImplemented(feature) -> "not implemented: " <> feature
+    Error(err) -> Error(error.ArchiveCodecFailed(step: step, cause: err))
   }
 }

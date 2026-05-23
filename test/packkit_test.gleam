@@ -157,3 +157,75 @@ pub fn facade_deflate_roundtrip_test() -> Nil {
   restored
   |> should.equal(payload)
 }
+
+// -- UX additions: recipe shortcuts, detect compound, limit unchecked,
+//    gzip.decode_payload, ArchiveCodecFailed structured wrapping. -----
+
+pub fn recipe_tar_bzip2_shortcut_test() -> Nil {
+  recipe.tar_bzip2()
+  |> recipe.description
+  |> should.equal("tar.bzip2")
+}
+
+pub fn recipe_tar_xz_shortcut_test() -> Nil {
+  recipe.tar_xz()
+  |> recipe.description
+  |> should.equal("tar.xz")
+}
+
+pub fn recipe_tar_zstd_shortcut_test() -> Nil {
+  recipe.tar_zstd()
+  |> recipe.description
+  |> should.equal("tar.zstd")
+}
+
+pub fn recipe_tar_brotli_shortcut_test() -> Nil {
+  recipe.tar_brotli()
+  |> recipe.description
+  |> should.equal("tar.brotli")
+}
+
+pub fn detect_recognizes_tar_bz2_compound_test() -> Nil {
+  let assert Ok(info) = detect.from_filename("backup.tar.bz2")
+  detect.recipe_of(info)
+  |> should.equal(Some(recipe.tar_bzip2()))
+}
+
+pub fn detect_recognizes_tar_xz_compound_test() -> Nil {
+  let assert Ok(info) = detect.from_filename("backup.tar.xz")
+  detect.recipe_of(info)
+  |> should.equal(Some(recipe.tar_xz()))
+}
+
+pub fn detect_recognizes_tar_zst_compound_test() -> Nil {
+  let assert Ok(info) = detect.from_filename("backup.tar.zst")
+  detect.recipe_of(info)
+  |> should.equal(Some(recipe.tar_zstd()))
+}
+
+pub fn facade_pack_unpack_tar_bzip2_test() -> Nil {
+  // End-to-end check for the previously-broken combination.
+  let archive_value =
+    tar.new()
+    |> tar.add_file(path: "a.txt", body: <<"alpha":utf8>>)
+    |> tar.add_file(path: "b.txt", body: <<"beta":utf8>>)
+  let assert Ok(bytes) =
+    packkit.pack(archive_value: archive_value, using: recipe.tar_bzip2())
+  let assert Ok(decoded) =
+    packkit.unpack(bytes: bytes, using: recipe.tar_bzip2())
+  archive.entry_count(decoded)
+  |> should.equal(2)
+}
+
+pub fn pack_failure_preserves_structured_codec_error_test() -> Nil {
+  // brotli encode is not implemented; the structured cause must surface
+  // instead of a flattened string.
+  let archive_value = tar.new() |> tar.add_file(path: "x", body: <<"y":utf8>>)
+  packkit.pack(archive_value: archive_value, using: recipe.tar_brotli())
+  |> should.equal(
+    Error(error.ArchiveCodecFailed(
+      step: "encode",
+      cause: error.CodecNotImplemented(feature: "brotli.encode"),
+    )),
+  )
+}

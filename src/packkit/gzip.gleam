@@ -163,6 +163,30 @@ pub fn decode(bytes bytes: BitArray) -> Result(Decoded, error.CodecError) {
   decode_with_limits(bytes: bytes, limits: limit.default())
 }
 
+/// Decode a gzip byte stream and return only the payload bytes.
+/// Parallels every other codec's `decode/1`, which returns
+/// `Result(BitArray, _)` — use this when you don't need the gzip
+/// header (mtime / filename / comment).
+pub fn decode_payload(
+  bytes bytes: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  case decode(bytes: bytes) {
+    Ok(decoded) -> Ok(decoded.payload)
+    Error(e) -> Error(e)
+  }
+}
+
+/// Like [decode_payload] but accepts an explicit `Limits` value.
+pub fn decode_payload_with_limits(
+  bytes bytes: BitArray,
+  limits limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
+  case decode_with_limits(bytes: bytes, limits: limits) {
+    Ok(decoded) -> Ok(decoded.payload)
+    Error(e) -> Error(e)
+  }
+}
+
 /// Decode a gzip byte stream using explicit limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,

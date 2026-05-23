@@ -20,207 +20,81 @@ pub opaque type Detected {
 /// Detect a format from a filename or path suffix.
 pub fn from_filename(path: String) -> Result(Detected, error.DetectError) {
   let lower = string.lowercase(path)
+  case find_filename_match(lower, filename_rules()) {
+    Some(detected) -> Ok(detected)
+    None -> Error(error.DetectUnknownFormat(input: path))
+  }
+}
 
-  case matches_any(lower, [".tar.gz", ".tgz"]) {
-    True -> Ok(detected_recipe(recipe.tar_gzip(), extension: "tar.gz"))
-    False ->
-      case string.ends_with(lower, ".tar.zlib") {
-        True -> Ok(detected_recipe(recipe.tar_zlib(), extension: "tar.zlib"))
-        False ->
-          case string.ends_with(lower, ".tar.lz4") {
-            True -> Ok(detected_recipe(recipe.tar_lz4(), extension: "tar.lz4"))
-            False ->
-              case matches_any(lower, [".tar.sz", ".tar.snappy"]) {
-                True ->
-                  Ok(detected_recipe(
-                    recipe.tar_snappy(),
-                    extension: "tar.snappy",
-                  ))
-                False ->
-                  case string.ends_with(lower, ".cpio.gz") {
-                    True ->
-                      Ok(detected_recipe(
-                        recipe.cpio_gzip(),
-                        extension: "cpio.gz",
-                      ))
-                    False ->
-                      case string.ends_with(lower, ".tar") {
-                        True ->
-                          Ok(detected_archive(archive.tar(), extension: "tar"))
-                        False ->
-                          case string.ends_with(lower, ".zip") {
-                            True ->
-                              Ok(detected_archive(
-                                archive.zip(),
-                                extension: "zip",
-                              ))
-                            False ->
-                              case string.ends_with(lower, ".7z") {
-                                True ->
-                                  Ok(detected_archive(
-                                    archive.seven_z(),
-                                    extension: "7z",
-                                  ))
-                                False ->
-                                  case string.ends_with(lower, ".cpio") {
-                                    True ->
-                                      Ok(detected_archive(
-                                        archive.cpio_newc(),
-                                        extension: "cpio",
-                                      ))
-                                    False ->
-                                      case matches_any(lower, [".ar", ".a"]) {
-                                        True ->
-                                          Ok(detected_archive(
-                                            archive.ar(),
-                                            extension: "ar",
-                                          ))
-                                        False ->
-                                          case string.ends_with(lower, ".gz") {
-                                            True ->
-                                              Ok(detected_codec(
-                                                codec.gzip(),
-                                                extension: "gz",
-                                              ))
-                                            False ->
-                                              case
-                                                string.ends_with(lower, ".zlib")
-                                              {
-                                                True ->
-                                                  Ok(detected_codec(
-                                                    codec.zlib(),
-                                                    extension: "zlib",
-                                                  ))
-                                                False ->
-                                                  case
-                                                    matches_any(lower, [
-                                                      ".deflate",
-                                                      ".dfl",
-                                                    ])
-                                                  {
-                                                    True ->
-                                                      Ok(detected_codec(
-                                                        codec.deflate(),
-                                                        extension: "deflate",
-                                                      ))
-                                                    False ->
-                                                      case
-                                                        string.ends_with(
-                                                          lower,
-                                                          ".lz4",
-                                                        )
-                                                      {
-                                                        True ->
-                                                          Ok(detected_codec(
-                                                            codec.lz4_frame(),
-                                                            extension: "lz4",
-                                                          ))
-                                                        False ->
-                                                          case
-                                                            matches_any(lower, [
-                                                              ".sz",
-                                                              ".snappy",
-                                                            ])
-                                                          {
-                                                            True ->
-                                                              Ok(detected_codec(
-                                                                codec.snappy_frame(),
-                                                                extension: "snappy",
-                                                              ))
-                                                            False ->
-                                                              case
-                                                                string.ends_with(
-                                                                  lower,
-                                                                  ".bz2",
-                                                                )
-                                                              {
-                                                                True ->
-                                                                  Ok(
-                                                                    detected_codec(
-                                                                      codec.bzip2(),
-                                                                      extension: "bz2",
-                                                                    ),
-                                                                  )
-                                                                False ->
-                                                                  case
-                                                                    string.ends_with(
-                                                                      lower,
-                                                                      ".xz",
-                                                                    )
-                                                                  {
-                                                                    True ->
-                                                                      Ok(
-                                                                        detected_codec(
-                                                                          codec.xz(),
-                                                                          extension: "xz",
-                                                                        ),
-                                                                      )
-                                                                    False ->
-                                                                      case
-                                                                        string.ends_with(
-                                                                          lower,
-                                                                          ".br",
-                                                                        )
-                                                                      {
-                                                                        True ->
-                                                                          Ok(
-                                                                            detected_codec(
-                                                                              codec.brotli(),
-                                                                              extension: "br",
-                                                                            ),
-                                                                          )
-                                                                        False ->
-                                                                          case
-                                                                            string.ends_with(
-                                                                              lower,
-                                                                              ".zst",
-                                                                            )
-                                                                          {
-                                                                            True ->
-                                                                              Ok(
-                                                                                detected_codec(
-                                                                                  codec.zstd(),
-                                                                                  extension: "zst",
-                                                                                ),
-                                                                              )
-                                                                            False ->
-                                                                              case
-                                                                                string.ends_with(
-                                                                                  lower,
-                                                                                  ".z",
-                                                                                )
-                                                                              {
-                                                                                True ->
-                                                                                  Ok(
-                                                                                    detected_codec(
-                                                                                      codec.lzw(),
-                                                                                      extension: "Z",
-                                                                                    ),
-                                                                                  )
-                                                                                False ->
-                                                                                  Error(
-                                                                                    error.DetectUnknownFormat(
-                                                                                      input: path,
-                                                                                    ),
-                                                                                  )
-                                                                              }
-                                                                          }
-                                                                      }
-                                                                  }
-                                                              }
-                                                          }
-                                                      }
-                                                  }
-                                              }
-                                          }
-                                      }
-                                  }
-                              }
-                          }
-                      }
-                  }
-              }
-          }
+/// Filename rules, ordered most-specific first so the first match wins.
+/// Compound extensions (`.tar.gz`, `.tar.bz2`, …) must precede the
+/// single extensions (`.gz`, `.bz2`, …) for the obvious reason.
+fn filename_rules() -> List(#(List(String), fn() -> Detected)) {
+  [
+    // Compound archive+codec recipes.
+    #([".tar.gz", ".tgz"], fn() {
+      detected_recipe(recipe.tar_gzip(), extension: "tar.gz")
+    }),
+    #([".tar.zlib"], fn() {
+      detected_recipe(recipe.tar_zlib(), extension: "tar.zlib")
+    }),
+    #([".tar.lz4"], fn() {
+      detected_recipe(recipe.tar_lz4(), extension: "tar.lz4")
+    }),
+    #([".tar.sz", ".tar.snappy"], fn() {
+      detected_recipe(recipe.tar_snappy(), extension: "tar.snappy")
+    }),
+    #([".tar.bz2"], fn() {
+      detected_recipe(recipe.tar_bzip2(), extension: "tar.bz2")
+    }),
+    #([".tar.xz"], fn() {
+      detected_recipe(recipe.tar_xz(), extension: "tar.xz")
+    }),
+    #([".tar.zst"], fn() {
+      detected_recipe(recipe.tar_zstd(), extension: "tar.zst")
+    }),
+    #([".tar.br"], fn() {
+      detected_recipe(recipe.tar_brotli(), extension: "tar.br")
+    }),
+    #([".cpio.gz"], fn() {
+      detected_recipe(recipe.cpio_gzip(), extension: "cpio.gz")
+    }),
+    // Archive families.
+    #([".tar"], fn() { detected_archive(archive.tar(), extension: "tar") }),
+    #([".zip"], fn() { detected_archive(archive.zip(), extension: "zip") }),
+    #([".7z"], fn() { detected_archive(archive.seven_z(), extension: "7z") }),
+    #([".cpio"], fn() {
+      detected_archive(archive.cpio_newc(), extension: "cpio")
+    }),
+    #([".ar", ".a"], fn() { detected_archive(archive.ar(), extension: "ar") }),
+    // Single-codec extensions.
+    #([".gz"], fn() { detected_codec(codec.gzip(), extension: "gz") }),
+    #([".zlib"], fn() { detected_codec(codec.zlib(), extension: "zlib") }),
+    #([".deflate", ".dfl"], fn() {
+      detected_codec(codec.deflate(), extension: "deflate")
+    }),
+    #([".lz4"], fn() { detected_codec(codec.lz4_frame(), extension: "lz4") }),
+    #([".sz", ".snappy"], fn() {
+      detected_codec(codec.snappy_frame(), extension: "snappy")
+    }),
+    #([".bz2"], fn() { detected_codec(codec.bzip2(), extension: "bz2") }),
+    #([".xz"], fn() { detected_codec(codec.xz(), extension: "xz") }),
+    #([".br"], fn() { detected_codec(codec.brotli(), extension: "br") }),
+    #([".zst"], fn() { detected_codec(codec.zstd(), extension: "zst") }),
+    #([".z"], fn() { detected_codec(codec.lzw(), extension: "Z") }),
+  ]
+}
+
+fn find_filename_match(
+  path: String,
+  rules: List(#(List(String), fn() -> Detected)),
+) -> Option(Detected) {
+  case rules {
+    [] -> None
+    [#(suffixes, build), ..rest] ->
+      case matches_any(path, suffixes) {
+        True -> Some(build())
+        False -> find_filename_match(path, rest)
       }
   }
 }

@@ -68,6 +68,27 @@ pub fn tar_snappy() -> Recipe {
   archive_with(format: archive.tar(), wrapped_by: codec.snappy_frame())
 }
 
+/// Convenience constructor for `tar.bz2`.
+pub fn tar_bzip2() -> Recipe {
+  archive_with(format: archive.tar(), wrapped_by: codec.bzip2())
+}
+
+/// Convenience constructor for `tar.xz`.
+pub fn tar_xz() -> Recipe {
+  archive_with(format: archive.tar(), wrapped_by: codec.xz())
+}
+
+/// Convenience constructor for `tar.zst`.
+pub fn tar_zstd() -> Recipe {
+  archive_with(format: archive.tar(), wrapped_by: codec.zstd())
+}
+
+/// Convenience constructor for `tar.br`.  Decode-only until the brotli
+/// encoder is implemented.
+pub fn tar_brotli() -> Recipe {
+  archive_with(format: archive.tar(), wrapped_by: codec.brotli())
+}
+
 /// Convenience constructor for `cpio.gz`.
 pub fn cpio_gzip() -> Recipe {
   archive_with(format: archive.cpio_newc(), wrapped_by: codec.gzip())
