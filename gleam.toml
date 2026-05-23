@@ -118,3 +118,6 @@ unused_exports = "off"
 "src/packkit/zlib.gleam" = [
   "assert_ok_pattern",
 ]
+"src/packkit/zstd.gleam" = [
+  "prefer_guard_clause",
+]

@@ -23,6 +23,7 @@ import packkit/tar
 import packkit/xz
 import packkit/zip as zip_archive
 import packkit/zlib
+import packkit/zstd
 
 pub type Archive =
   archive.Archive
@@ -68,6 +69,7 @@ pub fn compress(
     "bzip2" -> bzip2.encode(bytes: bytes)
     "lzw" -> lzw.encode(bytes: bytes)
     "xz" -> xz.encode(bytes: bytes)
+    "zstd" -> zstd.encode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
@@ -89,6 +91,7 @@ pub fn decompress(
     "bzip2" -> bzip2.decode(bytes: bytes)
     "lzw" -> lzw.decode(bytes: bytes)
     "xz" -> xz.decode(bytes: bytes)
+    "zstd" -> zstd.decode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }
