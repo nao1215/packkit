@@ -59,7 +59,9 @@ unused_exports = "off"
   "thrown_away_error",
 ]
 "src/packkit/brotli.gleam" = [
+  "assert_ok_pattern",
   "prefer_guard_clause",
+  "thrown_away_error",
 ]
 "src/packkit/checksum.gleam" = ["short_variable_name"]
 "src/packkit/deflate.gleam" = [
