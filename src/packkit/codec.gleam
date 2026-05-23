@@ -45,9 +45,11 @@ pub fn snappy() -> Codec {
   Codec(name: "snappy", level: None, dictionary: None)
 }
 
-/// BZip2 stream.
+/// BZip2 stream.  Defaults to level 9 (900 KiB block size) to match
+/// the canonical `bzip2` default and the level `bzip2.encode` uses
+/// when no level is supplied explicitly.
 pub fn bzip2() -> Codec {
-  Codec(name: "bzip2", level: Some(level.default()), dictionary: None)
+  Codec(name: "bzip2", level: Some(level.custom(9)), dictionary: None)
 }
 
 /// XZ stream.

@@ -142,6 +142,15 @@ fn decode_loop(
             |> result.map_error(entry_error_to_archive_error(_, name)),
           )
 
+          let depth = entry.depth(entry.path(base_entry))
+          use <- bool.guard(
+            when: depth > limit.max_entry_depth(limits),
+            return: Error(error.ArchiveLimitExceeded(
+              limit: "max_entry_depth",
+              actual: depth,
+            )),
+          )
+
           let entry_value =
             base_entry
             |> entry.with_mode(mode: record.mode)

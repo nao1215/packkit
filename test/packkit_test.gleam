@@ -4,6 +4,7 @@ import gleeunit
 import gleeunit/should
 import packkit
 import packkit/archive
+import packkit/bzip2
 import packkit/codec
 import packkit/detect
 import packkit/entry
@@ -228,4 +229,38 @@ pub fn pack_failure_preserves_structured_codec_error_test() -> Nil {
       cause: error.CodecNotImplemented(feature: "brotli.encode"),
     )),
   )
+}
+
+pub fn facade_rejects_dictionary_on_unsupported_codec_test() -> Nil {
+  // Requesting a preset dictionary on a codec that does not support
+  // it must fail with the typed `CodecOptionUnsupported` rather than
+  // silently dropping the dictionary.
+  let dict = codec.dictionary(bytes: <<"shared":utf8>>)
+  let gzip_with_dict = codec.gzip() |> codec.with_dictionary(dictionary: dict)
+  packkit.compress(bytes: <<"data":utf8>>, with: gzip_with_dict)
+  |> should.equal(
+    Error(error.CodecOptionUnsupported(option: "dictionary", codec_name: "gzip")),
+  )
+}
+
+pub fn facade_rejects_level_on_levelless_codec_test() -> Nil {
+  // lz4's frame format has no level knob; the codec smart constructor
+  // returns level=None.  Explicit level requests must fail loudly.
+  let lz4_with_level = codec.lz4() |> codec.with_level(level: level.best())
+  packkit.compress(bytes: <<"data":utf8>>, with: lz4_with_level)
+  |> should.equal(
+    Error(error.CodecOptionUnsupported(option: "level", codec_name: "lz4")),
+  )
+}
+
+pub fn facade_bzip2_default_codec_uses_canonical_level_test() -> Nil {
+  // codec.bzip2() now carries level 9 — bzip2's canonical default —
+  // so that `packkit.compress(bytes, with: codec.bzip2())` produces
+  // the same stream as `bzip2.encode(bytes)`.
+  let payload = <<"align facade bzip2 default to engine default":utf8>>
+  let assert Ok(via_facade) =
+    packkit.compress(bytes: payload, with: codec.bzip2())
+  let assert Ok(via_engine) = bzip2.encode(bytes: payload)
+  via_facade
+  |> should.equal(via_engine)
 }

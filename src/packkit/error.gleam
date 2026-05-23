@@ -6,6 +6,13 @@ pub type CodecError {
   CodecInvalidData(message: String)
   CodecLimitExceeded(limit: String, actual: Int)
   CodecDictionaryRequired(name: String)
+  CodecDictionaryMismatch(name: String)
+  /// The codec carries an option (level or preset dictionary) that the
+  /// selected encoder/decoder cannot honour.  Distinct from
+  /// `CodecNotImplemented` so callers can tell "the codec is
+  /// fundamentally unfinished" apart from "this combination of
+  /// options is not supported by the current implementation".
+  CodecOptionUnsupported(option: String, codec_name: String)
   CodecNotImplemented(feature: String)
 }
 

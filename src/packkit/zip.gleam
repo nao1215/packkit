@@ -415,6 +415,16 @@ fn parse_central_directory(
         )),
       )
 
+      let cleaned_name = strip_trailing_slash(name)
+      let depth = path_depth(cleaned_name)
+      use <- bool.guard(
+        when: depth > limit.max_entry_depth(limits),
+        return: Error(error.ArchiveLimitExceeded(
+          limit: "max_entry_depth",
+          actual: depth,
+        )),
+      )
+
       use <- bool.guard(
         when: method != method_store && method != method_deflate,
         return: Error(error.ArchiveNotImplemented(
@@ -534,6 +544,13 @@ fn strip_trailing_slash(value: String) -> String {
   }
 }
 
+fn path_depth(name: String) -> Int {
+  case name {
+    "" -> 0
+    _ -> list.length(string.split(name, "/"))
+  }
+}
+
 fn codec_to_archive_error(
   err: error.CodecError,
   path: String,
@@ -550,6 +567,19 @@ fn codec_to_archive_error(
       error.ArchiveEntryRejected(
         path: path,
         reason: "deflate decode requires preset dictionary (not supported)",
+      )
+    error.CodecDictionaryMismatch(_) ->
+      error.ArchiveEntryRejected(
+        path: path,
+        reason: "deflate decode preset dictionary mismatch",
+      )
+    error.CodecOptionUnsupported(option, codec_name) ->
+      error.ArchiveEntryRejected(
+        path: path,
+        reason: "codec "
+          <> codec_name
+          <> " does not support the requested option: "
+          <> option,
       )
     error.CodecNotImplemented(feature) ->
       error.ArchiveNotImplemented(feature: feature)

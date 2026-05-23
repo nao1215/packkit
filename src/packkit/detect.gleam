@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import packkit/archive
@@ -100,12 +101,24 @@ fn find_filename_match(
 }
 
 /// Detect a format from the leading bytes of an input stream.
+///
+/// Signatures are matched as strictly as practical:
+///
+/// * gzip (`1F 8B`) also requires the compression-method byte to be
+///   `08` (DEFLATE), since RFC 1952 reserves the other values and
+///   no production gzip stream uses them.
+/// * zlib (`78 _`) requires CMF.CM == 8 (DEFLATE), CMF.CINFO ≤ 7
+///   (15-bit window), and `(CMF*256 + FLG) % 31 == 0` per RFC 1950.
+/// * bzip2 (`BZh`) additionally requires the block-size byte to be
+///   an ASCII digit `1`..`9`.
+/// * lz4 (`04 22 4D 18`) and `.Z` (`1F 9D`) keep their fixed magic.
+///
+/// Looser signatures like a bare `0x78 _` would false-positive on
+/// any byte stream whose first byte happens to be `0x78`.
 pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
-  // Gzip: 1F 8B 08
   case bytes {
-    <<0x1F, 0x8B, _:bytes>> -> Ok(detected_codec(codec.gzip(), extension: "gz"))
-    <<0x78, _flg, _:bytes>> ->
-      Ok(detected_codec(codec.zlib(), extension: "zlib"))
+    <<0x1F, 0x8B, cm, _:bytes>> if cm == 0x08 ->
+      Ok(detected_codec(codec.gzip(), extension: "gz"))
     <<0x50, 0x4B, 0x03, 0x04, _:bytes>> ->
       Ok(detected_archive(archive.zip(), extension: "zip"))
     <<0x50, 0x4B, 0x05, 0x06, _:bytes>> ->
@@ -118,7 +131,7 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
       Ok(detected_codec(codec.zstd(), extension: "zst"))
     <<0x04, 0x22, 0x4D, 0x18, _:bytes>> ->
       Ok(detected_codec(codec.lz4(), extension: "lz4"))
-    <<0x42, 0x5A, 0x68, _:bytes>> ->
+    <<0x42, 0x5A, 0x68, lvl, _:bytes>> if lvl >= 0x31 && lvl <= 0x39 ->
       Ok(detected_codec(codec.bzip2(), extension: "bz2"))
     <<0x1F, 0x9D, _:bytes>> -> Ok(detected_codec(codec.lzw(), extension: "Z"))
     <<"!<arch>\n":utf8, _:bytes>> ->
@@ -126,10 +139,26 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
     <<"070701":utf8, _:bytes>> ->
       Ok(detected_archive(archive.cpio_newc(), extension: "cpio"))
     _ ->
-      case has_ustar_magic(bytes) {
-        True -> Ok(detected_archive(archive.tar(), extension: "tar"))
-        False -> Error(error.DetectUnknownFormat(input: "byte-signature scan"))
+      case looks_like_zlib(bytes) {
+        True -> Ok(detected_codec(codec.zlib(), extension: "zlib"))
+        False ->
+          case has_ustar_magic(bytes) {
+            True -> Ok(detected_archive(archive.tar(), extension: "tar"))
+            False ->
+              Error(error.DetectUnknownFormat(input: "byte-signature scan"))
+          }
       }
+  }
+}
+
+fn looks_like_zlib(bytes: BitArray) -> Bool {
+  case bytes {
+    <<cmf, flg, _:bytes>> -> {
+      let cm = int.bitwise_and(cmf, 0x0F)
+      let cinfo = int.bitwise_shift_right(cmf, 4)
+      cm == 8 && cinfo <= 7 && { cmf * 256 + flg } % 31 == 0
+    }
+    _ -> False
   }
 }
 

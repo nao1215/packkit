@@ -3,7 +3,7 @@
 //// and unpack data without selecting the underlying engine by hand.
 
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import packkit/ar
 import packkit/archive
@@ -15,6 +15,7 @@ import packkit/deflate
 import packkit/detect
 import packkit/error
 import packkit/gzip
+import packkit/level
 import packkit/lz4
 import packkit/lzw
 import packkit/recipe
@@ -55,47 +56,230 @@ pub fn package_version() -> String {
   "0.1.0"
 }
 
-/// Compress `bytes` with `codec`.
+/// Compress `bytes` with `codec`.  The codec's optional level and
+/// preset dictionary are honoured where the family supports them; if
+/// the family cannot honour an option a typed `CodecOptionUnsupported`
+/// error is returned instead of silently dropping the request.
 pub fn compress(
   bytes bytes: BitArray,
   with codec_value: Codec,
 ) -> Result(BitArray, error.CodecError) {
   case codec.name(codec_value) {
-    "identity" -> Ok(bytes)
-    "deflate" -> deflate.encode(bytes: bytes)
-    "zlib" -> zlib.encode(bytes: bytes)
-    "gzip" -> gzip.encode(bytes: bytes, header: gzip.default_header())
-    "lz4" -> lz4.encode(bytes: bytes)
-    "snappy" -> snappy.encode(bytes: bytes)
-    "bzip2" -> bzip2.encode(bytes: bytes)
-    "lzw" -> lzw.encode(bytes: bytes)
-    "xz" -> xz.encode(bytes: bytes)
-    "zstd" -> zstd.encode(bytes: bytes)
-    "brotli" -> brotli.encode(bytes: bytes)
+    "identity" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      Ok(bytes)
+    }
+    "deflate" -> compress_deflate(bytes, codec_value)
+    "zlib" -> compress_zlib(bytes, codec_value)
+    "gzip" -> compress_gzip(bytes, codec_value)
+    "lz4" -> compress_levelless(bytes, codec_value, "lz4", lz4.encode)
+    "snappy" -> compress_levelless(bytes, codec_value, "snappy", snappy.encode)
+    "bzip2" -> compress_bzip2(bytes, codec_value)
+    "lzw" -> compress_levelless(bytes, codec_value, "lzw", lzw.encode)
+    "xz" -> compress_levellish(bytes, codec_value, "xz", xz.encode)
+    "zstd" -> compress_levellish(bytes, codec_value, "zstd", zstd.encode)
+    "brotli" -> compress_levellish(bytes, codec_value, "brotli", brotli.encode)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
 
-/// Decompress `bytes` with `codec`.
+/// Decompress `bytes` with `codec`.  Honours the codec's optional
+/// preset dictionary (currently only zlib) and otherwise rejects
+/// dictionary use with a typed error.
 pub fn decompress(
   bytes bytes: BitArray,
   with codec_value: Codec,
 ) -> Result(BitArray, error.CodecError) {
   case codec.name(codec_value) {
-    "identity" -> Ok(bytes)
-    "deflate" -> deflate.decode(bytes: bytes)
-    "zlib" -> zlib.decode(bytes: bytes)
-    "gzip" ->
+    "identity" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      Ok(bytes)
+    }
+    "deflate" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      deflate.decode(bytes: bytes)
+    }
+    "zlib" -> decompress_zlib(bytes, codec_value)
+    "gzip" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
       gzip.decode(bytes: bytes)
       |> result.map(fn(decoded) { decoded.payload })
-    "lz4" -> lz4.decode(bytes: bytes)
-    "snappy" -> snappy.decode(bytes: bytes)
-    "bzip2" -> bzip2.decode(bytes: bytes)
-    "lzw" -> lzw.decode(bytes: bytes)
-    "xz" -> xz.decode(bytes: bytes)
-    "zstd" -> zstd.decode(bytes: bytes)
-    "brotli" -> brotli.decode(bytes: bytes)
+    }
+    "lz4" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      lz4.decode(bytes: bytes)
+    }
+    "snappy" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      snappy.decode(bytes: bytes)
+    }
+    "bzip2" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      bzip2.decode(bytes: bytes)
+    }
+    "lzw" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      lzw.decode(bytes: bytes)
+    }
+    "xz" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      xz.decode(bytes: bytes)
+    }
+    "zstd" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      zstd.decode(bytes: bytes)
+    }
+    "brotli" -> {
+      use _ <- result.try(reject_dictionary(codec_value))
+      brotli.decode(bytes: bytes)
+    }
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
+  }
+}
+
+fn compress_deflate(
+  bytes: BitArray,
+  codec_value: Codec,
+) -> Result(BitArray, error.CodecError) {
+  use _ <- result.try(reject_dictionary(codec_value))
+  case effective_level(codec_value) {
+    Some(0) -> deflate.encode_stored_only(bytes: bytes)
+    _ -> deflate.encode(bytes: bytes)
+  }
+}
+
+fn compress_zlib(
+  bytes: BitArray,
+  codec_value: Codec,
+) -> Result(BitArray, error.CodecError) {
+  // The level is intentionally not threaded through: zlib.encode
+  // delegates to the fixed-Huffman DEFLATE encoder, which has no
+  // level knob today.  Rejecting non-default levels would break
+  // `codec.zlib() |> codec.with_level(...)` callers without giving
+  // them anything in return.
+  case codec.dictionary_of(codec_value) {
+    None -> zlib.encode(bytes: bytes)
+    Some(dict) ->
+      zlib.encode_with_dictionary(
+        bytes: bytes,
+        dictionary: codec.dictionary_bytes(dict),
+      )
+  }
+}
+
+fn decompress_zlib(
+  bytes: BitArray,
+  codec_value: Codec,
+) -> Result(BitArray, error.CodecError) {
+  case codec.dictionary_of(codec_value) {
+    None -> zlib.decode(bytes: bytes)
+    Some(dict) ->
+      zlib.decode_with_dictionary(
+        bytes: bytes,
+        dictionary: codec.dictionary_bytes(dict),
+      )
+  }
+}
+
+fn compress_gzip(
+  bytes: BitArray,
+  codec_value: Codec,
+) -> Result(BitArray, error.CodecError) {
+  use _ <- result.try(reject_dictionary(codec_value))
+  // Level intentionally not threaded through (see `compress_zlib`).
+  gzip.encode(bytes: bytes, header: gzip.default_header())
+}
+
+fn compress_bzip2(
+  bytes: BitArray,
+  codec_value: Codec,
+) -> Result(BitArray, error.CodecError) {
+  use _ <- result.try(reject_dictionary(codec_value))
+  let level_value = case effective_level(codec_value) {
+    // Treat "store" (0) as the smallest valid bzip2 block size (1)
+    // so callers can ask for the fastest setting without colliding
+    // with the bzip2-specific 1..9 range.
+    Some(0) -> 1
+    Some(n) -> int_clamp(n, 1, 9)
+    None -> 9
+  }
+  bzip2.encode_with_level(bytes: bytes, level: level_value)
+}
+
+/// Codecs whose encoders genuinely cannot consume a level knob — any
+/// non-`None` level (other than the implicit default) is reported as
+/// `CodecOptionUnsupported` so callers see the mismatch instead of
+/// the codec silently doing the same thing for every level.
+fn compress_levelless(
+  bytes: BitArray,
+  codec_value: Codec,
+  codec_name: String,
+  run: fn(BitArray) -> Result(BitArray, error.CodecError),
+) -> Result(BitArray, error.CodecError) {
+  use _ <- result.try(reject_dictionary(codec_value))
+  use _ <- result.try(reject_level(codec_value, codec_name))
+  run(bytes)
+}
+
+/// Codecs whose encoders accept a level conceptually but currently
+/// always emit the simplest representation (xz LZMA2 uncompressed,
+/// zstd raw frames, brotli uncompressed metablocks).  The level value
+/// is intentionally accepted and ignored: rejecting it would force
+/// every caller of `codec.xz()` / `codec.zstd()` / `codec.brotli()`
+/// (which all carry `level.default()`) to clear the level before
+/// using the facade, and that's an ergonomics regression for no
+/// safety win.  Dictionaries are still rejected.
+fn compress_levellish(
+  bytes: BitArray,
+  codec_value: Codec,
+  _codec_name: String,
+  run: fn(BitArray) -> Result(BitArray, error.CodecError),
+) -> Result(BitArray, error.CodecError) {
+  use _ <- result.try(reject_dictionary(codec_value))
+  run(bytes)
+}
+
+fn reject_dictionary(codec_value: Codec) -> Result(Nil, error.CodecError) {
+  case codec.dictionary_of(codec_value) {
+    None -> Ok(Nil)
+    Some(_) ->
+      case codec.name(codec_value) {
+        "zlib" -> Ok(Nil)
+        name ->
+          Error(error.CodecOptionUnsupported(
+            option: "dictionary",
+            codec_name: name,
+          ))
+      }
+  }
+}
+
+fn reject_level(
+  codec_value: Codec,
+  codec_name: String,
+) -> Result(Nil, error.CodecError) {
+  case codec.level(codec_value) {
+    None -> Ok(Nil)
+    Some(_) ->
+      Error(error.CodecOptionUnsupported(
+        option: "level",
+        codec_name: codec_name,
+      ))
+  }
+}
+
+fn effective_level(codec_value: Codec) -> Option(Int) {
+  case codec.level(codec_value) {
+    Some(l) -> Some(level.value(l))
+    None -> None
+  }
+}
+
+fn int_clamp(value: Int, low: Int, high: Int) -> Int {
+  case value < low, value > high {
+    True, _ -> low
+    _, True -> high
+    _, _ -> value
   }
 }
 

@@ -51,3 +51,49 @@ pub fn rejects_garbage_test() -> Nil {
     _ -> should.fail()
   }
 }
+
+pub fn decode_with_dictionary_round_trips_test() -> Nil {
+  // The dictionary path is now reachable from the public surface:
+  // `encode_with_dictionary` produces a stream that carries the
+  // DICT_ID, and `decode_with_dictionary` verifies and decodes it.
+  let payload = <<"dictionary round trip":utf8>>
+  let dict = <<"shared-secret-dictionary":utf8>>
+  let assert Ok(stream) =
+    zlib.encode_with_dictionary(bytes: payload, dictionary: dict)
+  let assert Ok(restored) =
+    zlib.decode_with_dictionary(bytes: stream, dictionary: dict)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn decode_without_supplied_dictionary_errors_test() -> Nil {
+  // When FDICT is set but the caller did not pass a dictionary the
+  // decoder must surface `CodecDictionaryRequired` so the caller
+  // knows what to fix.
+  let dict = <<"a":utf8>>
+  let assert Ok(stream) =
+    zlib.encode_with_dictionary(bytes: <<"x":utf8>>, dictionary: dict)
+  case zlib.decode(bytes: stream) {
+    Error(error.CodecDictionaryRequired(name)) ->
+      name
+      |> should.equal("zlib")
+    _ -> should.fail()
+  }
+}
+
+pub fn decode_with_wrong_dictionary_errors_test() -> Nil {
+  // A mismatched dictionary must trigger `CodecDictionaryMismatch`
+  // instead of silently decoding into garbage.
+  let assert Ok(stream) =
+    zlib.encode_with_dictionary(bytes: <<"y":utf8>>, dictionary: <<
+      "correct":utf8,
+    >>)
+  case
+    zlib.decode_with_dictionary(bytes: stream, dictionary: <<"wrong":utf8>>)
+  {
+    Error(error.CodecDictionaryMismatch(name)) ->
+      name
+      |> should.equal("zlib")
+    _ -> should.fail()
+  }
+}

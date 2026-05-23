@@ -17,6 +17,7 @@ import packkit/archive as archives
 import packkit/entry
 import packkit/error
 import packkit/internal/lzma
+import packkit/limit
 
 const signature_size: Int = 32
 
@@ -96,10 +97,28 @@ pub fn encode(
   Error(error.ArchiveNotImplemented(feature: "seven_z.encode"))
 }
 
-/// Decode a 7z byte stream.
+/// Decode a 7z byte stream using the default limits.
 pub fn decode(
   bytes bytes: BitArray,
 ) -> Result(archives.Archive, error.ArchiveError) {
+  decode_with_limits(bytes: bytes, limits: limit.default())
+}
+
+/// Decode a 7z byte stream using explicit limits.  Currently enforces
+/// `max_input_bytes` and `max_entry_depth`; the underlying LZMA/LZMA2
+/// decoder uses its own internal output guards.
+pub fn decode_with_limits(
+  bytes bytes: BitArray,
+  limits limits: limit.Limits,
+) -> Result(archives.Archive, error.ArchiveError) {
+  use <- bool.guard(
+    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
+    return: Error(error.ArchiveLimitExceeded(
+      limit: "max_input_bytes",
+      actual: bit_array.byte_size(bytes),
+    )),
+  )
+
   use #(next_offset, next_size, _crc) <- result.try(parse_signature_header(
     bytes,
   ))
@@ -121,7 +140,7 @@ pub fn decode(
     _ -> Ok(next_header_bytes)
   })
   use parsed <- result.try(parse_header(header))
-  decode_archive(packed_streams, parsed)
+  decode_archive(packed_streams, parsed, limits)
 }
 
 // -- encoded next header (NID 0x17) ------------------------------------
@@ -928,6 +947,7 @@ fn sum_list(values: List(Int), acc: Int) -> Int {
 fn decode_archive(
   packed: BitArray,
   parsed: ParsedHeader,
+  limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
   let _ = parsed.pack_pos
   use plain <- result.try(decode_folder(
@@ -935,7 +955,7 @@ fn decode_archive(
     parsed.folder,
     parsed.unpack_sizes,
   ))
-  build_archive_entries(plain, parsed)
+  build_archive_entries(plain, parsed, limits)
 }
 
 fn decode_folder(
@@ -1118,14 +1138,33 @@ fn codec_to_archive(err: error.CodecError) -> error.ArchiveError {
       error.ArchiveInvalid(
         message: "codec " <> name <> " requires a preset dictionary",
       )
+    error.CodecDictionaryMismatch(name) ->
+      error.ArchiveInvalid(
+        message: "codec " <> name <> " preset dictionary DICT_ID mismatch",
+      )
+    error.CodecOptionUnsupported(option, codec_name) ->
+      error.ArchiveInvalid(
+        message: "codec "
+        <> codec_name
+        <> " does not support the requested option: "
+        <> option,
+      )
   }
 }
 
 fn build_archive_entries(
   plain: BitArray,
   parsed: ParsedHeader,
+  limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
-  build_entries_loop(plain, parsed.file_names, parsed.empty_streams, 0, [])
+  build_entries_loop(
+    plain,
+    parsed.file_names,
+    parsed.empty_streams,
+    0,
+    [],
+    limits,
+  )
   |> result.map(fn(entries) {
     archives.from_entries(format: format(), entries: entries)
   })
@@ -1137,13 +1176,14 @@ fn build_entries_loop(
   empties: List(Bool),
   consumed: Int,
   acc: List(entry.Entry),
+  limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
   case names, empties {
     [], _ -> Ok(list.reverse(acc))
     [name, ..rest_names], [is_empty, ..rest_empties] ->
       case is_empty {
         True ->
-          add_directory(name, acc)
+          add_directory(name, acc, limits)
           |> result.try(fn(new_acc) {
             build_entries_loop(
               plain,
@@ -1151,12 +1191,13 @@ fn build_entries_loop(
               rest_empties,
               consumed,
               new_acc,
+              limits,
             )
           })
         False -> {
           let remaining = bit_array.byte_size(plain) - consumed
           let assert Ok(body) = bit_array.slice(plain, consumed, remaining)
-          add_file(name, body, acc)
+          add_file(name, body, acc, limits)
           |> result.try(fn(new_acc) {
             build_entries_loop(
               plain,
@@ -1164,6 +1205,7 @@ fn build_entries_loop(
               rest_empties,
               consumed + remaining,
               new_acc,
+              limits,
             )
           })
         }
@@ -1171,9 +1213,16 @@ fn build_entries_loop(
     [name, ..rest_names], [] -> {
       let remaining = bit_array.byte_size(plain) - consumed
       let assert Ok(body) = bit_array.slice(plain, consumed, remaining)
-      add_file(name, body, acc)
+      add_file(name, body, acc, limits)
       |> result.try(fn(new_acc) {
-        build_entries_loop(plain, rest_names, [], consumed + remaining, new_acc)
+        build_entries_loop(
+          plain,
+          rest_names,
+          [],
+          consumed + remaining,
+          new_acc,
+          limits,
+        )
       })
     }
   }
@@ -1183,9 +1232,20 @@ fn add_file(
   name: String,
   body: BitArray,
   acc: List(entry.Entry),
+  limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
   case entry.file_checked(path: name, body: body) {
-    Ok(e) -> Ok([e, ..acc])
+    Ok(e) -> {
+      let depth = entry.depth(entry.path(e))
+      case depth > limit.max_entry_depth(limits) {
+        True ->
+          Error(error.ArchiveLimitExceeded(
+            limit: "max_entry_depth",
+            actual: depth,
+          ))
+        False -> Ok([e, ..acc])
+      }
+    }
     Error(_) ->
       Error(error.ArchiveInvalid(
         message: "7z file name failed path validation: " <> name,
@@ -1196,9 +1256,20 @@ fn add_file(
 fn add_directory(
   name: String,
   acc: List(entry.Entry),
+  limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
   case entry.directory_checked(path: name) {
-    Ok(e) -> Ok([e, ..acc])
+    Ok(e) -> {
+      let depth = entry.depth(entry.path(e))
+      case depth > limit.max_entry_depth(limits) {
+        True ->
+          Error(error.ArchiveLimitExceeded(
+            limit: "max_entry_depth",
+            actual: depth,
+          ))
+        False -> Ok([e, ..acc])
+      }
+    }
     Error(_) ->
       Error(error.ArchiveInvalid(
         message: "7z directory name failed path validation: " <> name,

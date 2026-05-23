@@ -209,6 +209,15 @@ fn header_to_entry(
       ))
   })
 
+  let depth = entry.depth(entry.path(base))
+  use <- bool.guard(
+    when: depth > limit.max_entry_depth(limits),
+    return: Error(error.ArchiveLimitExceeded(
+      limit: "max_entry_depth",
+      actual: depth,
+    )),
+  )
+
   Ok(
     base
     |> entry.with_mode(mode: perm)
