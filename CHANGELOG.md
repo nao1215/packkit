@@ -64,3 +64,33 @@
 - Wired the `packkit.compress` / `decompress` / `read` / `write` /
   `pack` / `unpack` facade and turned byte-signature detection into a
   real magic-number scan.
+- Honour the codec's `level` and preset `dictionary` in the facade.
+  Unsupported combinations now surface the typed
+  `CodecOptionUnsupported(option, codec_name)` instead of silently
+  dropping the option.  Aligned `codec.bzip2()` with bzip2's
+  canonical level 9 so `packkit.compress(b, codec.bzip2())` and
+  `bzip2.encode(b)` produce identical output.
+- Implemented zlib preset-dictionary support: `encode_with_dictionary`
+  emits the FDICT envelope with the Adler-32 DICT_ID,
+  `decode_with_dictionary` resolves it (with a typed
+  `CodecDictionaryMismatch` on a wrong-key dictionary), and the
+  decoder now enforces `Limits.max_window_bits` against the CMF
+  CINFO field.
+- Added safe gzip header constructors: `with_name_checked` /
+  `with_comment_checked` reject the NUL byte that would silently
+  truncate the FNAME / FCOMMENT field on round-trip.  The unchecked
+  builders now strip embedded NULs.
+- Tightened `detect.from_bytes`: gzip requires CM=8, zlib verifies
+  CMF.CM/CINFO and the FCHECK mod-31 invariant (no more
+  false-positives on `0x78 _` prefixes), bzip2 requires the 1..9
+  block-size digit.
+- Enforced `Limits.max_entry_depth` consistently across cpio, ar,
+  zip, and 7z (it previously fired only on tar).
+- Implemented `gzip.new_decoder` / `push` / `finish` as a buffered
+  decoder so the streaming surface is no longer a typed
+  `CodecNotImplemented`.  Mirrors the codec-neutral
+  `packkit/stream` API.
+- Implemented a real `brotli.encode` that emits valid uncompressed
+  metablocks (RFC 7932 §9.2) followed by a terminating empty
+  ISLAST marker.  `tar.brotli` now round-trips end-to-end through
+  the facade.

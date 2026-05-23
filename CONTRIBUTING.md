@@ -7,7 +7,9 @@ You need the following tools installed:
 - [Gleam](https://gleam.run/) 1.15+
 - Erlang/OTP 28+
 - Node.js 22+ for JavaScript-target builds and tests
-- [just](https://github.com/casey/just) as a task runner
+- [just](https://github.com/casey/just) 1.14+ as a task runner — the
+  `justfile` uses the `shell()` function which is parsed at justfile
+  load time, so older `just` will fail before it can run any recipe.
 - [mise](https://mise.jdx.dev/) for toolchain management
 
 Clone the repository and install the managed toolchain:
@@ -21,17 +23,46 @@ just deps
 ```
 
 `just` recipes and helper scripts locate the mise-managed toolchain via
-`scripts/lib/mise_bootstrap.sh`, so `mise activate` is not required in
-the current shell.
+`scripts/lib/mise_bootstrap.sh`, which the `justfile`'s `export PATH`
+line sources at load time.  That means `mise activate` is not required
+in the current shell, but the script and `mise` itself **must already
+be reachable** when `just` parses the file — otherwise `just` fails
+with a `shell` error before any recipe runs.  If that happens, source
+the bootstrap script by hand once (`. scripts/lib/mise_bootstrap.sh`)
+and re-run `just`.
 
 ## Project status
 
-Implemented engines: checksum (Adler-32, CRC-32), tar, cpio (newc), ar,
-zip (stored), deflate (full decoder, stored-only encoder), zlib, gzip.
+Implemented engines:
 
-Pending engines (lz4, snappy, bzip2, xz, brotli, zstd, 7z, ZIP deflate
-method, Huffman-coded DEFLATE encoder) return typed `*NotImplemented`
-errors from the facade.
+- **checksum**: Adler-32, CRC-32 (reflected), CRC-32C, bzip2 CRC-32.
+- **tar / cpio (newc) / ar**: full encode/decode.
+- **zip**: stored-method encode/decode; deflate-method encode/decode.
+- **deflate**: full RFC 1951 decoder; fixed-Huffman LZ77 encoder.
+- **zlib / gzip**: full RFC wrappers including preset-dictionary
+  support on zlib's decoder side (and an `encode_with_dictionary`
+  helper that emits the FDICT envelope).
+- **lz4 / snappy / lzw**: full encode/decode.
+- **bzip2**: full encode/decode (level 1..9).
+- **xz**: full LZMA2 decoder (raw + LZMA-compressed chunks);
+  uncompressed-LZMA2 encoder.
+- **zstd**: frame envelope + raw + RLE + FSE-compressed blocks with
+  Raw/RLE literals and predefined FSE modes on decode; raw-block
+  encoder.
+- **brotli**: full RFC 7932 decoder; encoder emits uncompressed
+  metablocks only (valid stream, no actual compression yet).
+- **7z**: single-folder LZMA / LZMA2 reader; encoder still pending.
+
+Codecs without real encoders (`xz`, `zstd`, `brotli`) still produce
+valid streams that any conforming decoder accepts; they just do no
+actual compression yet.  The `*NotImplemented` errors that remain are
+either internal helpers or 7z encode.
+
+The facade (`packkit.compress`, `packkit.decompress`, `packkit.pack`,
+`packkit.unpack`) honours the codec's optional `level` and preset
+dictionary.  Asking for an option the underlying engine cannot honour
+returns the typed `CodecOptionUnsupported` instead of silently
+dropping the request.
 
 ## Running checks
 

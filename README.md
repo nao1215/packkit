@@ -45,17 +45,25 @@ Implemented codecs and archive families:
 - **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
   with Raw / RLE literals and predefined FSE modes; Huffman
   literals and non-predefined FSE modes still pending
-- **brotli**: empty stream + any `ISUNCOMPRESSED` metablock
-  (RFC 7932 §9.2); compressed metablocks + static dictionary
-  still pending
+- **brotli**: full RFC 7932 decoder (uncompressed + compressed
+  metablocks, static dictionary, context maps, block switching).
+  Encoder emits uncompressed metablocks only — the stream is a
+  valid brotli stream that any conforming decoder accepts, but
+  does no actual LZ77/Huffman compression yet.
 
 The facade (`packkit.compress`, `packkit.decompress`, `packkit.read`,
 `packkit.write`, `packkit.pack`, `packkit.unpack`) is wired to these
-engines.  Filename- and byte-signature-based detection are both
-available.
+engines and honours the codec's optional level and preset-dictionary
+settings; unsupported combinations are reported with the typed
+`CodecOptionUnsupported` error rather than silently ignored.
+Filename- and byte-signature-based detection are both available, and
+the signatures are matched strictly (gzip requires CM=8, zlib
+verifies the RFC 1950 check bits, bzip2 requires the block-size
+digit, ...).
 
-Still pending: zstd compressed blocks (FSE + Huffman + sequences),
-brotli full RFC 7932 decoder, zstd / xz / 7z encoders, and the
+Still pending: zstd compressed-block Huffman literals and
+non-predefined FSE modes, brotli LZ77/Huffman compression in the
+encoder, zstd / xz / 7z encoders that do real compression, and the
 length-limited dynamic Huffman path inside the DEFLATE encoder.
 
 ## Install
