@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleam/option.{None, Some}
 import gleeunit/should
 import packkit/error
@@ -51,5 +52,49 @@ pub fn decode_payload_returns_bitarray_for_parity_test() -> Nil {
     gzip.encode(bytes: payload, header: gzip.default_header())
   let assert Ok(plain) = gzip.decode_payload(bytes: encoded)
   plain
+  |> should.equal(payload)
+}
+
+pub fn with_name_checked_rejects_embedded_nul_test() -> Nil {
+  // gzip terminates FNAME at the first NUL.  A name containing NUL
+  // would silently truncate on the round-trip, so the checked
+  // builder must reject it with the typed `HeaderNameContainsNul`.
+  gzip.default_header()
+  |> gzip.with_name_checked(name: "before\u{0000}after")
+  |> should.equal(Error(gzip.HeaderNameContainsNul))
+}
+
+pub fn with_comment_checked_rejects_embedded_nul_test() -> Nil {
+  gzip.default_header()
+  |> gzip.with_comment_checked(comment: "x\u{0000}y")
+  |> should.equal(Error(gzip.HeaderCommentContainsNul))
+}
+
+pub fn with_name_checked_accepts_nul_free_name_test() -> Nil {
+  let assert Ok(header) =
+    gzip.default_header() |> gzip.with_name_checked(name: "valid.txt")
+  let payload = <<"checked-name round trip":utf8>>
+  let assert Ok(encoded) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(decoded) = gzip.decode(bytes: encoded)
+  gzip.name(decoded.header)
+  |> should.equal(Some("valid.txt"))
+}
+
+pub fn streaming_decoder_round_trips_test() -> Nil {
+  // gzip.new_decoder / push / finish now buffers chunks and runs the
+  // eager decoder at finish time.  Regression for the period when
+  // both push and finish returned `CodecNotImplemented`.
+  let payload = <<"streaming gzip round trip":utf8>>
+  let assert Ok(encoded) =
+    gzip.encode(bytes: payload, header: gzip.default_header())
+  let half = 6
+  let total = bit_array.byte_size(encoded)
+  let assert Ok(first_chunk) = bit_array.slice(encoded, 0, half)
+  let assert Ok(second_chunk) = bit_array.slice(encoded, half, total - half)
+  let decoder = gzip.new_decoder()
+  let assert Ok(#(decoder, _)) = gzip.push(decoder, first_chunk)
+  let assert Ok(#(decoder, _)) = gzip.push(decoder, second_chunk)
+  let assert Ok([chunk]) = gzip.finish(decoder)
+  chunk
   |> should.equal(payload)
 }

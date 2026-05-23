@@ -10,6 +10,7 @@ import gleam/bool
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import packkit/checksum
 import packkit/codec as codecs
 import packkit/deflate
@@ -43,10 +44,15 @@ pub opaque type Header {
   )
 }
 
-/// Placeholder incremental decoder state (kept for API stability while
-/// streaming support is under construction).
+/// Incremental decoder state.  Buffers the input chunks and runs the
+/// one-shot decoder at `finish` time.  Streaming is presented as
+/// "feed-and-finalize" rather than "produce a partial output per
+/// push" because the underlying DEFLATE decoder is eager — but the
+/// API still lets callers wire incremental pipelines from sources
+/// that hand them data in chunks.  See `packkit/stream` for the
+/// codec-neutral version of this surface.
 pub opaque type Decoder {
-  Decoder(header: Header, reversed_chunks: List(BitArray))
+  Decoder(reversed_chunks: List(BitArray), limits: limit.Limits)
 }
 
 /// Gzip codec smart constructor.
@@ -60,13 +66,55 @@ pub fn default_header() -> Header {
 }
 
 /// Attach an optional filename.
+///
+/// **Warning:** gzip terminates the FNAME field with a NUL byte, so a
+/// name containing `\0` cannot round-trip — readers will truncate at
+/// the first NUL.  Prefer [with_name_checked] when the value comes
+/// from untrusted input; this unchecked counterpart silently strips
+/// embedded NULs so an already-validated string is still safe to pass.
 pub fn with_name(header: Header, name name: String) -> Header {
-  Header(..header, name: Some(name))
+  Header(..header, name: Some(string.replace(name, "\u{0000}", "")))
 }
 
-/// Attach an optional comment.
+/// Attach an optional comment.  See [with_name] for the NUL contract;
+/// embedded NULs are silently stripped.  Use [with_comment_checked]
+/// when callers may pass untrusted input that needs to round-trip
+/// faithfully.
 pub fn with_comment(header: Header, comment comment: String) -> Header {
-  Header(..header, comment: Some(comment))
+  Header(..header, comment: Some(string.replace(comment, "\u{0000}", "")))
+}
+
+/// Why a checked header constructor rejected an argument.
+pub type HeaderError {
+  HeaderNameContainsNul
+  HeaderCommentContainsNul
+}
+
+/// Attach an optional filename after validating that it does not
+/// contain the NUL byte gzip uses as the FNAME terminator.  Use this
+/// when the value comes from untrusted input that must round-trip.
+pub fn with_name_checked(
+  header: Header,
+  name name: String,
+) -> Result(Header, HeaderError) {
+  use <- bool.guard(
+    when: string.contains(name, "\u{0000}"),
+    return: Error(HeaderNameContainsNul),
+  )
+  Ok(Header(..header, name: Some(name)))
+}
+
+/// Attach an optional comment after validating that it does not
+/// contain the NUL byte gzip uses as the FCOMMENT terminator.
+pub fn with_comment_checked(
+  header: Header,
+  comment comment: String,
+) -> Result(Header, HeaderError) {
+  use <- bool.guard(
+    when: string.contains(comment, "\u{0000}"),
+    return: Error(HeaderCommentContainsNul),
+  )
+  Ok(Header(..header, comment: Some(comment)))
 }
 
 /// Attach an optional Unix mtime.
@@ -370,21 +418,54 @@ fn maybe_skip_header_crc(
   }
 }
 
-/// Create a new incremental decoder state.  Streaming is not yet
-/// implemented; this scaffold exists so the public API stays stable.
+/// Create a new incremental decoder state using the default limits.
 pub fn new_decoder() -> Decoder {
-  Decoder(header: default_header(), reversed_chunks: [])
+  Decoder(reversed_chunks: [], limits: limit.default())
 }
 
-/// Placeholder chunk push API for future incremental decode.
+/// Create a new incremental decoder state with explicit limits.
+pub fn new_decoder_with_limits(limits: limit.Limits) -> Decoder {
+  Decoder(reversed_chunks: [], limits: limits)
+}
+
+/// Append a chunk of input bytes to the decoder.  Returns the updated
+/// decoder; no output is produced until [finish] runs (the underlying
+/// DEFLATE decoder is eager).  The empty list in the result tuple
+/// reserves space for a future incremental implementation that emits
+/// payload bytes as they decode.
 pub fn push(
-  _decoder: Decoder,
-  _chunk: BitArray,
+  decoder: Decoder,
+  chunk: BitArray,
 ) -> Result(#(Decoder, List(BitArray)), error.CodecError) {
-  Error(error.CodecNotImplemented(feature: "gzip.push (streaming)"))
+  Ok(
+    #(
+      Decoder(..decoder, reversed_chunks: [chunk, ..decoder.reversed_chunks]),
+      [],
+    ),
+  )
 }
 
-/// Placeholder finalization API for future incremental decode.
-pub fn finish(_decoder: Decoder) -> Result(List(BitArray), error.CodecError) {
-  Error(error.CodecNotImplemented(feature: "gzip.finish (streaming)"))
+/// Finalize the decoder and return the full decoded payload split
+/// into a single-element list (one chunk).  The list shape mirrors
+/// the chunked output future implementations can emit.
+pub fn finish(decoder: Decoder) -> Result(List(BitArray), error.CodecError) {
+  let bytes =
+    decoder.reversed_chunks
+    |> list_reverse_bits
+  case decode_with_limits(bytes: bytes, limits: decoder.limits) {
+    Ok(decoded) -> Ok([decoded.payload])
+    Error(e) -> Error(e)
+  }
+}
+
+fn list_reverse_bits(reversed: List(BitArray)) -> BitArray {
+  list_reverse_bits_loop(reversed, <<>>)
+}
+
+fn list_reverse_bits_loop(reversed: List(BitArray), acc: BitArray) -> BitArray {
+  case reversed {
+    [] -> acc
+    [head, ..rest] ->
+      list_reverse_bits_loop(rest, bit_array.concat([head, acc]))
+  }
 }
