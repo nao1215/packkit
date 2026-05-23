@@ -19,26 +19,42 @@ recipes just because they may compress their members internally.
 
 Implemented codecs and archive families:
 
-- **checksum**: Adler-32 and CRC-32
+- **checksum**: Adler-32, CRC-32 (reflected), CRC-32C (Castagnoli),
+  bzip2 CRC-32 (non-reflected)
 - **tar**: USTAR encode/decode (regular files, directories, symlinks,
   hardlinks, prefix/name split)
 - **cpio**: newc encode/decode
 - **ar**: BSD long-name encode/decode
-- **zip**: stored-method encode/decode with CRC-32 verification
+- **zip**: stored-method encode/decode with CRC-32 verification, plus
+  per-entry deflate decode
+- **7z**: single-folder LZMA / LZMA2 reader (covers the common
+  `7z a` single-file case)
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
-  encoder currently emits stored blocks only
+  fixed-Huffman LZ77 encoder (3-byte hash chain, 32 KiB window)
 - **zlib**: RFC 1950 wrapper with Adler-32 trailer
 - **gzip**: RFC 1952 wrapper with header metadata and CRC/ISIZE
   verification
+- **lz4**: frame decoder + uncompressed-block encoder
+- **snappy**: raw-block and framed codec
+- **bzip2**: round-trip (BWT inverse + MTF + Huffman + RUNA/RUNB + RLE1
+  for decode; naive forward BWT + length-limited Huffman for encode)
+- **lzw**: Unix `.Z` (compress) encoder + decoder
+- **xz**: stream header / block header / index / footer + LZMA2 with
+  both uncompressed and LZMA-compressed chunks (via the pure-Gleam
+  LZMA range coder in `packkit/internal/lzma`)
+- **zstd**: frame envelope + raw + RLE blocks (FSE/Huffman compressed
+  blocks return `CodecNotImplemented`)
+- **brotli**: recognises the canonical empty stream `0x3F`
+  (RFC 7932 metablock layer + static dictionary still pending)
 
 The facade (`packkit.compress`, `packkit.decompress`, `packkit.read`,
 `packkit.write`, `packkit.pack`, `packkit.unpack`) is wired to these
 engines.  Filename- and byte-signature-based detection are both
 available.
 
-Pending codecs (`lz4`, `snappy`, `bzip2`, `xz`, `brotli`, `zstd`),
-`7z`, ZIP deflate method, and a Huffman-coded DEFLATE encoder return
-typed `*NotImplemented` errors.
+Still pending: zstd compressed blocks (FSE + Huffman + sequences),
+brotli full RFC 7932 decoder, zstd / xz / 7z encoders, and the
+length-limited dynamic Huffman path inside the DEFLATE encoder.
 
 ## Install
 
