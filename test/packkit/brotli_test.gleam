@@ -49,27 +49,43 @@ pub fn decode_hi_with_wbits_18_test() -> Nil {
   |> should.equal(Ok(<<"hi":utf8>>))
 }
 
-pub fn compressed_metablock_reaches_descriptor_stage_test() -> Nil {
+pub fn compressed_metablock_reaches_command_loop_test() -> Nil {
   // `printf 'aaaaaaaaaa' | brotli -c` — brotli chooses a compressed
-  // metablock for inputs around 10 bytes.  The decoder now reads the
-  // metablock prelude (NBLTYPES_{L,I,D}, NPOSTFIX, NDIRECT, context
-  // modes) before erroring at the prefix-code descriptor stage.
+  // metablock for inputs around 10 bytes.  The decoder now parses the
+  // metablock prelude (NBLTYPES, NPOSTFIX, NDIRECT, context modes),
+  // the NTREES counts, and three simple-form prefix-code descriptors
+  // (literal, insert-and-copy, distance) before erroring at the
+  // command-loop stage.  This proves the full header pipeline lines
+  // up bit-for-bit with brotli's encoder output.
   let stream = <<0x1F, 0x09, 0x00, 0xF8, 0x25, 0xC2, 0x82, 0x84, 0x00, 0x00>>
   let expected_feature =
-    "brotli prefix-code descriptors, context maps, and command loop (RFC 7932 §3.4–§4)"
+    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
   brotli.decode(bytes: stream)
   |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
 }
 
-pub fn compressed_metablock_with_small_wbits_reaches_same_stage_test() -> Nil {
+pub fn compressed_metablock_with_small_wbits_reaches_command_loop_test() -> Nil {
   // `printf 'aaaaaaaaaa' | brotli -c --lgwin=10` — the same 10-byte
   // payload encoded with a smaller window.  Because WBITS doesn't
   // change the bit positions of later fields, this also reaches the
-  // prefix-code descriptor stage.  Regression coverage for the
-  // `triple == 0` branch of `read_wbits`.
+  // command-loop stage.  Regression coverage for the `triple == 0`
+  // branch of `read_wbits` and for simple-form prefix-code parsing
+  // with a small (NDIRECT-derived) distance alphabet.
   let stream = <<0xA1, 0x48, 0x00, 0xC0, 0x2F, 0x11, 0x16, 0x24, 0x04, 0x00>>
   let expected_feature =
-    "brotli prefix-code descriptors, context maps, and command loop (RFC 7932 §3.4–§4)"
+    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
+  brotli.decode(bytes: stream)
+  |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
+}
+
+pub fn compressed_metablock_16a_reaches_command_loop_test() -> Nil {
+  // `printf 'aaaaaaaaaaaaaaaa' | brotli -c` (16 `a`s).  brotli's
+  // encoder still uses simple-form prefix codes for this length, so
+  // the literal/insert-and-copy/distance descriptors parse cleanly
+  // and we reach the same command-loop stage as the 10-byte fixture.
+  let stream = <<0x1F, 0x0F, 0x00, 0xF8, 0x25, 0xC2, 0x22, 0x8C, 0x00, 0x00>>
+  let expected_feature =
+    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
   brotli.decode(bytes: stream)
   |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
 }

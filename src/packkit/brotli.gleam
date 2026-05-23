@@ -7,12 +7,14 @@
 ////   (`ISUNCOMPRESSED` bit set) — i.e. payloads that brotli chose
 ////   not to compress.
 ////
-//// For compressed metablocks the decoder reads the metablock header
-//// up to and including the per-block-type context modes, but does
-//// not yet decode prefix-code descriptors, context maps, or the
-//// command loop.  Those return a typed `CodecNotImplemented` error
-//// whose `feature` string names the missing stage.  The ~120 KiB
-//// RFC 7932 static dictionary is also still pending.
+//// For compressed metablocks the decoder parses the metablock header
+//// (NBLTYPES, NPOSTFIX, NDIRECT, context modes), the NTREES counts
+//// for the literal and distance categories, and any prefix-code
+//// descriptors that the stream encodes in *simple* form (RFC 7932
+//// §3.4).  Complex-form descriptors, context maps for NTREES > 1,
+//// the command loop itself, and the ~120 KiB built-in static
+//// dictionary all still return a typed `CodecNotImplemented` whose
+//// `feature` string names the missing stage.
 
 import gleam/bit_array
 import gleam/bool
@@ -124,11 +126,21 @@ fn decode_one_metablock(
 
 // -- Compressed metablock (RFC 7932 §9.2) ------------------------------
 //
-// Only the prelude is implemented at this stage: NBLTYPES for the three
-// block categories (literal, insert-and-copy, distance), NPOSTFIX +
-// NDIRECT, and the literal context modes.  Anything further (prefix-code
-// descriptors, context maps, command loop, static dictionary) returns
-// `CodecNotImplemented` so callers see exactly which stage is missing.
+// What this implementation parses:
+//
+//   * NBLTYPES for the literal, insert-and-copy, and distance
+//     categories (the var-len uint8 from RFC 7932 §9.2).
+//   * NPOSTFIX + NDIRECT and the literal context modes.
+//   * NTREES counts for literals and distances.
+//   * Each prefix-code descriptor that uses *simple* form
+//     (`HCODE = 01`, RFC 7932 §3.4).
+//
+// What still returns `CodecNotImplemented`:
+//
+//   * Block switching (NBLTYPES > 1) and context maps (NTREES > 1).
+//   * Complex-form prefix codes (RFC 7932 §3.5).
+//   * The command loop and the ~120 KiB static dictionary
+//     (RFC 7932 §4 and §8).
 
 fn decode_compressed_metablock(
   reader: Reader,
@@ -146,17 +158,52 @@ fn decode_compressed_metablock(
   use _ <- result.try(reject_block_switching("insert-and-copy", nbl_command))
   use _ <- result.try(reject_block_switching("distance", nbl_distance))
 
-  use #(_npostfix, reader) <- result.try(read_bits(reader, 2))
-  use #(_ndirect, reader) <- result.try(read_bits(reader, 4))
+  use #(npostfix, reader) <- result.try(read_bits(reader, 2))
+  use #(ndirect, reader) <- result.try(read_bits(reader, 4))
 
   // Per RFC 7932 §7.3 the literal context mode is 2 bits per literal
   // block type (1 entry when NBLTYPES_L == 1).
-  use #(_context_modes, _reader) <- result.try(
+  use #(_context_modes, reader) <- result.try(
     read_context_modes(reader, nbl_literal, []),
   )
 
+  // RFC 7932 §9.2: NTREESL precedes the literal context map (which is
+  // emitted only when NTREESL ≥ 2).  Same shape for distances.
+  use #(ntrees_literal, reader) <- result.try(decode_var_len_uint8(reader))
+  use _ <- result.try(reject_context_map("literal", ntrees_literal))
+
+  use #(ntrees_distance, reader) <- result.try(decode_var_len_uint8(reader))
+  use _ <- result.try(reject_context_map("distance", ntrees_distance))
+
+  // §3.3 alphabet sizes.
+  let literal_alphabet = 256
+  let command_alphabet = 704
+  let distance_alphabet = 16 + ndirect + int.bitwise_shift_left(48, npostfix)
+
+  use #(_literal_codes, reader) <- result.try(
+    decode_prefix_codes(reader, ntrees_literal, literal_alphabet, "literal", []),
+  )
+  use #(_command_codes, reader) <- result.try(
+    decode_prefix_codes(
+      reader,
+      nbl_command,
+      command_alphabet,
+      "insert-and-copy",
+      [],
+    ),
+  )
+  use #(_distance_codes, _reader) <- result.try(
+    decode_prefix_codes(
+      reader,
+      ntrees_distance,
+      distance_alphabet,
+      "distance",
+      [],
+    ),
+  )
+
   Error(error.CodecNotImplemented(
-    feature: "brotli prefix-code descriptors, context maps, and command loop (RFC 7932 §3.4–§4)",
+    feature: "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)",
   ))
 }
 
@@ -168,6 +215,216 @@ fn reject_block_switching(
     True ->
       Error(error.CodecNotImplemented(
         feature: "brotli " <> category <> " block switching (NBLTYPES > 1)",
+      ))
+    False -> Ok(Nil)
+  }
+}
+
+fn reject_context_map(
+  category: String,
+  ntrees: Int,
+) -> Result(Nil, error.CodecError) {
+  case ntrees > 1 {
+    True ->
+      Error(error.CodecNotImplemented(
+        feature: "brotli "
+        <> category
+        <> " context map decoding (NTREES > 1, RFC 7932 §7.3)",
+      ))
+    False -> Ok(Nil)
+  }
+}
+
+// -- Prefix code descriptors (RFC 7932 §3.4) ---------------------------
+
+/// A decoded prefix code: each entry pairs a symbol with its canonical
+/// MSB-first code value and bit length.  A length of 0 marks the
+/// degenerate one-symbol code that consumes no bits.
+type PrefixCode {
+  PrefixCode(entries: List(PrefixEntry))
+}
+
+type PrefixEntry {
+  PrefixEntry(symbol: Int, length: Int, code: Int)
+}
+
+fn decode_prefix_codes(
+  reader: Reader,
+  remaining: Int,
+  alphabet_size: Int,
+  kind: String,
+  acc: List(PrefixCode),
+) -> Result(#(List(PrefixCode), Reader), error.CodecError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), reader))
+    _ -> {
+      use #(code, reader) <- result.try(decode_prefix_code(
+        reader,
+        alphabet_size,
+        kind,
+      ))
+      decode_prefix_codes(reader, remaining - 1, alphabet_size, kind, [
+        code,
+        ..acc
+      ])
+    }
+  }
+}
+
+fn decode_prefix_code(
+  reader: Reader,
+  alphabet_size: Int,
+  kind: String,
+) -> Result(#(PrefixCode, Reader), error.CodecError) {
+  use #(descriptor, reader) <- result.try(read_bits(reader, 2))
+  case descriptor {
+    1 -> decode_simple_prefix_code(reader, alphabet_size)
+    hskip ->
+      Error(error.CodecNotImplemented(
+        feature: "brotli "
+        <> kind
+        <> " complex-form prefix code (HSKIP="
+        <> int.to_string(hskip)
+        <> ", RFC 7932 §3.5)",
+      ))
+  }
+}
+
+fn decode_simple_prefix_code(
+  reader: Reader,
+  alphabet_size: Int,
+) -> Result(#(PrefixCode, Reader), error.CodecError) {
+  use #(nsym_minus_1, reader) <- result.try(read_bits(reader, 2))
+  let nsym = nsym_minus_1 + 1
+  let alphabet_bits = ceil_log2(alphabet_size)
+  use #(symbols, reader) <- result.try(
+    read_simple_symbols(reader, nsym, alphabet_bits, []),
+  )
+  use _ <- result.try(check_alphabet_bounds(symbols, alphabet_size))
+  use _ <- result.try(check_no_duplicates(symbols))
+  build_simple_layout(reader, nsym, symbols)
+}
+
+fn build_simple_layout(
+  reader: Reader,
+  nsym: Int,
+  symbols: List(Int),
+) -> Result(#(PrefixCode, Reader), error.CodecError) {
+  case nsym {
+    1 -> Ok(#(canonicalise(symbols, [0]), reader))
+    2 -> Ok(#(canonicalise(sort_asc(symbols), [1, 1]), reader))
+    3 -> {
+      // RFC 7932 §3.4: the first symbol keeps its position and gets a
+      // length-1 code; the remaining two are sorted ascending and get
+      // length-2 codes.
+      let assert [first, ..rest] = symbols
+      let sorted_rest = sort_asc(rest)
+      Ok(#(canonicalise([first, ..sorted_rest], [1, 2, 2]), reader))
+    }
+    _ -> {
+      use #(tree_select, reader) <- result.try(read_bits(reader, 1))
+      case tree_select {
+        0 -> Ok(#(canonicalise(sort_asc(symbols), [2, 2, 2, 2]), reader))
+        _ -> {
+          let assert [first, ..rest] = symbols
+          let sorted_rest = sort_asc(rest)
+          Ok(#(canonicalise([first, ..sorted_rest], [1, 2, 3, 3]), reader))
+        }
+      }
+    }
+  }
+}
+
+/// Build a canonical-Huffman `PrefixCode` from a parallel list of
+/// symbols and code-lengths.  Walks `(symbol, length)` pairs in
+/// length-ascending order, assigning MSB-first code values via the
+/// standard canonical-Huffman recurrence.
+fn canonicalise(symbols: List(Int), lengths: List(Int)) -> PrefixCode {
+  let pairs = list.zip(symbols, lengths)
+  let sorted =
+    list.sort(pairs, fn(a, b) {
+      let #(_, len_a) = a
+      let #(_, len_b) = b
+      int.compare(len_a, len_b)
+    })
+  PrefixCode(entries: assign_canonical(sorted, 0, 0, []))
+}
+
+fn assign_canonical(
+  pairs: List(#(Int, Int)),
+  next_code: Int,
+  prev_length: Int,
+  acc: List(PrefixEntry),
+) -> List(PrefixEntry) {
+  case pairs {
+    [] -> list.reverse(acc)
+    [#(sym, len), ..rest] -> {
+      let shifted = int.bitwise_shift_left(next_code, len - prev_length)
+      assign_canonical(rest, shifted + 1, len, [
+        PrefixEntry(symbol: sym, length: len, code: shifted),
+        ..acc
+      ])
+    }
+  }
+}
+
+fn ceil_log2(n: Int) -> Int {
+  ceil_log2_loop(n, 0, 1)
+}
+
+fn ceil_log2_loop(target: Int, k: Int, pow: Int) -> Int {
+  case pow >= target {
+    True -> k
+    False -> ceil_log2_loop(target, k + 1, pow * 2)
+  }
+}
+
+fn read_simple_symbols(
+  reader: Reader,
+  remaining: Int,
+  bits_per: Int,
+  acc: List(Int),
+) -> Result(#(List(Int), Reader), error.CodecError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), reader))
+    _ -> {
+      use #(sym, reader) <- result.try(read_bits(reader, bits_per))
+      read_simple_symbols(reader, remaining - 1, bits_per, [sym, ..acc])
+    }
+  }
+}
+
+fn sort_asc(symbols: List(Int)) -> List(Int) {
+  list.sort(symbols, int.compare)
+}
+
+fn check_no_duplicates(symbols: List(Int)) -> Result(Nil, error.CodecError) {
+  case has_consecutive_dup(sort_asc(symbols)) {
+    True ->
+      Error(error.CodecInvalidData(
+        message: "brotli simple-form prefix code has duplicate symbols",
+      ))
+    False -> Ok(Nil)
+  }
+}
+
+fn has_consecutive_dup(sorted: List(Int)) -> Bool {
+  case sorted {
+    [] -> False
+    [_] -> False
+    [a, b, ..] if a == b -> True
+    [_, ..rest] -> has_consecutive_dup(rest)
+  }
+}
+
+fn check_alphabet_bounds(
+  symbols: List(Int),
+  alphabet_size: Int,
+) -> Result(Nil, error.CodecError) {
+  case list.any(symbols, fn(s) { s >= alphabet_size }) {
+    True ->
+      Error(error.CodecInvalidData(
+        message: "brotli simple-form prefix code symbol exceeds alphabet size",
       ))
     False -> Ok(Nil)
   }
