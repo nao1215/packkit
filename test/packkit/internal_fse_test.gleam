@@ -54,6 +54,31 @@ pub fn high_bit_position_test() -> Nil {
   |> should.equal(6)
 }
 
+pub fn backward_reader_skips_padding_and_marker_test() -> Nil {
+  // Last byte 0x02 = 0b00000010 → marker bit at position 1, padding
+  // bits at positions 7-2 (all zero).  Bits below the marker (just
+  // bit 0 = 0) form the initial buffer.
+  let assert Ok(reader) = fse.new_backward_reader(<<0x02>>)
+  // No further bits available → asking for 1 bit returns 0.
+  let assert Ok(#(value, _)) = fse.read_backward_bits(reader, 1)
+  value
+  |> should.equal(0)
+}
+
+pub fn backward_reader_consumes_full_byte_after_marker_test() -> Nil {
+  // 0xC0 0x02 — last byte (0x02) gives 1 bit (0) below the marker;
+  // pulling another 8 bits should pour in the 0xC0 byte MSB-first.
+  let assert Ok(reader) = fse.new_backward_reader(<<0xC0, 0x02>>)
+  // First read consumes the 1 bit below the marker.
+  let assert Ok(#(low, reader)) = fse.read_backward_bits(reader, 1)
+  low
+  |> should.equal(0)
+  // The next 8 bits should equal 0xC0 (11000000).
+  let assert Ok(#(byte, _)) = fse.read_backward_bits(reader, 8)
+  byte
+  |> should.equal(0xC0)
+}
+
 pub fn offset_table_covers_all_symbols_test() -> Nil {
   // Every symbol that the predefined offset distribution allocates
   // must appear in the built state table.

@@ -12,6 +12,7 @@
 import gleam/dict
 import gleam/int
 import gleam/list
+import gleam/result
 
 /// Predefined Literals_Length distribution at accuracy_log 6.
 pub fn predefined_literal_length() -> List(Int) {
@@ -309,6 +310,118 @@ pub fn predefined_offset_table() -> dict.Dict(Int, StateEntry) {
 /// Total number of state cells implied by an accuracy_log.
 pub fn state_count(accuracy_log: Int) -> Int {
   int.bitwise_shift_left(1, accuracy_log)
+}
+
+// -- backward bit reader ------------------------------------------------
+
+/// Bit reader that consumes the FSE / Huffman bitstream from its end,
+/// MSB-first within each byte, after skipping the standard zstd
+/// "highest-bit-as-marker" padding.
+pub opaque type BackwardReader {
+  BackwardReader(buffer: Int, bits: Int, source_rev: List(Int))
+}
+
+/// Create a backward bit reader from the raw bitstream bytes.  The
+/// last byte must contain at least one set bit (the marker); all
+/// bits above the marker are padding and are skipped.
+pub fn new_backward_reader(bytes: BitArray) -> Result(BackwardReader, FseError) {
+  let bytes_rev = bytes_to_reverse_list(bytes, [])
+  case bytes_rev {
+    [] -> Error(FseEmptyBitstream)
+    [last, ..rest] -> {
+      let high = high_bit_position(last)
+      case last == 0 {
+        True -> Error(FseEmptyBitstream)
+        False -> {
+          // Drop the marker bit (highest set bit) but keep the bits
+          // below it as the initial buffer.
+          let bits_below = high
+          let mask = int.bitwise_shift_left(1, bits_below) - 1
+          let initial = int.bitwise_and(last, mask)
+          Ok(BackwardReader(buffer: initial, bits: bits_below, source_rev: rest))
+        }
+      }
+    }
+  }
+}
+
+/// Decoder error type for the FSE / zstd bitstream layer.
+pub type FseError {
+  FseEmptyBitstream
+  FseTruncated
+}
+
+/// Read `count` bits from the bitstream MSB-first.
+pub fn read_backward_bits(
+  reader: BackwardReader,
+  count: Int,
+) -> Result(#(Int, BackwardReader), FseError) {
+  let reader = refill_backward(reader, count)
+  case reader.bits >= count {
+    False -> Error(FseTruncated)
+    True -> {
+      let shift = reader.bits - count
+      let mask = int.bitwise_shift_left(1, count) - 1
+      let value =
+        int.bitwise_and(int.bitwise_shift_right(reader.buffer, shift), mask)
+      let leftover_mask = int.bitwise_shift_left(1, shift) - 1
+      Ok(#(
+        value,
+        BackwardReader(
+          buffer: int.bitwise_and(reader.buffer, leftover_mask),
+          bits: shift,
+          source_rev: reader.source_rev,
+        ),
+      ))
+    }
+  }
+}
+
+fn refill_backward(reader: BackwardReader, needed: Int) -> BackwardReader {
+  case reader.bits >= needed {
+    True -> reader
+    False ->
+      case reader.source_rev {
+        [byte, ..rest] -> {
+          let new_buffer =
+            int.bitwise_or(int.bitwise_shift_left(reader.buffer, 8), byte)
+          refill_backward(
+            BackwardReader(
+              buffer: new_buffer,
+              bits: reader.bits + 8,
+              source_rev: rest,
+            ),
+            needed,
+          )
+        }
+        [] -> reader
+      }
+  }
+}
+
+fn bytes_to_reverse_list(bytes: BitArray, acc: List(Int)) -> List(Int) {
+  case bytes {
+    <<b, rest:bytes>> -> bytes_to_reverse_list(rest, [b, ..acc])
+    _ -> acc
+  }
+}
+
+// -- state-driven decode helper ----------------------------------------
+
+/// Look up the symbol associated with the current state, read
+/// `nb_bits` from the backward bitstream to compute the next state,
+/// and return both.  Used by every zstd sequence decode step.
+pub fn decode_state(
+  table: dict.Dict(Int, StateEntry),
+  state: Int,
+  reader: BackwardReader,
+) -> Result(#(Int, Int, BackwardReader), FseError) {
+  let entry = case dict.get(table, state) {
+    Ok(e) -> e
+    Error(_) -> StateEntry(symbol: 0, nb_bits: 0, baseline: 0)
+  }
+  use #(extra, reader) <- result.try(read_backward_bits(reader, entry.nb_bits))
+  Ok(#(entry.symbol, entry.baseline + extra, reader))
 }
 
 /// Sum the absolute counts in a normalized distribution.  Useful for
