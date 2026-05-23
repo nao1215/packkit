@@ -116,14 +116,43 @@ pub fn decode(
     "7z next header",
   ))
   use header <- result.try(case next_header_bytes {
-    <<n, _:bytes>> if n == nid_encoded_header ->
-      Error(error.ArchiveNotImplemented(
-        feature: "7z encoded (compressed) next header",
-      ))
+    <<n, rest:bytes>> if n == nid_encoded_header ->
+      decode_encoded_header(rest, bytes)
     _ -> Ok(next_header_bytes)
   })
   use parsed <- result.try(parse_header(header))
   decode_archive(packed_streams, parsed)
+}
+
+// -- encoded next header (NID 0x17) ------------------------------------
+
+fn decode_encoded_header(
+  bytes_after_nid: BitArray,
+  full_archive: BitArray,
+) -> Result(BitArray, error.ArchiveError) {
+  // The encoded-header body is a StreamsInfo block describing the
+  // packed stream(s) that contain the *actual* next-header bytes.
+  // Parse it through the same MainStreamsInfo parser, then decode the
+  // packed stream using the declared coder and feed the result back
+  // through parse_header.
+  use #(streams, _rest) <- result.try(parse_main_streams_info(bytes_after_nid))
+  case streams {
+    HeaderStreamsNone ->
+      Error(error.ArchiveInvalid(
+        message: "7z encoded next header has no StreamsInfo",
+      ))
+    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes) -> {
+      let pack_offset = signature_size + pack_pos
+      let pack_size = sum_list(pack_sizes, 0)
+      use packed <- result.try(slice_required(
+        full_archive,
+        pack_offset,
+        pack_size,
+        "7z encoded-header packed bytes",
+      ))
+      decode_folder(packed, folder, unpack_sizes)
+    }
+  }
 }
 
 // -- signature header ----------------------------------------------------
@@ -1055,8 +1084,12 @@ fn decode_raw_lzma(
     <<props_byte, _:bytes>> ->
       case lzma.properties_of_byte(props_byte) {
         Ok(parsed_props) -> {
-          let primed = bit_array.concat([<<0>>, packed])
-          case lzma.new(primed, parsed_props, 32_000_000) {
+          // 7z's raw LZMA payload starts directly with the range
+          // coder's 5 priming bytes (the first of which must be zero
+          // per the LZMA specification).  Unlike the LZMA2 wrapper
+          // used inside xz, the priming byte is NOT injected by the
+          // surrounding format, so do not prepend another zero.
+          case lzma.new(packed, parsed_props, 32_000_000) {
             Ok(dec) ->
               case lzma.decode_into(dec, target) {
                 Ok(#(decoded, _state)) -> Ok(decoded)
