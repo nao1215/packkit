@@ -13,6 +13,7 @@ import gleam/bool
 import gleam/dict
 import gleam/int
 import gleam/list
+import gleam/order
 import gleam/result
 import packkit/checksum
 import packkit/codec as codecs
@@ -38,9 +39,48 @@ pub fn codec() -> codecs.Codec {
   codecs.bzip2()
 }
 
-/// Encode `bytes` as a bzip2 stream.  Not yet implemented.
-pub fn encode(bytes _bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  Error(error.CodecNotImplemented(feature: "bzip2.encode"))
+/// Encode `bytes` as a bzip2 stream using the default block size 9
+/// (900 KiB).  The encoder emits a single block plus the stream
+/// trailer with the combined CRC; large inputs that exceed the
+/// block size will still be packed into one block, so a naive
+/// forward BWT may dominate the running time.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+  encode_with_level(bytes: bytes, level: 9)
+}
+
+/// Encode `bytes` as a bzip2 stream with an explicit block-size
+/// level (1..9).  The level only affects the stream header byte; the
+/// encoder always emits a single block so the level mostly carries
+/// over for round-trip tooling.
+pub fn encode_with_level(
+  bytes bytes: BitArray,
+  level level: Int,
+) -> Result(BitArray, error.CodecError) {
+  use <- bool.guard(
+    when: level < 1 || level > 9,
+    return: Error(error.CodecInvalidData(message: "bzip2 level must be in 1..9")),
+  )
+  let level_byte = 0x30 + level
+  let header = <<0x42, 0x5A, 0x68, level_byte>>
+  case bit_array.byte_size(bytes) {
+    0 -> {
+      let writer = write_eos_marker(new_writer(), 0)
+      Ok(bit_array.concat([header, flush_writer_msb(writer)]))
+    }
+    _ -> {
+      let stream_crc = checksum.bzip2_crc32(bytes)
+      let writer = encode_block(new_writer(), bytes)
+      let writer = write_eos_marker(writer, stream_crc)
+      Ok(bit_array.concat([header, flush_writer_msb(writer)]))
+    }
+  }
+}
+
+fn write_eos_marker(writer: Writer, stream_crc: Int) -> Writer {
+  writer
+  |> write_bits_msb(eos_magic_high, 24)
+  |> write_bits_msb(eos_magic_low, 24)
+  |> write_bits_msb(stream_crc, 32)
 }
 
 /// Decode a bzip2 stream using the shared default `Limits`.
@@ -1081,5 +1121,762 @@ fn read_bits(
         ),
       ))
     }
+  }
+}
+
+// -- encoder pipeline --------------------------------------------------
+
+fn encode_block(writer: Writer, bytes: BitArray) -> Writer {
+  let block_crc = checksum.bzip2_crc32(bytes)
+  let rle1 = rle1_encode(bytes)
+  let n = list.length(rle1)
+  let #(l_string, orig_ptr) = bwt_forward(rle1, n)
+  let unique = sorted_unique_bytes(l_string)
+  let mtf_indices = mtf_forward(l_string, unique)
+  let symbols = rle2_encode(mtf_indices, list.length(unique) + 1)
+  let alphabet_size = list.length(unique) + 2
+  let lengths = build_huffman_lengths(symbols, alphabet_size)
+  let codes = canonical_codes(lengths)
+  let num_groups = case list.length(symbols) {
+    0 -> 1
+    sn -> { sn + group_size - 1 } / group_size
+  }
+  let writer =
+    writer
+    |> write_bits_msb(block_magic_high, 24)
+    |> write_bits_msb(block_magic_low, 24)
+    |> write_bits_msb(block_crc, 32)
+    |> write_bits_msb(0, 1)
+    |> write_bits_msb(orig_ptr, 24)
+  let writer = emit_symbol_map(writer, unique)
+  let writer = write_bits_msb(writer, 2, 3)
+  let writer = write_bits_msb(writer, num_groups, 15)
+  let writer = emit_selectors(writer, num_groups)
+  let writer = emit_two_tables(writer, lengths, alphabet_size)
+  emit_huffman_data(writer, symbols, lengths, codes)
+}
+
+// -- RLE1 forward ------------------------------------------------------
+
+fn rle1_encode(bytes: BitArray) -> List(Int) {
+  rle1_loop(bytes, -1, 0, [])
+}
+
+fn rle1_loop(bytes: BitArray, last: Int, run: Int, acc: List(Int)) -> List(Int) {
+  case bytes {
+    <<b, rest:bytes>> ->
+      case b == last {
+        True ->
+          case run {
+            r if r < 4 -> rle1_loop(rest, last, run + 1, [b, ..acc])
+            r if r < 259 -> {
+              // run is currently 4..258, but bzip2 caps at 259 (extra
+              // byte stores 0..255).  If we hit 259 we close the run.
+              case r >= 4 + 254 {
+                True -> rle1_loop(rest, -1, 0, [b, 255, ..acc])
+                False -> rle1_loop(rest, last, run + 1, acc)
+              }
+            }
+            _ -> rle1_loop(rest, last, run + 1, acc)
+          }
+        False ->
+          case run >= 4 {
+            True -> {
+              let extra = run - 4
+              rle1_loop(rest, b, 1, [b, extra, ..acc])
+            }
+            False -> rle1_loop(rest, b, 1, [b, ..acc])
+          }
+      }
+    _ ->
+      case run >= 4 {
+        True -> {
+          let extra = run - 4
+          list.reverse([extra, ..acc])
+        }
+        False -> list.reverse(acc)
+      }
+  }
+}
+
+// -- BWT forward (naive sort of rotations) ---------------------------
+
+fn bwt_forward(input: List(Int), n: Int) -> #(dict.Dict(Int, Int), Int) {
+  let table = list_to_dict(input, 0, dict.new())
+  let indices = list_range(0, n - 1, [])
+  let sorted =
+    list.sort(indices, fn(a, b) { compare_rotations(table, n, a, b) })
+  let l_dict = build_l_dict(sorted, table, n, 0, dict.new())
+  let orig_ptr = find_index(sorted, 0, 0)
+  #(l_dict, orig_ptr)
+}
+
+fn list_range(low: Int, high: Int, acc: List(Int)) -> List(Int) {
+  case low > high {
+    True -> list.reverse(acc)
+    False -> list_range(low + 1, high, [low, ..acc])
+  }
+}
+
+fn compare_rotations(
+  table: dict.Dict(Int, Int),
+  n: Int,
+  a: Int,
+  b: Int,
+) -> order.Order {
+  compare_loop(table, n, a, b, 0)
+}
+
+fn compare_loop(
+  table: dict.Dict(Int, Int),
+  n: Int,
+  a: Int,
+  b: Int,
+  offset: Int,
+) -> order.Order {
+  case offset >= n {
+    True -> order.Eq
+    False -> {
+      let ba = byte_at_index(table, mod_index(a + offset, n))
+      let bb = byte_at_index(table, mod_index(b + offset, n))
+      case ba == bb {
+        True -> compare_loop(table, n, a, b, offset + 1)
+        False -> int.compare(ba, bb)
+      }
+    }
+  }
+}
+
+fn byte_at_index(table: dict.Dict(Int, Int), index: Int) -> Int {
+  case dict.get(table, index) {
+    Ok(v) -> v
+    Error(_) -> 0
+  }
+}
+
+fn mod_index(value: Int, n: Int) -> Int {
+  case n {
+    0 -> 0
+    _ -> {
+      let r = value - { value / n } * n
+      case r < 0 {
+        True -> r + n
+        False -> r
+      }
+    }
+  }
+}
+
+fn build_l_dict(
+  sorted: List(Int),
+  table: dict.Dict(Int, Int),
+  n: Int,
+  index: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case sorted {
+    [] -> acc
+    [head, ..rest] -> {
+      let byte = byte_at_index(table, mod_index(head + n - 1, n))
+      build_l_dict(rest, table, n, index + 1, dict.insert(acc, index, byte))
+    }
+  }
+}
+
+fn find_index(values: List(Int), target: Int, index: Int) -> Int {
+  case values {
+    [head, ..] if head == target -> index
+    [_, ..rest] -> find_index(rest, target, index + 1)
+    [] -> 0
+  }
+}
+
+// -- MTF forward + RLE2 ------------------------------------------------
+
+fn sorted_unique_bytes(l_string: dict.Dict(Int, Int)) -> List(Int) {
+  let unique_dict =
+    dict.fold(l_string, dict.new(), fn(acc, _key, value) {
+      dict.insert(acc, value, True)
+    })
+  let bytes = dict.keys(unique_dict)
+  list.sort(bytes, int.compare)
+}
+
+fn mtf_forward(l_string: dict.Dict(Int, Int), unique: List(Int)) -> List(Int) {
+  mtf_forward_loop(l_string, 0, dict.size(l_string), unique, [])
+}
+
+fn mtf_forward_loop(
+  l_string: dict.Dict(Int, Int),
+  index: Int,
+  length: Int,
+  stack: List(Int),
+  acc: List(Int),
+) -> List(Int) {
+  case index >= length {
+    True -> list.reverse(acc)
+    False -> {
+      let byte = byte_at_index(l_string, index)
+      let #(pos, new_stack) = find_and_pop(stack, byte, 0, [])
+      mtf_forward_loop(l_string, index + 1, length, [byte, ..new_stack], [
+        pos,
+        ..acc
+      ])
+    }
+  }
+}
+
+fn find_and_pop(
+  stack: List(Int),
+  target: Int,
+  pos: Int,
+  prefix: List(Int),
+) -> #(Int, List(Int)) {
+  case stack {
+    [head, ..rest] if head == target -> #(
+      pos,
+      list.append(list.reverse(prefix), rest),
+    )
+    [head, ..rest] -> find_and_pop(rest, target, pos + 1, [head, ..prefix])
+    [] -> #(pos, list.reverse(prefix))
+  }
+}
+
+fn rle2_encode(mtf: List(Int), eob: Int) -> List(Int) {
+  rle2_loop(mtf, 0, eob, [])
+}
+
+fn rle2_loop(
+  mtf: List(Int),
+  zero_run: Int,
+  eob: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case mtf {
+    [0, ..rest] -> rle2_loop(rest, zero_run + 1, eob, acc)
+    [n, ..rest] -> {
+      let acc = flush_zero_run(zero_run, acc)
+      rle2_loop(rest, 0, eob, [n + 1, ..acc])
+    }
+    [] -> {
+      let acc = flush_zero_run(zero_run, acc)
+      list.reverse([eob, ..acc])
+    }
+  }
+}
+
+fn flush_zero_run(count: Int, acc: List(Int)) -> List(Int) {
+  case count {
+    0 -> acc
+    _ -> emit_runa_runb(count + 1, acc)
+  }
+}
+
+fn emit_runa_runb(value: Int, acc: List(Int)) -> List(Int) {
+  // value = (run_length + 1).  Drop the most-significant bit and
+  // emit the remaining bits LSB-first as RUNA (bit 0) or RUNB (bit 1).
+  case value {
+    1 -> acc
+    _ -> {
+      let bit = int.bitwise_and(value, 1)
+      let next = int.bitwise_shift_right(value, 1)
+      emit_runa_runb(next, [bit, ..acc])
+    }
+  }
+}
+
+// -- Huffman tree (length-limited) ------------------------------------
+
+fn build_huffman_lengths(
+  symbols: List(Int),
+  alphabet_size: Int,
+) -> dict.Dict(Int, Int) {
+  let freq = count_frequencies(symbols, dict.new())
+  let freq = pad_min_frequencies(freq, 0, alphabet_size)
+  package_merge_lengths(freq, alphabet_size, 17)
+}
+
+fn count_frequencies(
+  symbols: List(Int),
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case symbols {
+    [] -> acc
+    [head, ..rest] -> {
+      let current = case dict.get(acc, head) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      count_frequencies(rest, dict.insert(acc, head, current + 1))
+    }
+  }
+}
+
+fn pad_min_frequencies(
+  freq: dict.Dict(Int, Int),
+  symbol: Int,
+  alphabet_size: Int,
+) -> dict.Dict(Int, Int) {
+  case symbol >= alphabet_size {
+    True -> freq
+    False -> {
+      let freq = case dict.get(freq, symbol) {
+        Ok(_) -> freq
+        Error(_) -> dict.insert(freq, symbol, 1)
+      }
+      pad_min_frequencies(freq, symbol + 1, alphabet_size)
+    }
+  }
+}
+
+// Simple length-limited Huffman via repeated rebalancing.  For small
+// alphabets (≤ 258) this terminates quickly and produces a valid
+// canonical code that respects the bzip2 length cap of 17.
+fn package_merge_lengths(
+  freq: dict.Dict(Int, Int),
+  alphabet_size: Int,
+  max_length: Int,
+) -> dict.Dict(Int, Int) {
+  let lengths = compute_huffman_lengths(freq, alphabet_size)
+  case max_length_in_dict(lengths, 0, alphabet_size, 0) > max_length {
+    False -> lengths
+    True ->
+      package_merge_lengths(
+        flatten_frequencies(freq),
+        alphabet_size,
+        max_length,
+      )
+  }
+}
+
+fn flatten_frequencies(freq: dict.Dict(Int, Int)) -> dict.Dict(Int, Int) {
+  // Halve every frequency and round up, then add the minimum so all
+  // frequencies stay ≥ 1.  This compresses the dynamic range and
+  // shortens the longest codes.
+  dict.fold(freq, dict.new(), fn(acc, sym, count) {
+    let new_count = case count {
+      n if n <= 1 -> 1
+      n -> { n + 1 } / 2 + 1
+    }
+    dict.insert(acc, sym, new_count)
+  })
+}
+
+fn max_length_in_dict(
+  lengths: dict.Dict(Int, Int),
+  symbol: Int,
+  alphabet_size: Int,
+  best: Int,
+) -> Int {
+  case symbol >= alphabet_size {
+    True -> best
+    False -> {
+      let len = case dict.get(lengths, symbol) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      let best = case len > best {
+        True -> len
+        False -> best
+      }
+      max_length_in_dict(lengths, symbol + 1, alphabet_size, best)
+    }
+  }
+}
+
+// Standard Huffman tree builder using node merging.
+fn compute_huffman_lengths(
+  freq: dict.Dict(Int, Int),
+  alphabet_size: Int,
+) -> dict.Dict(Int, Int) {
+  let nodes = build_leaves(freq, 0, alphabet_size, [])
+  let merged_root = merge_nodes(nodes)
+  collect_lengths(merged_root, 0, dict.new())
+}
+
+type HuffNode {
+  HuffLeaf(symbol: Int, weight: Int)
+  HuffInternal(weight: Int, left: HuffNode, right: HuffNode)
+}
+
+fn build_leaves(
+  freq: dict.Dict(Int, Int),
+  symbol: Int,
+  alphabet_size: Int,
+  acc: List(HuffNode),
+) -> List(HuffNode) {
+  case symbol >= alphabet_size {
+    True -> acc
+    False -> {
+      let weight = case dict.get(freq, symbol) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      build_leaves(freq, symbol + 1, alphabet_size, [
+        HuffLeaf(symbol: symbol, weight: weight),
+        ..acc
+      ])
+    }
+  }
+}
+
+fn merge_nodes(nodes: List(HuffNode)) -> HuffNode {
+  case nodes {
+    [single] -> single
+    _ -> {
+      let sorted =
+        list.sort(nodes, fn(a, b) {
+          int.compare(node_weight(a), node_weight(b))
+        })
+      case sorted {
+        [a, b, ..rest] ->
+          merge_nodes([
+            HuffInternal(
+              weight: node_weight(a) + node_weight(b),
+              left: a,
+              right: b,
+            ),
+            ..rest
+          ])
+        _ -> HuffLeaf(symbol: 0, weight: 0)
+      }
+    }
+  }
+}
+
+fn node_weight(node: HuffNode) -> Int {
+  case node {
+    HuffLeaf(_, w) -> w
+    HuffInternal(w, _, _) -> w
+  }
+}
+
+fn collect_lengths(
+  node: HuffNode,
+  depth: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case node {
+    HuffLeaf(symbol, _) -> {
+      let depth = case depth {
+        0 -> 1
+        _ -> depth
+      }
+      dict.insert(acc, symbol, depth)
+    }
+    HuffInternal(_, left, right) -> {
+      let acc = collect_lengths(left, depth + 1, acc)
+      collect_lengths(right, depth + 1, acc)
+    }
+  }
+}
+
+// -- canonical Huffman codes ------------------------------------------
+
+fn canonical_codes(lengths: dict.Dict(Int, Int)) -> dict.Dict(Int, Int) {
+  let pairs = dict.to_list(lengths)
+  let sorted =
+    list.sort(pairs, fn(a, b) {
+      case int.compare(a.1, b.1) {
+        order.Eq -> int.compare(a.0, b.0)
+        other -> other
+      }
+    })
+  assign_codes(sorted, 0, 0, dict.new())
+}
+
+fn assign_codes(
+  pairs: List(#(Int, Int)),
+  code: Int,
+  prev_length: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case pairs {
+    [] -> acc
+    [#(sym, length), ..rest] -> {
+      let code = case prev_length {
+        0 -> 0
+        _ -> int.bitwise_shift_left(code, length - prev_length)
+      }
+      assign_codes(rest, code + 1, length, dict.insert(acc, sym, code))
+    }
+  }
+}
+
+// -- block emission -----------------------------------------------------
+
+fn emit_symbol_map(writer: Writer, unique: List(Int)) -> Writer {
+  let group_dict = bytes_to_group_dict(unique, dict.new())
+  let group_used = compute_group_used(group_dict, 0, dict.new())
+  let writer = emit_group_high(writer, group_used, 0)
+  emit_group_bitmaps(writer, group_used, group_dict, 0)
+}
+
+fn bytes_to_group_dict(
+  bytes: List(Int),
+  acc: dict.Dict(Int, List(Int)),
+) -> dict.Dict(Int, List(Int)) {
+  case bytes {
+    [] -> acc
+    [b, ..rest] -> {
+      let group = b / 16
+      let existing = case dict.get(acc, group) {
+        Ok(v) -> v
+        Error(_) -> []
+      }
+      bytes_to_group_dict(rest, dict.insert(acc, group, [b, ..existing]))
+    }
+  }
+}
+
+fn compute_group_used(
+  group_dict: dict.Dict(Int, List(Int)),
+  group: Int,
+  acc: dict.Dict(Int, Bool),
+) -> dict.Dict(Int, Bool) {
+  case group >= 16 {
+    True -> acc
+    False -> {
+      let used = case dict.get(group_dict, group) {
+        Ok(_) -> True
+        Error(_) -> False
+      }
+      compute_group_used(group_dict, group + 1, dict.insert(acc, group, used))
+    }
+  }
+}
+
+fn emit_group_high(
+  writer: Writer,
+  group_used: dict.Dict(Int, Bool),
+  group: Int,
+) -> Writer {
+  case group >= 16 {
+    True -> writer
+    False -> {
+      let bit = case dict.get(group_used, group) {
+        Ok(True) -> 1
+        _ -> 0
+      }
+      emit_group_high(write_bits_msb(writer, bit, 1), group_used, group + 1)
+    }
+  }
+}
+
+fn emit_group_bitmaps(
+  writer: Writer,
+  group_used: dict.Dict(Int, Bool),
+  group_dict: dict.Dict(Int, List(Int)),
+  group: Int,
+) -> Writer {
+  case group >= 16 {
+    True -> writer
+    False ->
+      case dict.get(group_used, group) {
+        Ok(True) -> {
+          let bytes = case dict.get(group_dict, group) {
+            Ok(v) -> v
+            Error(_) -> []
+          }
+          let writer = emit_bitmap_for_group(writer, bytes, group, 0)
+          emit_group_bitmaps(writer, group_used, group_dict, group + 1)
+        }
+        _ -> emit_group_bitmaps(writer, group_used, group_dict, group + 1)
+      }
+  }
+}
+
+fn emit_bitmap_for_group(
+  writer: Writer,
+  bytes: List(Int),
+  group: Int,
+  offset: Int,
+) -> Writer {
+  case offset >= 16 {
+    True -> writer
+    False -> {
+      let target = group * 16 + offset
+      let bit = case list.contains(bytes, target) {
+        True -> 1
+        False -> 0
+      }
+      emit_bitmap_for_group(
+        write_bits_msb(writer, bit, 1),
+        bytes,
+        group,
+        offset + 1,
+      )
+    }
+  }
+}
+
+fn emit_selectors(writer: Writer, num_groups: Int) -> Writer {
+  // All-zero selector list: every group picks table 0, encoded as a
+  // single 0 bit (unary 0).
+  emit_selectors_loop(writer, num_groups)
+}
+
+fn emit_selectors_loop(writer: Writer, remaining: Int) -> Writer {
+  case remaining {
+    0 -> writer
+    _ -> emit_selectors_loop(write_bits_msb(writer, 0, 1), remaining - 1)
+  }
+}
+
+fn emit_two_tables(
+  writer: Writer,
+  lengths: dict.Dict(Int, Int),
+  alphabet_size: Int,
+) -> Writer {
+  let writer = emit_table_lengths(writer, lengths, alphabet_size)
+  emit_table_lengths(writer, lengths, alphabet_size)
+}
+
+fn emit_table_lengths(
+  writer: Writer,
+  lengths: dict.Dict(Int, Int),
+  alphabet_size: Int,
+) -> Writer {
+  // The 5-bit prefix is the running length BEFORE the first symbol's
+  // adjustment.  Choosing the length of symbol 0 lets that adjustment
+  // collapse to a single "0" bit.
+  let first = case dict.get(lengths, 0) {
+    Ok(v) -> v
+    Error(_) -> 1
+  }
+  let writer = write_bits_msb(writer, first, 5)
+  emit_lengths_diff(writer, lengths, 0, alphabet_size, first)
+}
+
+fn emit_lengths_diff(
+  writer: Writer,
+  lengths: dict.Dict(Int, Int),
+  symbol: Int,
+  alphabet_size: Int,
+  previous: Int,
+) -> Writer {
+  case symbol >= alphabet_size {
+    True -> writer
+    False -> {
+      let target = case dict.get(lengths, symbol) {
+        Ok(v) -> v
+        Error(_) -> previous
+      }
+      let writer = emit_length_diff(writer, previous, target)
+      emit_lengths_diff(writer, lengths, symbol + 1, alphabet_size, target)
+    }
+  }
+}
+
+fn emit_length_diff(writer: Writer, previous: Int, target: Int) -> Writer {
+  case target == previous {
+    True -> write_bits_msb(writer, 0, 1)
+    False ->
+      case target > previous {
+        True -> {
+          let writer = write_bits_msb(writer, 1, 1)
+          let writer = write_bits_msb(writer, 0, 1)
+          emit_length_diff(writer, previous + 1, target)
+        }
+        False -> {
+          let writer = write_bits_msb(writer, 1, 1)
+          let writer = write_bits_msb(writer, 1, 1)
+          emit_length_diff(writer, previous - 1, target)
+        }
+      }
+  }
+}
+
+fn emit_huffman_data(
+  writer: Writer,
+  symbols: List(Int),
+  lengths: dict.Dict(Int, Int),
+  codes: dict.Dict(Int, Int),
+) -> Writer {
+  case symbols {
+    [] -> writer
+    [head, ..rest] -> {
+      let code = case dict.get(codes, head) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      let length = case dict.get(lengths, head) {
+        Ok(v) -> v
+        Error(_) -> 1
+      }
+      emit_huffman_data(
+        write_bits_msb(writer, code, length),
+        rest,
+        lengths,
+        codes,
+      )
+    }
+  }
+}
+
+// -- MSB-first bit writer ---------------------------------------------
+
+type Writer {
+  Writer(bytes_rev: List(Int), buffer: Int, bits: Int)
+}
+
+fn new_writer() -> Writer {
+  Writer(bytes_rev: [], buffer: 0, bits: 0)
+}
+
+fn write_bits_msb(writer: Writer, value: Int, count: Int) -> Writer {
+  case count {
+    0 -> writer
+    _ -> {
+      let masked = int.bitwise_and(value, mask_for(count))
+      let buffer =
+        int.bitwise_or(int.bitwise_shift_left(writer.buffer, count), masked)
+      flush_writer_full_bytes(Writer(
+        bytes_rev: writer.bytes_rev,
+        buffer: buffer,
+        bits: writer.bits + count,
+      ))
+    }
+  }
+}
+
+fn mask_for(count: Int) -> Int {
+  int.bitwise_shift_left(1, count) - 1
+}
+
+fn flush_writer_full_bytes(writer: Writer) -> Writer {
+  case writer.bits >= 8 {
+    False -> writer
+    True -> {
+      let shift = writer.bits - 8
+      let byte =
+        int.bitwise_and(int.bitwise_shift_right(writer.buffer, shift), 0xFF)
+      let new_buffer = int.bitwise_and(writer.buffer, mask_for(shift))
+      flush_writer_full_bytes(Writer(
+        bytes_rev: [byte, ..writer.bytes_rev],
+        buffer: new_buffer,
+        bits: shift,
+      ))
+    }
+  }
+}
+
+fn flush_writer_msb(writer: Writer) -> BitArray {
+  let writer = case writer.bits {
+    0 -> writer
+    _ -> {
+      let pad = 8 - writer.bits
+      let shifted = int.bitwise_shift_left(writer.buffer, pad)
+      let byte = int.bitwise_and(shifted, 0xFF)
+      Writer(bytes_rev: [byte, ..writer.bytes_rev], buffer: 0, bits: 0)
+    }
+  }
+  list_to_bit_array(list.reverse(writer.bytes_rev), <<>>)
+}
+
+fn list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
+  case values {
+    [] -> acc
+    [head, ..rest] -> list_to_bit_array(rest, <<acc:bits, head>>)
   }
 }

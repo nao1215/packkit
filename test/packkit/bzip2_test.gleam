@@ -9,9 +9,34 @@ pub fn codec_marker_test() -> Nil {
   |> should.equal("bzip2")
 }
 
-pub fn encode_reports_not_implemented_test() -> Nil {
-  bzip2.encode(bytes: <<>>)
-  |> should.equal(Error(error.CodecNotImplemented(feature: "bzip2.encode")))
+pub fn encode_empty_test() -> Nil {
+  let assert Ok(encoded) = bzip2.encode(bytes: <<>>)
+  let assert Ok(decoded) = bzip2.decode(bytes: encoded)
+  decoded
+  |> should.equal(<<>>)
+}
+
+pub fn encode_roundtrip_hello_test() -> Nil {
+  let payload = <<"hello":utf8>>
+  let assert Ok(encoded) = bzip2.encode(bytes: payload)
+  let assert Ok(decoded) = bzip2.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+}
+
+pub fn encode_roundtrip_pangram_test() -> Nil {
+  let payload = <<"The quick brown fox jumps over the lazy dog.\n":utf8>>
+  let assert Ok(encoded) = bzip2.encode(bytes: payload)
+  let assert Ok(decoded) = bzip2.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+}
+
+pub fn encode_rejects_invalid_level_test() -> Nil {
+  bzip2.encode_with_level(bytes: <<"x":utf8>>, level: 0)
+  |> should.equal(
+    Error(error.CodecInvalidData(message: "bzip2 level must be in 1..9")),
+  )
 }
 
 pub fn decode_hello_block_test() -> Nil {
