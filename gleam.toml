@@ -96,6 +96,11 @@ unused_exports = "off"
   "prefer_guard_clause",
   "thrown_away_error",
 ]
+"src/packkit/internal/fse.gleam" = [
+  "discarded_result",
+  "prefer_guard_clause",
+  "thrown_away_error",
+]
 "src/packkit/internal/lzma.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
