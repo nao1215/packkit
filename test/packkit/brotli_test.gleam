@@ -78,6 +78,24 @@ pub fn compressed_metablock_with_small_wbits_reaches_command_loop_test() -> Nil 
   |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
 }
 
+pub fn compressed_metablock_complex_form_reaches_command_loop_test() -> Nil {
+  // `printf 'Hello, World! This is brotli testing.' | brotli -c` —
+  // text input that triggers complex-form prefix codes (mixed-
+  // alphabet literals encoded via the 18-symbol code-length code
+  // and 16/17 run-length symbols, RFC 7932 §3.5).  Successful parse
+  // through to the command-loop stub is the strongest evidence
+  // that the complex-form pipeline reproduces brotli's output.
+  let stream = <<
+    0x1F, 0x24, 0x00, 0xE0, 0xC5, 0x6D, 0x6C, 0x5D, 0x1D, 0xA7, 0x77, 0xFB, 0xD1,
+    0x09, 0x04, 0x41, 0xEA, 0x41, 0x14, 0xA9, 0xE5, 0x16, 0xC5, 0xD2, 0x91, 0x58,
+    0x5D, 0x3B, 0x5A, 0xB2, 0x77, 0xE2, 0xD7, 0xC1, 0xD6, 0x02,
+  >>
+  let expected_feature =
+    "brotli command loop (insert-and-copy + sliding window, RFC 7932 §4)"
+  brotli.decode(bytes: stream)
+  |> should.equal(Error(error.CodecNotImplemented(feature: expected_feature)))
+}
+
 pub fn compressed_metablock_16a_reaches_command_loop_test() -> Nil {
   // `printf 'aaaaaaaaaaaaaaaa' | brotli -c` (16 `a`s).  brotli's
   // encoder still uses simple-form prefix codes for this length, so

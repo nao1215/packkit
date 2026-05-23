@@ -9,12 +9,13 @@
 ////
 //// For compressed metablocks the decoder parses the metablock header
 //// (NBLTYPES, NPOSTFIX, NDIRECT, context modes), the NTREES counts
-//// for the literal and distance categories, and any prefix-code
-//// descriptors that the stream encodes in *simple* form (RFC 7932
-//// §3.4).  Complex-form descriptors, context maps for NTREES > 1,
-//// the command loop itself, and the ~120 KiB built-in static
-//// dictionary all still return a typed `CodecNotImplemented` whose
-//// `feature` string names the missing stage.
+//// for the literal and distance categories, and every prefix-code
+//// descriptor — both *simple* (RFC 7932 §3.4) and *complex* (§3.5,
+//// the 18-symbol code-length code with 16/17 run-length symbols).
+//// Context maps for `NTREES > 1`, the command loop itself, and the
+//// ~120 KiB built-in static dictionary still return a typed
+//// `CodecNotImplemented` whose `feature` string names the missing
+//// stage.
 
 import gleam/bit_array
 import gleam/bool
@@ -132,13 +133,12 @@ fn decode_one_metablock(
 //     categories (the var-len uint8 from RFC 7932 §9.2).
 //   * NPOSTFIX + NDIRECT and the literal context modes.
 //   * NTREES counts for literals and distances.
-//   * Each prefix-code descriptor that uses *simple* form
-//     (`HCODE = 01`, RFC 7932 §3.4).
+//   * Every prefix-code descriptor — both simple (RFC 7932 §3.4)
+//     and complex (§3.5).
 //
 // What still returns `CodecNotImplemented`:
 //
 //   * Block switching (NBLTYPES > 1) and context maps (NTREES > 1).
-//   * Complex-form prefix codes (RFC 7932 §3.5).
 //   * The command loop and the ~120 KiB static dictionary
 //     (RFC 7932 §4 and §8).
 
@@ -274,19 +274,13 @@ fn decode_prefix_codes(
 fn decode_prefix_code(
   reader: Reader,
   alphabet_size: Int,
-  kind: String,
+  _kind: String,
 ) -> Result(#(PrefixCode, Reader), error.CodecError) {
   use #(descriptor, reader) <- result.try(read_bits(reader, 2))
   case descriptor {
     1 -> decode_simple_prefix_code(reader, alphabet_size)
-    hskip ->
-      Error(error.CodecNotImplemented(
-        feature: "brotli "
-        <> kind
-        <> " complex-form prefix code (HSKIP="
-        <> int.to_string(hskip)
-        <> ", RFC 7932 §3.5)",
-      ))
+    // 0, 2, 3 → complex form (HSKIP = descriptor, RFC 7932 §3.5).
+    hskip -> decode_complex_prefix_code(reader, alphabet_size, hskip)
   }
 }
 
@@ -365,6 +359,356 @@ fn assign_canonical(
         ..acc
       ])
     }
+  }
+}
+
+/// Build a `PrefixCode` from `(symbol, length)` pairs where a length
+/// of 0 indicates the symbol is absent from the code.  Sorts the
+/// remaining pairs by `(length asc, symbol asc)` and applies the
+/// canonical-Huffman recurrence.  Collapses the degenerate single-
+/// active-symbol case to length 0 to match RFC 7932 §3.5.
+fn canonicalise_from_pairs(pairs: List(#(Int, Int))) -> PrefixCode {
+  let active =
+    list.filter(pairs, fn(p) {
+      let #(_, len) = p
+      len > 0
+    })
+  case active {
+    [#(sym, _)] ->
+      PrefixCode(entries: [PrefixEntry(symbol: sym, length: 0, code: 0)])
+    _ -> {
+      let by_sym =
+        list.sort(active, fn(a, b) {
+          let #(sa, _) = a
+          let #(sb, _) = b
+          int.compare(sa, sb)
+        })
+      let by_len =
+        list.sort(by_sym, fn(a, b) {
+          let #(_, la) = a
+          let #(_, lb) = b
+          int.compare(la, lb)
+        })
+      PrefixCode(entries: assign_canonical(by_len, 0, 0, []))
+    }
+  }
+}
+
+// -- Complex-form prefix codes (RFC 7932 §3.5) -------------------------
+//
+// The encoding is two-stage: first the lengths of an 18-symbol code
+// (covering literal code lengths 0..15 plus repeat-prev=16 and
+// repeat-zero=17) are read using a fixed 16-entry lookup table; then
+// those lengths build a Huffman "CL" code which itself decodes the
+// final alphabet's code lengths, with the 16/17 repeats expanding
+// runs of the previous (non-zero or zero) length.
+
+/// Read order for the 18 code-length-code-lengths.  HSKIP entries are
+/// implicitly zero; the remainder is read in this order until either
+/// all are consumed or the Huffman space (32) is exhausted.
+fn cl_code_order() -> List(Int) {
+  [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+}
+
+/// Lookup tables for the fixed 4-bit code that encodes each CL
+/// code-length value.  Indexed by a 4-bit peek; returns
+/// `#(bits_to_consume, value)`.  Values are in 0..5 — never 6..15 —
+/// since CL code-lengths can't exceed 5 bits.  Mirrors the brotli C
+/// reference `kCodeLengthPrefixLength` + `kCodeLengthPrefixValue`.
+fn cl_prefix_lookup(ix: Int) -> #(Int, Int) {
+  case ix {
+    0 -> #(2, 0)
+    1 -> #(2, 4)
+    2 -> #(2, 3)
+    3 -> #(3, 2)
+    4 -> #(2, 0)
+    5 -> #(2, 4)
+    6 -> #(2, 3)
+    7 -> #(4, 1)
+    8 -> #(2, 0)
+    9 -> #(2, 4)
+    10 -> #(2, 3)
+    11 -> #(3, 2)
+    12 -> #(2, 0)
+    13 -> #(2, 4)
+    14 -> #(2, 3)
+    _ -> #(4, 5)
+  }
+}
+
+fn decode_complex_prefix_code(
+  reader: Reader,
+  alphabet_size: Int,
+  hskip: Int,
+) -> Result(#(PrefixCode, Reader), error.CodecError) {
+  let order = list.drop(cl_code_order(), hskip)
+  use #(cl_pairs, reader) <- result.try(
+    read_cl_code_lengths(reader, order, 32, 0, []),
+  )
+  let cl_code = canonicalise_from_pairs(cl_pairs)
+  use #(symbol_pairs, reader) <- result.try(
+    read_symbol_code_lengths(
+      reader,
+      cl_code,
+      alphabet_size,
+      SymLenState(symbol: 0, space: 32_768, prev: 8, repeat: 0, repeat_len: 0),
+      [],
+    ),
+  )
+  Ok(#(canonicalise_from_pairs(symbol_pairs), reader))
+}
+
+fn read_cl_code_lengths(
+  reader: Reader,
+  remaining_order: List(Int),
+  space: Int,
+  num_codes: Int,
+  accum: List(#(Int, Int)),
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  case remaining_order {
+    [] -> validate_cl_space(num_codes, space, accum, reader)
+    [cl_sym, ..rest] ->
+      read_one_cl(reader, cl_sym, rest, space, num_codes, accum)
+  }
+}
+
+fn read_one_cl(
+  reader: Reader,
+  cl_sym: Int,
+  rest: List(Int),
+  space: Int,
+  num_codes: Int,
+  accum: List(#(Int, Int)),
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  use reader <- result.try(ensure_bits(reader, 4))
+  let ix = peek_bits_value(reader, 4)
+  let #(consume, value) = cl_prefix_lookup(ix)
+  let reader = drop_bits(reader, consume)
+  let new_accum = [#(cl_sym, value), ..accum]
+  case value {
+    0 -> read_cl_code_lengths(reader, rest, space, num_codes, new_accum)
+    _ -> {
+      let new_space = space - int.bitwise_shift_right(32, value)
+      let new_num = num_codes + 1
+      case new_space <= 0 {
+        True -> validate_cl_space(new_num, new_space, new_accum, reader)
+        False ->
+          read_cl_code_lengths(reader, rest, new_space, new_num, new_accum)
+      }
+    }
+  }
+}
+
+fn validate_cl_space(
+  num_codes: Int,
+  space: Int,
+  accum: List(#(Int, Int)),
+  reader: Reader,
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  use <- bool.guard(
+    when: space < 0,
+    return: Error(error.CodecInvalidData(
+      message: "brotli code-length codes oversubscribe Huffman space",
+    )),
+  )
+  case num_codes == 1 || space == 0 {
+    True -> {
+      Ok(#(accum, reader))
+    }
+    False ->
+      Error(error.CodecInvalidData(
+        message: "brotli code-length codes underfill Huffman space",
+      ))
+  }
+}
+
+type SymLenState {
+  SymLenState(symbol: Int, space: Int, prev: Int, repeat: Int, repeat_len: Int)
+}
+
+fn read_symbol_code_lengths(
+  reader: Reader,
+  cl_code: PrefixCode,
+  alphabet_size: Int,
+  state: SymLenState,
+  accum: List(#(Int, Int)),
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  case state.symbol >= alphabet_size || state.space <= 0 {
+    True -> finalize_symbol_lengths(reader, state, accum)
+    False -> step_symbol_length(reader, cl_code, alphabet_size, state, accum)
+  }
+}
+
+fn finalize_symbol_lengths(
+  reader: Reader,
+  state: SymLenState,
+  accum: List(#(Int, Int)),
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  use <- bool.guard(
+    when: state.space != 0,
+    return: Error(error.CodecInvalidData(
+      message: "brotli symbol code lengths do not fully consume Huffman space",
+    )),
+  )
+  Ok(#(accum, reader))
+}
+
+fn step_symbol_length(
+  reader: Reader,
+  cl_code: PrefixCode,
+  alphabet_size: Int,
+  state: SymLenState,
+  accum: List(#(Int, Int)),
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  use #(code_len, reader) <- result.try(decode_prefix_symbol(reader, cl_code))
+  case code_len < 16 {
+    True ->
+      apply_single_code_length(
+        reader,
+        cl_code,
+        alphabet_size,
+        state,
+        accum,
+        code_len,
+      )
+    False ->
+      apply_repeat_code_length(
+        reader,
+        cl_code,
+        alphabet_size,
+        state,
+        accum,
+        code_len,
+      )
+  }
+}
+
+fn apply_single_code_length(
+  reader: Reader,
+  cl_code: PrefixCode,
+  alphabet_size: Int,
+  state: SymLenState,
+  accum: List(#(Int, Int)),
+  code_len: Int,
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  let new_accum = case code_len {
+    0 -> accum
+    _ -> [#(state.symbol, code_len), ..accum]
+  }
+  let new_space = case code_len {
+    0 -> state.space
+    _ -> state.space - int.bitwise_shift_right(32_768, code_len)
+  }
+  let new_prev = case code_len {
+    0 -> state.prev
+    _ -> code_len
+  }
+  let new_state =
+    SymLenState(
+      symbol: state.symbol + 1,
+      space: new_space,
+      prev: new_prev,
+      repeat: 0,
+      repeat_len: 0,
+    )
+  read_symbol_code_lengths(reader, cl_code, alphabet_size, new_state, new_accum)
+}
+
+fn apply_repeat_code_length(
+  reader: Reader,
+  cl_code: PrefixCode,
+  alphabet_size: Int,
+  state: SymLenState,
+  accum: List(#(Int, Int)),
+  code_len: Int,
+) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+  let #(new_len, extra_bits) = case code_len {
+    16 -> #(state.prev, 2)
+    _ -> #(0, 3)
+  }
+  use #(extra, reader) <- result.try(read_bits(reader, extra_bits))
+  let prior_repeat = case state.repeat_len == new_len {
+    True -> state.repeat
+    False -> 0
+  }
+  let scaled = case prior_repeat > 0 {
+    True -> int.bitwise_shift_left(prior_repeat - 2, extra_bits)
+    False -> 0
+  }
+  let new_repeat = scaled + extra + 3
+  let delta = new_repeat - prior_repeat
+  use <- bool.guard(
+    when: state.symbol + delta > alphabet_size,
+    return: Error(error.CodecInvalidData(
+      message: "brotli repeat code overruns alphabet",
+    )),
+  )
+  let #(new_accum, new_space) = case new_len {
+    0 -> #(accum, state.space)
+    _ -> #(
+      prepend_repeated(state.symbol, delta, new_len, accum),
+      state.space - int.bitwise_shift_left(delta, 15 - new_len),
+    )
+  }
+  let new_state =
+    SymLenState(
+      symbol: state.symbol + delta,
+      space: new_space,
+      prev: state.prev,
+      repeat: new_repeat,
+      repeat_len: new_len,
+    )
+  read_symbol_code_lengths(reader, cl_code, alphabet_size, new_state, new_accum)
+}
+
+fn prepend_repeated(
+  start: Int,
+  delta: Int,
+  length: Int,
+  acc: List(#(Int, Int)),
+) -> List(#(Int, Int)) {
+  case delta {
+    0 -> acc
+    _ ->
+      prepend_repeated(start + 1, delta - 1, length, [#(start, length), ..acc])
+  }
+}
+
+fn decode_prefix_symbol(
+  reader: Reader,
+  code: PrefixCode,
+) -> Result(#(Int, Reader), error.CodecError) {
+  decode_prefix_walk(reader, code.entries, 0, 0)
+}
+
+fn decode_prefix_walk(
+  reader: Reader,
+  entries: List(PrefixEntry),
+  accumulated: Int,
+  bit_count: Int,
+) -> Result(#(Int, Reader), error.CodecError) {
+  case find_prefix_entry(entries, bit_count, accumulated) {
+    Ok(symbol) -> Ok(#(symbol, reader))
+    Error(_) -> {
+      use #(bit, reader) <- result.try(read_bits(reader, 1))
+      let new_acc = int.bitwise_shift_left(accumulated, 1) + bit
+      decode_prefix_walk(reader, entries, new_acc, bit_count + 1)
+    }
+  }
+}
+
+fn find_prefix_entry(
+  entries: List(PrefixEntry),
+  length: Int,
+  value: Int,
+) -> Result(Int, Nil) {
+  case entries {
+    [] -> Error(Nil)
+    [entry, ..rest] ->
+      case entry.length == length && entry.code == value {
+        True -> Ok(entry.symbol)
+        False -> find_prefix_entry(rest, length, value)
+      }
   }
 }
 
@@ -596,26 +940,41 @@ fn read_bits(
   case count {
     0 -> Ok(#(0, reader))
     _ -> {
-      let reader = refill(reader, count)
-      case reader.bits >= count {
-        False ->
-          Error(error.CodecInvalidData(message: "truncated brotli bit stream"))
-        True -> {
-          let mask = int.bitwise_shift_left(1, count) - 1
-          let value = int.bitwise_and(reader.buffer, mask)
-          Ok(#(
-            value,
-            Reader(
-              source: reader.source,
-              buffer: int.bitwise_shift_right(reader.buffer, count),
-              bits: reader.bits - count,
-              overflow: reader.overflow,
-            ),
-          ))
-        }
-      }
+      use reader <- result.try(ensure_bits(reader, count))
+      let value = peek_bits_value(reader, count)
+      Ok(#(value, drop_bits(reader, count)))
     }
   }
+}
+
+/// Refill the bit buffer until it holds at least `count` bits; error
+/// out if the source stream is shorter than that.  Used by both
+/// `read_bits` and the peek/drop API the complex-form prefix code
+/// reader needs (to look up a variable-length CL code by 4-bit peek).
+fn ensure_bits(reader: Reader, count: Int) -> Result(Reader, error.CodecError) {
+  let reader = refill(reader, count)
+  case reader.bits >= count {
+    True -> Ok(reader)
+    False ->
+      Error(error.CodecInvalidData(message: "truncated brotli bit stream"))
+  }
+}
+
+/// LSB-first read of `count` bits without consuming them.  Callers
+/// must first call `ensure_bits` to guarantee the buffer is filled.
+fn peek_bits_value(reader: Reader, count: Int) -> Int {
+  let mask = int.bitwise_shift_left(1, count) - 1
+  int.bitwise_and(reader.buffer, mask)
+}
+
+/// Consume `count` bits previously inspected with `peek_bits_value`.
+fn drop_bits(reader: Reader, count: Int) -> Reader {
+  Reader(
+    source: reader.source,
+    buffer: int.bitwise_shift_right(reader.buffer, count),
+    bits: reader.bits - count,
+    overflow: reader.overflow,
+  )
 }
 
 /// Drop the remaining bits in the current byte so the next byte-level
