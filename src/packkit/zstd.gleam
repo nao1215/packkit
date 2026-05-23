@@ -28,9 +28,6 @@ pub fn codec() -> codecs.Codec {
 
 const max_block_size: Int = 0x20_000
 
-/// Maximum frame content size representable in the 8-byte FCS field.
-const fcs_max: Int = 0xFFFFFFFFFFFFFFFF
-
 /// Encode `bytes` as a Zstandard frame.  The encoder always emits raw
 /// blocks (no compression, no checksum) — the output is a valid
 /// Zstandard frame that any conforming decoder can read, but it
@@ -73,13 +70,24 @@ pub fn frame_header_for_size(size: Int) -> Result(BitArray, error.CodecError) {
         0xA0,
         n:size(32)-little,
       >>)
-    n if n <= fcs_max -> {
+    n -> {
       // FCS_flag = 3: full unsigned 64-bit little-endian field.
       // The previous encoder packed `n` into the low 32 bits and a
       // literal `0` into the high 32 bits, silently truncating any
-      // payload at or above 4 GiB to `n mod 2^32` bytes.
+      // payload at or above 4 GiB to `n mod 2^32` bytes.  The 2^64
+      // ceiling is enforced by checking the high half rather than via
+      // a literal upper bound, because 0xFFFFFFFFFFFFFFFF would warn
+      // as outside JavaScript's safe-integer range on that target.
       let lo = int.bitwise_and(n, 0xFFFFFFFF)
-      let hi = int.bitwise_and(int.bitwise_shift_right(n, 32), 0xFFFFFFFF)
+      let high_half = int.bitwise_shift_right(n, 32)
+      use <- bool.guard(
+        when: high_half > 0xFFFFFFFF,
+        return: Error(error.CodecLimitExceeded(
+          limit: "zstd frame_content_size",
+          actual: n,
+        )),
+      )
+      let hi = int.bitwise_and(high_half, 0xFFFFFFFF)
       Ok(<<
         0x28,
         0xB5,
@@ -90,11 +98,6 @@ pub fn frame_header_for_size(size: Int) -> Result(BitArray, error.CodecError) {
         hi:size(32)-little,
       >>)
     }
-    n ->
-      Error(error.CodecLimitExceeded(
-        limit: "zstd frame_content_size",
-        actual: n,
-      ))
   }
 }
 
