@@ -81,8 +81,10 @@ pub fn tar_zstd() -> Recipe {
   archive_with(format: archive.tar(), wrapped_by: codec.zstd())
 }
 
-/// Convenience constructor for `tar.br`.  Decode-only until the brotli
-/// encoder is implemented.
+/// Convenience constructor for `tar.br`.  Round-trips end-to-end via
+/// brotli's uncompressed-metablock encoder; the bytes are valid for
+/// any conforming brotli decoder but do no actual LZ77/Huffman
+/// compression yet.
 pub fn tar_brotli() -> Recipe {
   archive_with(format: archive.tar(), wrapped_by: codec.brotli())
 }

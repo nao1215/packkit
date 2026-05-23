@@ -25,6 +25,15 @@
 ////   into context-map indexing so the right tree is picked for every
 ////   symbol.
 ////
+//// Encode side:
+////
+//// * The encoder emits only uncompressed metablocks (one per chunk of
+////   up to 65 536 bytes), wrapped in the canonical `WBITS=16` prefix.
+////   That produces a valid RFC 7932 stream that any conforming
+////   brotli decoder accepts; it does no actual compression but lets
+////   `packkit.compress(..., with: codec.brotli())` round-trip
+////   end-to-end with `packkit.decompress`.
+////
 //// What still returns a typed `CodecNotImplemented`:
 ////
 //// * The `SHIFT_FIRST` / `SHIFT_ALL` transforms used by the
@@ -49,9 +58,177 @@ pub fn codec() -> codecs.Codec {
   codecs.brotli()
 }
 
-/// Encode `bytes` as a Brotli stream.  Not yet implemented.
-pub fn encode(bytes _bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  Error(error.CodecNotImplemented(feature: "brotli.encode"))
+/// Encode `bytes` as a Brotli stream made up of uncompressed
+/// metablocks (RFC 7932 §9.2 `ISUNCOMPRESSED` form) followed by a
+/// final empty `ISLAST` marker.  The output is a valid Brotli stream
+/// that any conforming decoder accepts; it does no actual LZ77 or
+/// Huffman compression yet, but it does let
+/// `packkit.compress(..., with: codec.brotli())` round-trip with the
+/// matching decoder.
+///
+/// Note: RFC 7932 §9.2 mandates that `ISLAST=1` metablocks are
+/// compressed (there is no `ISUNCOMPRESSED` bit in that branch), so
+/// uncompressed payload bytes are emitted as one or more `ISLAST=0`
+/// metablocks and the stream is terminated with a separate empty
+/// `ISLAST=1, ISLASTEMPTY=1` marker.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+  let writer = new_bit_writer()
+  // WBITS prefix: a single 0 bit encodes WBITS = 16.
+  let writer = bw_write(writer, 0, 1)
+  let total = bit_array.byte_size(bytes)
+  let writer = case total {
+    0 -> emit_empty_last_metablock(writer)
+    _ -> {
+      let writer = encode_chunks(writer, bytes, 0, total)
+      emit_empty_last_metablock(writer)
+    }
+  }
+  Ok(bw_flush(writer))
+}
+
+/// Maximum payload bytes per uncompressed metablock.  RFC 7932 §9.2
+/// permits up to `MNIBBLES=6` (16 MiB), but we stay at the 4-nibble
+/// `MLEN-1` form (65 536-byte ceiling) so every emitted metablock
+/// shares an identical bit layout.
+const uncompressed_chunk_size: Int = 65_536
+
+fn emit_empty_last_metablock(writer: BitWriter) -> BitWriter {
+  // ISLAST=1, ISLASTEMPTY=1.
+  let writer = bw_write(writer, 1, 1)
+  bw_write(writer, 1, 1)
+}
+
+fn encode_chunks(
+  writer: BitWriter,
+  bytes: BitArray,
+  consumed: Int,
+  total: Int,
+) -> BitWriter {
+  let remaining = total - consumed
+  case remaining <= 0 {
+    True -> writer
+    False -> {
+      let chunk_size = case remaining > uncompressed_chunk_size {
+        True -> uncompressed_chunk_size
+        False -> remaining
+      }
+      let writer =
+        emit_uncompressed_metablock(writer, bytes, consumed, chunk_size)
+      encode_chunks(writer, bytes, consumed + chunk_size, total)
+    }
+  }
+}
+
+fn emit_uncompressed_metablock(
+  writer: BitWriter,
+  bytes: BitArray,
+  offset: Int,
+  chunk_size: Int,
+) -> BitWriter {
+  // ISLAST=0.
+  let writer = bw_write(writer, 0, 1)
+  // MNIBBLES: 2-bit field, value `N-4` (so 0 → 4 nibbles = 16-bit
+  // MLEN-1).
+  let writer = bw_write(writer, 0, 2)
+  // MLEN - 1 in 16 bits.
+  let writer = bw_write(writer, chunk_size - 1, 16)
+  // ISUNCOMPRESSED = 1.
+  let writer = bw_write(writer, 1, 1)
+  // Align to byte boundary before raw bytes.
+  let writer = bw_align(writer)
+  let assert Ok(chunk) = bit_array.slice(bytes, offset, chunk_size)
+  bw_append_bytes(writer, chunk)
+}
+
+// -- LSB-first bit writer for brotli encode ----------------------------
+//
+// Mirrors the LSB-first convention `read_bits` uses on the decoder
+// side: bytes are written low-byte first, and within a byte the
+// least-significant bit comes from the first call.
+
+type BitWriter {
+  BitWriter(bytes_rev: List(Int), buffer: Int, bits: Int)
+}
+
+fn new_bit_writer() -> BitWriter {
+  BitWriter(bytes_rev: [], buffer: 0, bits: 0)
+}
+
+fn bw_write(writer: BitWriter, value: Int, count: Int) -> BitWriter {
+  case count {
+    0 -> writer
+    _ -> {
+      let masked = int.bitwise_and(value, bw_mask(count))
+      let new_buffer =
+        int.bitwise_or(
+          writer.buffer,
+          int.bitwise_shift_left(masked, writer.bits),
+        )
+      bw_flush_bytes(BitWriter(
+        bytes_rev: writer.bytes_rev,
+        buffer: new_buffer,
+        bits: writer.bits + count,
+      ))
+    }
+  }
+}
+
+fn bw_mask(count: Int) -> Int {
+  int.bitwise_shift_left(1, count) - 1
+}
+
+fn bw_flush_bytes(writer: BitWriter) -> BitWriter {
+  case writer.bits >= 8 {
+    False -> writer
+    True -> {
+      let byte = int.bitwise_and(writer.buffer, 0xFF)
+      bw_flush_bytes(BitWriter(
+        bytes_rev: [byte, ..writer.bytes_rev],
+        buffer: int.bitwise_shift_right(writer.buffer, 8),
+        bits: writer.bits - 8,
+      ))
+    }
+  }
+}
+
+fn bw_align(writer: BitWriter) -> BitWriter {
+  case writer.bits {
+    0 -> writer
+    _ -> bw_write(writer, 0, 8 - writer.bits)
+  }
+}
+
+fn bw_append_bytes(writer: BitWriter, chunk: BitArray) -> BitWriter {
+  let writer = bw_align(writer)
+  // After align, buffer is empty; just push raw bytes.
+  bw_push_raw(writer, chunk)
+}
+
+fn bw_push_raw(writer: BitWriter, chunk: BitArray) -> BitWriter {
+  case chunk {
+    <<b, rest:bytes>> ->
+      bw_push_raw(BitWriter(..writer, bytes_rev: [b, ..writer.bytes_rev]), rest)
+    _ -> writer
+  }
+}
+
+fn bw_flush(writer: BitWriter) -> BitArray {
+  let writer = case writer.bits {
+    0 -> writer
+    _ -> {
+      // Pad the trailing partial byte with zeros to complete it.
+      let byte = int.bitwise_and(writer.buffer, 0xFF)
+      BitWriter(bytes_rev: [byte, ..writer.bytes_rev], buffer: 0, bits: 0)
+    }
+  }
+  bw_bytes_to_bit_array(list.reverse(writer.bytes_rev), <<>>)
+}
+
+fn bw_bytes_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
+  case values {
+    [] -> acc
+    [head, ..rest] -> bw_bytes_to_bit_array(rest, <<acc:bits, head>>)
+  }
 }
 
 /// Decode a Brotli stream using default limits.

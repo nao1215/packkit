@@ -2,7 +2,6 @@ import gleam/bit_array
 import gleeunit/should
 import packkit/brotli
 import packkit/codec
-import packkit/error
 
 pub fn codec_marker_test() -> Nil {
   brotli.codec()
@@ -10,9 +9,34 @@ pub fn codec_marker_test() -> Nil {
   |> should.equal("brotli")
 }
 
-pub fn encode_reports_not_implemented_test() -> Nil {
-  brotli.encode(bytes: <<>>)
-  |> should.equal(Error(error.CodecNotImplemented(feature: "brotli.encode")))
+pub fn encode_empty_stream_round_trips_test() -> Nil {
+  let assert Ok(stream) = brotli.encode(bytes: <<>>)
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(<<>>))
+}
+
+pub fn encode_small_payload_round_trips_test() -> Nil {
+  let payload = <<"packkit brotli uncompressed metablock":utf8>>
+  let assert Ok(stream) = brotli.encode(bytes: payload)
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(payload))
+}
+
+pub fn encode_multi_chunk_payload_round_trips_test() -> Nil {
+  // Larger than the 65 536-byte uncompressed-metablock cap so the
+  // encoder has to emit more than one chunk back-to-back.
+  let chunk = bit_array.from_string("abcdefghij")
+  let big = repeat_chunk(chunk, 7000, <<>>)
+  let assert Ok(stream) = brotli.encode(bytes: big)
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(big))
+}
+
+fn repeat_chunk(chunk: BitArray, times: Int, acc: BitArray) -> BitArray {
+  case times {
+    0 -> acc
+    _ -> repeat_chunk(chunk, times - 1, bit_array.concat([acc, chunk]))
+  }
 }
 
 pub fn decode_empty_stream_test() -> Nil {

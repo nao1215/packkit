@@ -94,12 +94,31 @@ pub fn facade_gzip_roundtrip_test() -> Nil {
   |> should.equal(payload)
 }
 
-pub fn facade_reports_unimplemented_codecs_test() -> Nil {
-  // Brotli encode is not yet implemented; the facade should dispatch
-  // to brotli.encode so the user sees the codec module's actual error
-  // (not a stale "compress brotli" string from a facade fallthrough).
-  packkit.compress(bytes: <<"x":utf8>>, with: codec.brotli())
-  |> should.equal(Error(error.CodecNotImplemented(feature: "brotli.encode")))
+pub fn facade_brotli_round_trip_test() -> Nil {
+  // Brotli encode now emits uncompressed metablocks, so the facade
+  // can round-trip end-to-end.  Regression for the period when the
+  // encoder returned `CodecNotImplemented`.
+  let payload = <<"facade-level brotli round trip":utf8>>
+  let assert Ok(stream) = packkit.compress(bytes: payload, with: codec.brotli())
+  let assert Ok(restored) =
+    packkit.decompress(bytes: stream, with: codec.brotli())
+  restored
+  |> should.equal(payload)
+}
+
+pub fn facade_pack_unpack_tar_brotli_test() -> Nil {
+  // tar.brotli now round-trips because brotli.encode is wired and the
+  // facade no longer rejects the recipe at encode time.
+  let archive_value =
+    tar.new()
+    |> tar.add_file(path: "alpha.txt", body: <<"alpha":utf8>>)
+    |> tar.add_file(path: "beta.txt", body: <<"beta":utf8>>)
+  let assert Ok(bytes) =
+    packkit.pack(archive_value: archive_value, using: recipe.tar_brotli())
+  let assert Ok(decoded) =
+    packkit.unpack(bytes: bytes, using: recipe.tar_brotli())
+  archive.entry_count(decoded)
+  |> should.equal(2)
 }
 
 pub fn facade_decompresses_brotli_stream_test() -> Nil {
@@ -219,14 +238,25 @@ pub fn facade_pack_unpack_tar_bzip2_test() -> Nil {
 }
 
 pub fn pack_failure_preserves_structured_codec_error_test() -> Nil {
-  // brotli encode is not implemented; the structured cause must surface
-  // instead of a flattened string.
+  // When a codec step inside a recipe fails, the structured cause
+  // must surface instead of a flattened string.  We trigger a failure
+  // by requesting a preset dictionary on a codec that does not
+  // support one (gzip), which the facade rejects with the typed
+  // `CodecOptionUnsupported`.
   let archive_value = tar.new() |> tar.add_file(path: "x", body: <<"y":utf8>>)
-  packkit.pack(archive_value: archive_value, using: recipe.tar_brotli())
+  let gzip_with_dict =
+    codec.gzip()
+    |> codec.with_dictionary(dictionary: codec.dictionary(bytes: <<"d":utf8>>))
+  let dict_recipe =
+    recipe.archive_with(format: archive.tar(), wrapped_by: gzip_with_dict)
+  packkit.pack(archive_value: archive_value, using: dict_recipe)
   |> should.equal(
     Error(error.ArchiveCodecFailed(
       step: "encode",
-      cause: error.CodecNotImplemented(feature: "brotli.encode"),
+      cause: error.CodecOptionUnsupported(
+        option: "dictionary",
+        codec_name: "gzip",
+      ),
     )),
   )
 }
