@@ -65,8 +65,8 @@ pub fn compress(
     "deflate" -> deflate.encode(bytes: bytes)
     "zlib" -> zlib.encode(bytes: bytes)
     "gzip" -> gzip.encode(bytes: bytes, header: gzip.default_header())
-    "lz4-frame" -> lz4.encode(bytes: bytes)
-    "snappy-frame" -> snappy.encode(bytes: bytes)
+    "lz4" -> lz4.encode(bytes: bytes)
+    "snappy" -> snappy.encode(bytes: bytes)
     "bzip2" -> bzip2.encode(bytes: bytes)
     "lzw" -> lzw.encode(bytes: bytes)
     "xz" -> xz.encode(bytes: bytes)
@@ -88,8 +88,8 @@ pub fn decompress(
     "gzip" ->
       gzip.decode(bytes: bytes)
       |> result.map(fn(decoded) { decoded.payload })
-    "lz4-frame" -> lz4.decode(bytes: bytes)
-    "snappy-frame" -> snappy.decode(bytes: bytes)
+    "lz4" -> lz4.decode(bytes: bytes)
+    "snappy" -> snappy.decode(bytes: bytes)
     "bzip2" -> bzip2.decode(bytes: bytes)
     "lzw" -> lzw.decode(bytes: bytes)
     "xz" -> xz.decode(bytes: bytes)
@@ -104,7 +104,7 @@ pub fn read(
   bytes bytes: BitArray,
   format format: ArchiveFormat,
 ) -> Result(Archive, error.ArchiveError) {
-  case archive.format_name(format) {
+  case archive.name(format) {
     "tar" -> tar.decode(bytes: bytes)
     "zip" -> zip_archive.decode(bytes: bytes)
     "cpio-newc" -> cpio.decode(bytes: bytes)
@@ -119,7 +119,7 @@ pub fn write(
   archive_value archive_value: Archive,
   format format: ArchiveFormat,
 ) -> Result(BitArray, error.ArchiveError) {
-  case archive.format_name(format) {
+  case archive.name(format) {
     "tar" -> tar.encode(archive: archive_value)
     "zip" -> zip_archive.encode(archive: archive_value)
     "cpio-newc" -> cpio.encode(archive: archive_value)

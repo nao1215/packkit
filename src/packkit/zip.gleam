@@ -142,7 +142,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.ArchiveLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -153,7 +153,7 @@ pub fn decode_with_limits(
     when: eocd.total_entries > limit.max_members(limits),
     return: Error(error.ArchiveLimitExceeded(
       limit: "max_members",
-      value: eocd.total_entries,
+      actual: eocd.total_entries,
     )),
   )
 
@@ -203,7 +203,7 @@ fn encode_entry(
   method: Method,
 ) -> Result(#(BitArray, BitArray, Int), error.ArchiveError) {
   let kind = entry.kind(value)
-  let raw_path = entry.to_string(entry.path_of(value))
+  let raw_path = entry.to_string(entry.path(value))
 
   use <- bool.guard(
     when: kind == "symlink" || kind == "hardlink",
@@ -411,7 +411,7 @@ fn parse_central_directory(
         when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
         return: Error(error.ArchiveLimitExceeded(
           limit: "max_entry_name_bytes",
-          value: string.byte_size(name),
+          actual: string.byte_size(name),
         )),
       )
 
@@ -544,10 +544,8 @@ fn codec_to_archive_error(
         path: path,
         reason: "deflate decode failed: " <> message,
       )
-    error.CodecLimitExceeded(limit, value) ->
-      error.ArchiveLimitExceeded(limit: limit, value: value)
-    error.CodecUnsupported(name) ->
-      error.ArchiveNotImplemented(feature: "ZIP method " <> name)
+    error.CodecLimitExceeded(limit, actual) ->
+      error.ArchiveLimitExceeded(limit: limit, actual: actual)
     error.CodecDictionaryRequired(_) ->
       error.ArchiveEntryRejected(
         path: path,

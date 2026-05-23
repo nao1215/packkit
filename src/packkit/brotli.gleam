@@ -68,7 +68,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -568,7 +568,7 @@ fn in_window_copy(
     when: projected > limit.max_output_bytes(state.limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_output_bytes",
-      value: projected,
+      actual: projected,
     )),
   )
   Ok(refresh_prev_bytes(
@@ -632,7 +632,7 @@ fn dictionary_copy(
     when: projected > limit.max_output_bytes(state.limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_output_bytes",
-      value: projected,
+      actual: projected,
     )),
   )
   Ok(refresh_prev_bytes(
@@ -691,7 +691,7 @@ fn emit_literals_loop(
         when: projected > limit.max_output_bytes(state.limits),
         return: Error(error.CodecLimitExceeded(
           limit: "max_output_bytes",
-          value: projected,
+          actual: projected,
         )),
       )
       let new_state =
@@ -1854,7 +1854,7 @@ fn decode_uncompressed_metablock(
     True ->
       Error(error.CodecLimitExceeded(
         limit: "max_output_bytes",
-        value: projected,
+        actual: projected,
       ))
     False -> Ok(#(bit_array.concat([output, chunk]), ring, reader))
   }

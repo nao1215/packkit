@@ -35,7 +35,7 @@ pub fn entry_accepts_safe_nested_path_test() -> Nil {
   |> should.equal("file")
 
   file
-  |> entry.path_of
+  |> entry.path
   |> entry.depth
   |> should.equal(3)
 }
@@ -56,10 +56,10 @@ pub fn tar_gzip_recipe_exposes_archive_and_outer_codec_test() -> Nil {
 pub fn filename_detection_recognizes_tar_gzip_test() -> Nil {
   let assert Ok(info) = detect.from_filename("backup-2026-05-22.tar.gz")
 
-  detect.recipe_of(info)
+  detect.recipe(info)
   |> should.equal(Some(recipe.tar_gzip()))
 
-  detect.codec_of(info)
+  detect.codec(info)
   |> should.equal(Some(codec.gzip()))
 }
 
@@ -187,19 +187,19 @@ pub fn recipe_tar_brotli_shortcut_test() -> Nil {
 
 pub fn detect_recognizes_tar_bz2_compound_test() -> Nil {
   let assert Ok(info) = detect.from_filename("backup.tar.bz2")
-  detect.recipe_of(info)
+  detect.recipe(info)
   |> should.equal(Some(recipe.tar_bzip2()))
 }
 
 pub fn detect_recognizes_tar_xz_compound_test() -> Nil {
   let assert Ok(info) = detect.from_filename("backup.tar.xz")
-  detect.recipe_of(info)
+  detect.recipe(info)
   |> should.equal(Some(recipe.tar_xz()))
 }
 
 pub fn detect_recognizes_tar_zst_compound_test() -> Nil {
   let assert Ok(info) = detect.from_filename("backup.tar.zst")
-  detect.recipe_of(info)
+  detect.recipe(info)
   |> should.equal(Some(recipe.tar_zstd()))
 }
 

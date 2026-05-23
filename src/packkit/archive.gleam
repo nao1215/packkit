@@ -86,6 +86,6 @@ pub fn entry_count(archive: Archive) -> Int {
 }
 
 /// Stable string name for an archive format.
-pub fn format_name(format: ArchiveFormat) -> String {
+pub fn name(format: ArchiveFormat) -> String {
   format.name
 }

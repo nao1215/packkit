@@ -73,9 +73,9 @@ fn filename_rules() -> List(#(List(String), fn() -> Detected)) {
     #([".deflate", ".dfl"], fn() {
       detected_codec(codec.deflate(), extension: "deflate")
     }),
-    #([".lz4"], fn() { detected_codec(codec.lz4_frame(), extension: "lz4") }),
+    #([".lz4"], fn() { detected_codec(codec.lz4(), extension: "lz4") }),
     #([".sz", ".snappy"], fn() {
-      detected_codec(codec.snappy_frame(), extension: "snappy")
+      detected_codec(codec.snappy(), extension: "snappy")
     }),
     #([".bz2"], fn() { detected_codec(codec.bzip2(), extension: "bz2") }),
     #([".xz"], fn() { detected_codec(codec.xz(), extension: "xz") }),
@@ -117,7 +117,7 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
     <<0x28, 0xB5, 0x2F, 0xFD, _:bytes>> ->
       Ok(detected_codec(codec.zstd(), extension: "zst"))
     <<0x04, 0x22, 0x4D, 0x18, _:bytes>> ->
-      Ok(detected_codec(codec.lz4_frame(), extension: "lz4"))
+      Ok(detected_codec(codec.lz4(), extension: "lz4"))
     <<0x42, 0x5A, 0x68, _:bytes>> ->
       Ok(detected_codec(codec.bzip2(), extension: "bz2"))
     <<0x1F, 0x9D, _:bytes>> -> Ok(detected_codec(codec.lzw(), extension: "Z"))
@@ -141,22 +141,22 @@ fn has_ustar_magic(bytes: BitArray) -> Bool {
 }
 
 /// Read the detected codec if one was found.
-pub fn codec_of(detected: Detected) -> Option(codec.Codec) {
+pub fn codec(detected: Detected) -> Option(codec.Codec) {
   detected.codec
 }
 
 /// Read the detected archive family if one was found.
-pub fn archive_of(detected: Detected) -> Option(archive.ArchiveFormat) {
+pub fn archive(detected: Detected) -> Option(archive.ArchiveFormat) {
   detected.archive
 }
 
 /// Read the detected recipe if one was found.
-pub fn recipe_of(detected: Detected) -> Option(recipe.Recipe) {
+pub fn recipe(detected: Detected) -> Option(recipe.Recipe) {
   detected.recipe
 }
 
 /// Read the matched extension label, if any.
-pub fn extension_of(detected: Detected) -> Option(String) {
+pub fn extension(detected: Detected) -> Option(String) {
   detected.extension
 }
 

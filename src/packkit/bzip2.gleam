@@ -97,7 +97,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -183,7 +183,7 @@ fn append_with_limit(
     True ->
       Error(error.CodecLimitExceeded(
         limit: "max_output_bytes",
-        value: projected,
+        actual: projected,
       ))
     False -> Ok(bit_array.concat([output, chunk]))
   }
@@ -764,7 +764,7 @@ fn flush_run(
         when: out_len + pending > limit.max_output_bytes(limits),
         return: Error(error.CodecLimitExceeded(
           limit: "max_output_bytes",
-          value: out_len + pending,
+          actual: out_len + pending,
         )),
       )
       let out_rev = repeat_prepend(front, pending, out_rev)
@@ -783,7 +783,7 @@ fn emit_byte(
     when: out_len + 1 > limit.max_output_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_output_bytes",
-      value: out_len + 1,
+      actual: out_len + 1,
     )),
   )
   Ok(#([byte, ..out_rev], out_len + 1))

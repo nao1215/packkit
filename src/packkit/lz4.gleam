@@ -37,7 +37,7 @@ const default_block_max: Int = 4_194_304
 
 /// LZ4 frame codec smart constructor.
 pub fn codec() -> codecs.Codec {
-  codecs.lz4_frame()
+  codecs.lz4()
 }
 
 /// Encode `bytes` as an LZ4 frame using uncompressed blocks.
@@ -62,7 +62,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -385,7 +385,7 @@ fn append_with_limit(
     True ->
       Error(error.CodecLimitExceeded(
         limit: "max_output_bytes",
-        value: projected,
+        actual: projected,
       ))
     False -> Ok(bit_array.concat([output, chunk]))
   }

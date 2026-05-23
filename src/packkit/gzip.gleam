@@ -196,7 +196,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 

@@ -16,7 +16,7 @@ pub fn roundtrip_single_file_test() -> Nil {
   let assert Ok(decoded) = zip.decode(bytes: bytes)
 
   let assert [restored] = archive.entries(decoded)
-  entry.to_string(entry.path_of(restored))
+  entry.to_string(entry.path(restored))
   |> should.equal("hello.txt")
   entry.body(restored)
   |> should.equal(<<"hello":utf8>>)
@@ -75,7 +75,7 @@ pub fn decodes_python_deflate_zip_test() -> Nil {
   let assert Ok(archive_value) = zip.decode(bytes: bytes)
   let entries = archive.entries(archive_value)
 
-  list.map(entries, fn(e) { entry.to_string(entry.path_of(e)) })
+  list.map(entries, fn(e) { entry.to_string(entry.path(e)) })
   |> should.equal(["hello.txt", "numbers.txt"])
 
   let assert [hello, numbers] = entries

@@ -16,7 +16,7 @@ pub fn roundtrip_file_test() -> Nil {
   let assert Ok(decoded) = cpio.decode(bytes: bytes)
 
   list.map(archive.entries(decoded), fn(e) {
-    #(entry.kind(e), entry.to_string(entry.path_of(e)), entry.body(e))
+    #(entry.kind(e), entry.to_string(entry.path(e)), entry.body(e))
   })
   |> should.equal([
     #("file", "hello.txt", <<"hello":utf8>>),

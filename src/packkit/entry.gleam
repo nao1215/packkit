@@ -69,12 +69,13 @@ pub fn path_checked(value: String) -> Result(EntryPath, EntryError) {
   Ok(EntryPath(raw: value, segments: segments))
 }
 
-/// Panicking counterpart of `path_checked`.
-pub fn path(value: String) -> EntryPath {
+/// Panicking counterpart of `path_checked`.  The getter on `Entry`
+/// claims the short name; this constructor takes the explicit suffix.
+pub fn path_unchecked(value: String) -> EntryPath {
   case path_checked(value) {
     Ok(path) -> path
     Error(_) ->
-      panic as "packkit/entry.path: entry path must be a safe relative path"
+      panic as "packkit/entry.path_unchecked: entry path must be a safe relative path"
   }
 }
 
@@ -201,7 +202,7 @@ pub fn kind(entry: Entry) -> String {
 }
 
 /// Read the validated entry path.
-pub fn path_of(entry: Entry) -> EntryPath {
+pub fn path(entry: Entry) -> EntryPath {
   entry.path
 }
 

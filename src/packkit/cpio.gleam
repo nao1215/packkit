@@ -71,7 +71,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.ArchiveLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
   decode_loop(bytes, [], 0, limits)
@@ -133,7 +133,7 @@ fn check_member_limit(
 ) -> Result(Nil, error.ArchiveError) {
   case count > limit.max_members(limits) {
     True ->
-      Error(error.ArchiveLimitExceeded(limit: "max_members", value: count))
+      Error(error.ArchiveLimitExceeded(limit: "max_members", actual: count))
     False -> Ok(Nil)
   }
 }
@@ -184,7 +184,7 @@ fn header_to_entry(
     when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
     return: Error(error.ArchiveLimitExceeded(
       limit: "max_entry_name_bytes",
-      value: string.byte_size(name),
+      actual: string.byte_size(name),
     )),
   )
 
@@ -244,12 +244,12 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   use <- bool.guard(
     when: kind == "hardlink",
     return: Error(error.ArchiveEntryRejected(
-      path: entry.to_string(entry.path_of(value)),
+      path: entry.to_string(entry.path(value)),
       reason: "cpio newc cannot represent hard links",
     )),
   )
 
-  let path = entry.to_string(entry.path_of(value))
+  let path = entry.to_string(entry.path(value))
   let name_bytes = bit_array.from_string(path)
   let name_size = bit_array.byte_size(name_bytes) + 1
   let metadata = entry.metadata(value)

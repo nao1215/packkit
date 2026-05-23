@@ -30,7 +30,7 @@ fn single_file_roundtrip(
   let assert Ok(decoded) = decode(bytes)
   let assert [restored] = archive.entries(decoded)
   restored |> entry.kind |> should.equal("file")
-  restored |> entry.path_of |> entry.to_string |> should.equal(name)
+  restored |> entry.path |> entry.to_string |> should.equal(name)
   restored |> entry.body |> should.equal(body)
 }
 
@@ -95,7 +95,7 @@ pub fn tar_roundtrip_many_entries_test() -> Nil {
   archive.entry_count(decoded) |> should.equal(list.length(names))
   let decoded_names =
     archive.entries(decoded)
-    |> list.map(fn(e) { e |> entry.path_of |> entry.to_string })
+    |> list.map(fn(e) { e |> entry.path |> entry.to_string })
   decoded_names |> should.equal(names)
 }
 
@@ -187,7 +187,7 @@ pub fn entry_path_with_spaces_allowed_test() -> Nil {
 
 pub fn entry_file_checked_preserves_path_test() -> Nil {
   let assert Ok(e) = entry.file_checked(path: "a/b/c.txt", body: <<>>)
-  e |> entry.path_of |> entry.to_string |> should.equal("a/b/c.txt")
+  e |> entry.path |> entry.to_string |> should.equal("a/b/c.txt")
   e |> entry.body |> should.equal(<<>>)
 }
 

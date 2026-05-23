@@ -82,7 +82,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -443,7 +443,7 @@ fn check_output_limit(
 ) -> Result(Nil, error.CodecError) {
   case size > limit.max_output_bytes(limits) {
     True ->
-      Error(error.CodecLimitExceeded(limit: "max_output_bytes", value: size))
+      Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: size))
     False -> Ok(Nil)
   }
 }

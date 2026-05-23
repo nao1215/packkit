@@ -41,9 +41,7 @@ pub fn with_archive(
 ) -> Result(Recipe, error.RecipeError) {
   case recipe.format {
     Some(existing) ->
-      Error(
-        error.RecipeArchiveAlreadySet(current: archive.format_name(existing)),
-      )
+      Error(error.RecipeArchiveAlreadySet(current: archive.name(existing)))
     None -> Ok(Recipe(..recipe, format: Some(format)))
   }
 }
@@ -60,12 +58,12 @@ pub fn tar_zlib() -> Recipe {
 
 /// Convenience constructor for `tar.lz4`.
 pub fn tar_lz4() -> Recipe {
-  archive_with(format: archive.tar(), wrapped_by: codec.lz4_frame())
+  archive_with(format: archive.tar(), wrapped_by: codec.lz4())
 }
 
 /// Convenience constructor for `tar.snappy`.
 pub fn tar_snappy() -> Recipe {
-  archive_with(format: archive.tar(), wrapped_by: codec.snappy_frame())
+  archive_with(format: archive.tar(), wrapped_by: codec.snappy())
 }
 
 /// Convenience constructor for `tar.bz2`.
@@ -112,7 +110,7 @@ pub fn outermost_codec(recipe: Recipe) -> Option(codec.Codec) {
 /// Human-readable canonical description for debugging and tests.
 pub fn description(recipe: Recipe) -> String {
   let prefix = case recipe.format {
-    Some(format) -> [archive.format_name(format)]
+    Some(format) -> [archive.name(format)]
     None -> []
   }
 

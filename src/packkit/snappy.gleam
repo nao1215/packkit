@@ -34,7 +34,7 @@ const max_uncompressed_chunk: Int = 65_536
 
 /// Snappy framed codec smart constructor.
 pub fn codec() -> codecs.Codec {
-  codecs.snappy_frame()
+  codecs.snappy()
 }
 
 /// Encode `bytes` as a framed Snappy stream that stores every chunk
@@ -58,7 +58,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -89,7 +89,7 @@ pub fn raw_decode_with_limits(
     when: uncompressed_length > limit.max_output_bytes(limits),
     return: Error(error.CodecLimitExceeded(
       limit: "max_output_bytes",
-      value: uncompressed_length,
+      actual: uncompressed_length,
     )),
   )
 
@@ -487,7 +487,7 @@ fn append_with_limit(
     True ->
       Error(error.CodecLimitExceeded(
         limit: "max_output_bytes",
-        value: projected,
+        actual: projected,
       ))
     False -> Ok(bit_array.concat([output, chunk]))
   }

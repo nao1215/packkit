@@ -15,7 +15,7 @@ pub fn roundtrip_file_test() -> Nil {
   let assert Ok(decoded) = ar.decode(bytes: bytes)
 
   list.map(archive.entries(decoded), fn(e) {
-    #(entry.to_string(entry.path_of(e)), entry.body(e))
+    #(entry.to_string(entry.path(e)), entry.body(e))
   })
   |> should.equal([#("a.o", <<1, 2, 3>>), #("b.o", <<4, 5, 6, 7>>)])
 }
@@ -29,7 +29,7 @@ pub fn roundtrip_long_name_test() -> Nil {
   let assert Ok(decoded) = ar.decode(bytes: bytes)
   let assert [restored] = archive.entries(decoded)
 
-  entry.to_string(entry.path_of(restored))
+  entry.to_string(entry.path(restored))
   |> should.equal(path)
   entry.body(restored)
   |> should.equal(body)

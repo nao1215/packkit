@@ -3,9 +3,8 @@
 
 /// Errors returned by byte-to-byte codec APIs.
 pub type CodecError {
-  CodecUnsupported(name: String)
   CodecInvalidData(message: String)
-  CodecLimitExceeded(limit: String, value: Int)
+  CodecLimitExceeded(limit: String, actual: Int)
   CodecDictionaryRequired(name: String)
   CodecNotImplemented(feature: String)
 }
@@ -15,7 +14,7 @@ pub type ArchiveError {
   ArchiveUnsupported(name: String)
   ArchiveInvalid(message: String)
   ArchiveEntryRejected(path: String, reason: String)
-  ArchiveLimitExceeded(limit: String, value: Int)
+  ArchiveLimitExceeded(limit: String, actual: Int)
   ArchiveNotImplemented(feature: String)
   /// Surfaces a structured codec failure that occurred during a
   /// recipe-driven pack/unpack step.  Preserves the underlying

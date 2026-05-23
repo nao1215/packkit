@@ -7,7 +7,7 @@ import packkit/seven_z
 
 pub fn format_marker_test() -> Nil {
   seven_z.format()
-  |> archive.format_name
+  |> archive.name
   |> should.equal("7z")
 }
 
@@ -40,7 +40,7 @@ pub fn decode_single_uncompressed_file_test() -> Nil {
   |> should.equal(1)
   case entries {
     [single] -> {
-      entry.path_of(single)
+      entry.path(single)
       |> entry.to_string
       |> should.equal("hello.txt")
       entry.body(single)
@@ -90,7 +90,7 @@ pub fn decode_lzma_compressed_file_test() -> Nil {
   >>
   case entries {
     [single] -> {
-      entry.path_of(single)
+      entry.path(single)
       |> entry.to_string
       |> should.equal("big.txt")
       entry.body(single)

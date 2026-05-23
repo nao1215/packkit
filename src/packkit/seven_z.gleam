@@ -1112,10 +1112,8 @@ fn codec_to_archive(err: error.CodecError) -> error.ArchiveError {
     error.CodecNotImplemented(feature) ->
       error.ArchiveNotImplemented(feature: feature)
     error.CodecInvalidData(message) -> error.ArchiveInvalid(message: message)
-    error.CodecLimitExceeded(limit, value) ->
-      error.ArchiveLimitExceeded(limit: limit, value: value)
-    error.CodecUnsupported(name) ->
-      error.ArchiveNotImplemented(feature: "codec " <> name)
+    error.CodecLimitExceeded(limit, actual) ->
+      error.ArchiveLimitExceeded(limit: limit, actual: actual)
     error.CodecDictionaryRequired(name) ->
       error.ArchiveInvalid(
         message: "codec " <> name <> " requires a preset dictionary",

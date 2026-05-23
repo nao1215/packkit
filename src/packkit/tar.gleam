@@ -129,7 +129,7 @@ pub fn decode_with_limits(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
     return: Error(error.ArchiveLimitExceeded(
       limit: "max_input_bytes",
-      value: bit_array.byte_size(bytes),
+      actual: bit_array.byte_size(bytes),
     )),
   )
 
@@ -305,7 +305,7 @@ fn check_member_limit(
 ) -> Result(Nil, error.ArchiveError) {
   case count > limit.max_members(limits) {
     True ->
-      Error(error.ArchiveLimitExceeded(limit: "max_members", value: count))
+      Error(error.ArchiveLimitExceeded(limit: "max_members", actual: count))
     False -> Ok(Nil)
   }
 }
@@ -362,7 +362,7 @@ fn header_to_entry(
     when: string.byte_size(header.name) > limit.max_entry_name_bytes(limits),
     return: Error(error.ArchiveLimitExceeded(
       limit: "max_entry_name_bytes",
-      value: string.byte_size(header.name),
+      actual: string.byte_size(header.name),
     )),
   )
 
@@ -387,7 +387,7 @@ fn header_to_entry(
         True ->
           Error(error.ArchiveLimitExceeded(
             limit: "max_entry_depth",
-            value: entry.depth(parsed_path),
+            actual: entry.depth(parsed_path),
           ))
         False -> Ok(Nil)
       }
@@ -495,7 +495,7 @@ fn encode_entry(
 
 fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   let kind = entry.kind(value)
-  let path = entry.to_string(entry.path_of(value))
+  let path = entry.to_string(entry.path(value))
   let metadata = entry.metadata(value)
 
   use #(name_field, prefix_field) <- result.try(split_name_field(path, kind))

@@ -36,13 +36,13 @@ pub fn deflate() -> Codec {
 }
 
 /// LZ4 frame format.
-pub fn lz4_frame() -> Codec {
-  Codec(name: "lz4-frame", level: None, dictionary: None)
+pub fn lz4() -> Codec {
+  Codec(name: "lz4", level: None, dictionary: None)
 }
 
 /// Snappy framed format.
-pub fn snappy_frame() -> Codec {
-  Codec(name: "snappy-frame", level: None, dictionary: None)
+pub fn snappy() -> Codec {
+  Codec(name: "snappy", level: None, dictionary: None)
 }
 
 /// BZip2 stream.

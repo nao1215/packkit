@@ -27,7 +27,7 @@ pub fn roundtrip_single_file_test() -> Nil {
   |> should.equal("file")
 
   readme
-  |> entry.path_of
+  |> entry.path
   |> entry.to_string
   |> should.equal("README.md")
 
@@ -88,7 +88,7 @@ pub fn input_size_limit_is_enforced_test() -> Nil {
     limit.with_max_input_bytes_checked(limit.default(), bytes: 100)
 
   case tar.decode_with_limits(bytes: bytes, limits: limits) {
-    Error(error.ArchiveLimitExceeded(limit: name, value: _)) ->
+    Error(error.ArchiveLimitExceeded(limit: name, actual: _)) ->
       should.equal(name, "max_input_bytes")
     _ -> should.fail()
   }
@@ -106,7 +106,7 @@ pub fn member_count_limit_is_enforced_test() -> Nil {
     limit.with_max_members_checked(limit.default(), count: 2)
 
   case tar.decode_with_limits(bytes: bytes, limits: limits) {
-    Error(error.ArchiveLimitExceeded(limit: "max_members", value: _)) -> Nil
+    Error(error.ArchiveLimitExceeded(limit: "max_members", actual: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -245,7 +245,7 @@ pub fn ustar_decodes_100_char_name_test() -> Nil {
   let assert Ok(decoded) = tar.decode(bytes: stream)
   let assert [file_entry] = archive.entries(decoded)
   file_entry
-  |> entry.path_of
+  |> entry.path
   |> entry.to_string
   |> should.equal(name)
   entry.body(file_entry)
@@ -294,7 +294,7 @@ pub fn decodes_gnu_long_name_test() -> Nil {
   let assert Ok(decoded) = tar.decode(bytes: stream)
   let assert [file_entry] = archive.entries(decoded)
   file_entry
-  |> entry.path_of
+  |> entry.path
   |> entry.to_string
   |> should.equal(long_name)
   entry.body(file_entry)
