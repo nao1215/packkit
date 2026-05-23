@@ -29,8 +29,22 @@
   along with the predefined LL/ML/Offset distributions and the LL /
   ML base+extra-bits lookup tables.
 - Added a Brotli decoder covering the empty stream and any
-  `ISUNCOMPRESSED` metablock (RFC 7932 §9.2).  Compressed
-  metablocks + the 122 KiB static dictionary are still pending.
+  `ISUNCOMPRESSED` metablock (RFC 7932 §9.2).
+- Extended the Brotli decoder to parse compressed metablocks
+  through the entire header pipeline: NBLTYPES, NPOSTFIX/NDIRECT,
+  literal context modes, NTREES, and all three prefix-code
+  descriptors in both simple form (§3.4) and complex form (§3.5,
+  the 18-symbol code-length code with 16/17 run-length symbols).
+  The command loop and the 122 KiB static dictionary are still
+  pending; the decoder reports each missing stage with a
+  fine-grained `CodecNotImplemented(feature: …)` error.
+- Fixed the WBITS prefix decoder (RFC 7932 §9.1) for the
+  `1 000 nnn` branch — previously returned `17 + extra` instead
+  of `8 + extra` for `nnn ∈ {2..7}` and now rejects the
+  large-window indicator with a typed error.
+- Added GNU long-name (`L`) and long-link (`K`) decoding to the
+  USTAR tar reader, plus permissive skipping of PAX extended-
+  attribute headers (`x`, `g`).
 - Wired the `packkit.compress` / `decompress` / `read` / `write` /
   `pack` / `unpack` facade and turned byte-signature detection into a
   real magic-number scan.
