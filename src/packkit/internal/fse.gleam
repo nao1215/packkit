@@ -117,9 +117,13 @@ fn assign_positions(
     + int.bitwise_shift_right(table_size, 3)
     + 3
   let high_threshold = table_size - 1
-  let #(positions, _next_high) =
+  let #(positions, next_high) =
     place_less_probable(normalized, 0, high_threshold, dict.new())
-  place_normal(normalized, 0, 0, positions, mask, step, high_threshold)
+  // After consuming `(-1)` symbols, the normal-placement cursor must
+  // skip the cells we have already reserved at the high end.  Using
+  // `next_high` (= high_threshold - num_less_probable) as the new
+  // threshold prevents the normal cursor from landing on them.
+  place_normal(normalized, 0, 0, positions, mask, step, next_high)
 }
 
 fn place_less_probable(
