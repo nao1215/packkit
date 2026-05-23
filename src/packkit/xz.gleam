@@ -1,15 +1,10 @@
-//// xz codec — framing decoder for `.xz` streams.
+//// xz codec — decoder for `.xz` streams.
 ////
 //// The decoder validates the xz magic, parses stream and block
-//// headers, walks the LZMA2 chunk sequence, validates the index and
-//// stream footer, and emits the concatenated block payloads.
-//// LZMA2 uncompressed chunks (control bytes `0x01` and `0x02`) are
-//// supported in full.  LZMA-compressed chunks (control bytes
-//// `0x80..0xFF`) intentionally return `CodecNotImplemented` so the
-//// caller can detect that the LZMA range-coder layer has not landed
-//// yet — the surrounding xz envelope is still consumed correctly so
-//// later work can drop the LZMA decoder in without changing this
-//// module's public surface.
+//// headers, walks the LZMA2 chunk sequence (uncompressed and
+//// LZMA-compressed chunks), validates the index plus stream footer,
+//// and emits the concatenated block payloads.  The LZMA range coder
+//// itself lives in `packkit/internal/lzma`.
 
 import gleam/bit_array
 import gleam/bool
@@ -19,6 +14,7 @@ import gleam/result
 import packkit/checksum
 import packkit/codec as codecs
 import packkit/error
+import packkit/internal/lzma
 import packkit/limit
 
 const stream_footer_size: Int = 12
@@ -354,15 +350,20 @@ fn parse_filters(
 
 fn decode_lzma2(
   payload: BitArray,
-  _properties: Int,
+  default_props: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
-  decode_lzma2_loop(payload, <<>>, limits)
+  let initial = case lzma.properties_of_byte(default_props) {
+    Ok(p) -> p
+    Error(_) -> lzma.Properties(lc: 3, lp: 0, pb: 2)
+  }
+  decode_lzma2_loop(payload, <<>>, initial, limits)
 }
 
 fn decode_lzma2_loop(
   payload: BitArray,
   output: BitArray,
+  props: lzma.Properties,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   case payload {
@@ -381,7 +382,7 @@ fn decode_lzma2_loop(
           use new_output <- result.try(append_with_limit(output, data, limits))
           let assert Ok(next) =
             bit_array.slice(rest, size, bit_array.byte_size(rest) - size)
-          decode_lzma2_loop(next, new_output, limits)
+          decode_lzma2_loop(next, new_output, props, limits)
         }
         _ ->
           Error(error.CodecInvalidData(
@@ -390,14 +391,84 @@ fn decode_lzma2_loop(
       }
     }
     <<control, _:bytes>> if control >= 0x80 ->
-      Error(error.CodecNotImplemented(
-        feature: "xz LZMA range-coder layer (LZMA2 compressed chunks)",
-      ))
+      decode_lzma2_lzma_chunk(payload, control, output, props, limits)
     <<other, _:bytes>> ->
       Error(error.CodecInvalidData(
         message: "invalid lzma2 control byte " <> int.to_string(other),
       ))
     _ -> Error(error.CodecInvalidData(message: "truncated lzma2 stream"))
+  }
+}
+
+fn decode_lzma2_lzma_chunk(
+  payload: BitArray,
+  control: Int,
+  output: BitArray,
+  props: lzma.Properties,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
+  let has_new_props = control >= 0xC0
+  case payload {
+    <<_control, usize_high, usize_low, csize_high, csize_low, rest:bytes>> -> {
+      let usize =
+        int.bitwise_or(
+          int.bitwise_shift_left(int.bitwise_and(control, 0x1F), 16),
+          int.bitwise_or(int.bitwise_shift_left(usize_high, 8), usize_low),
+        )
+        + 1
+      let csize =
+        int.bitwise_or(int.bitwise_shift_left(csize_high, 8), csize_low) + 1
+      use #(new_props, lzma_input, after_chunk) <- result.try(
+        case has_new_props {
+          True ->
+            case rest {
+              <<props_byte, rest_after_props:bytes>> -> {
+                use parsed_props <- result.try(lzma.properties_of_byte(
+                  props_byte,
+                ))
+                use lzma_data <- result.try(slice_required(
+                  rest_after_props,
+                  0,
+                  csize,
+                  "lzma2 LZMA data",
+                ))
+                let assert Ok(after) =
+                  bit_array.slice(
+                    rest_after_props,
+                    csize,
+                    bit_array.byte_size(rest_after_props) - csize,
+                  )
+                Ok(#(parsed_props, lzma_data, after))
+              }
+              _ ->
+                Error(error.CodecInvalidData(
+                  message: "truncated lzma2 properties byte",
+                ))
+            }
+          False -> {
+            use lzma_data <- result.try(slice_required(
+              rest,
+              0,
+              csize,
+              "lzma2 LZMA data",
+            ))
+            let assert Ok(after) =
+              bit_array.slice(rest, csize, bit_array.byte_size(rest) - csize)
+            Ok(#(props, lzma_data, after))
+          }
+        },
+      )
+      use decoder <- result.try(lzma.new(
+        lzma_input,
+        new_props,
+        limit.max_output_bytes(limits),
+      ))
+      use #(decoded, _state) <- result.try(lzma.decode_into(decoder, usize))
+      use new_output <- result.try(append_with_limit(output, decoded, limits))
+      decode_lzma2_loop(after_chunk, new_output, new_props, limits)
+    }
+    _ ->
+      Error(error.CodecInvalidData(message: "truncated lzma2 LZMA chunk header"))
   }
 }
 
