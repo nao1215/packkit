@@ -515,6 +515,59 @@ fn list_map_codec_names(codecs: List(codec.Codec)) -> List(String) {
   }
 }
 
+pub fn archive_add_file_works_for_every_format_test() -> Nil {
+  // The shared `archive.add_file` helper must work for every format
+  // (tar/cpio/ar/zip/seven_z), not only the one tar exposes a
+  // convenience helper for.  Regression for the pre-release API gap
+  // where each archive module had to duplicate `add_*` helpers (or
+  // users had to drop down to `entry.file |> archive.add`).
+  let tar_archive =
+    archive.new(format: archive.tar())
+    |> archive.add_file(path: "a.txt", body: <<"a":utf8>>)
+  archive.entry_count(tar_archive)
+  |> should.equal(1)
+
+  let cpio_archive =
+    archive.new(format: archive.cpio_newc())
+    |> archive.add_file(path: "a.txt", body: <<"a":utf8>>)
+  archive.entry_count(cpio_archive)
+  |> should.equal(1)
+
+  let zip_archive =
+    archive.new(format: archive.zip())
+    |> archive.add_file(path: "a.txt", body: <<"a":utf8>>)
+  archive.entry_count(zip_archive)
+  |> should.equal(1)
+
+  let ar_archive =
+    archive.new(format: archive.ar())
+    |> archive.add_file(path: "a.txt", body: <<"a":utf8>>)
+  archive.entry_count(ar_archive)
+  |> should.equal(1)
+}
+
+pub fn archive_add_directory_and_symlink_helpers_test() -> Nil {
+  let arch =
+    archive.new(format: archive.tar())
+    |> archive.add_directory(path: "doc")
+    |> archive.add_symlink(path: "link.txt", target: "actual.txt")
+    |> archive.add_hardlink(path: "hard.txt", target: "actual.txt")
+  archive.entry_count(arch)
+  |> should.equal(3)
+}
+
+pub fn archive_add_file_checked_rejects_absolute_path_test() -> Nil {
+  // The checked variant must surface entry-validation errors instead
+  // of panicking — drop-in replacement for `entry.file_checked |>
+  // archive.add` callers.
+  archive.add_file_checked(
+    archive: archive.new(format: archive.tar()),
+    path: "/etc/passwd",
+    body: <<"data":utf8>>,
+  )
+  |> should.equal(Error(entry.AbsolutePath("/etc/passwd")))
+}
+
 pub fn facade_bzip2_default_codec_uses_canonical_level_test() -> Nil {
   // codec.bzip2() now carries level 9 — bzip2's canonical default —
   // so that `packkit.compress(bytes, with: codec.bzip2())` produces

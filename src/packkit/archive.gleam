@@ -80,6 +80,96 @@ pub fn add(archive: Archive, entry entry: entry.Entry) -> Archive {
   Archive(..archive, reversed_entries: [entry, ..archive.reversed_entries])
 }
 
+/// Add a regular file after checked path validation.  Format-agnostic
+/// counterpart to `tar.add_file_checked`; works for any archive
+/// produced by `new(format:)`.  Format-side restrictions (e.g. `ar`
+/// only carries flat files, `7z`'s encoder is not yet implemented)
+/// surface at encode time as `ArchiveError`.
+pub fn add_file_checked(
+  archive archive_value: Archive,
+  path path: String,
+  body body: BitArray,
+) -> Result(Archive, entry.EntryError) {
+  case entry.file_checked(path: path, body: body) {
+    Ok(value) -> Ok(add(archive_value, entry: value))
+    Error(err) -> Error(err)
+  }
+}
+
+/// Panicking counterpart of `add_file_checked`.
+pub fn add_file(
+  archive archive_value: Archive,
+  path path: String,
+  body body: BitArray,
+) -> Archive {
+  add(archive_value, entry: entry.file(path: path, body: body))
+}
+
+/// Add a directory after checked path validation.
+pub fn add_directory_checked(
+  archive archive_value: Archive,
+  path path: String,
+) -> Result(Archive, entry.EntryError) {
+  case entry.directory_checked(path) {
+    Ok(value) -> Ok(add(archive_value, entry: value))
+    Error(err) -> Error(err)
+  }
+}
+
+/// Panicking counterpart of `add_directory_checked`.
+pub fn add_directory(
+  archive archive_value: Archive,
+  path path: String,
+) -> Archive {
+  add(archive_value, entry: entry.directory(path))
+}
+
+/// Add a symbolic link after checked path validation.  Formats whose
+/// on-disk layout has no symlink slot (e.g. ZIP without the unix
+/// extra field, ar) will reject the archive at encode time; the
+/// logical archive value can still carry the entry.
+pub fn add_symlink_checked(
+  archive archive_value: Archive,
+  path path: String,
+  target target: String,
+) -> Result(Archive, entry.EntryError) {
+  case entry.symlink_checked(path: path, target: target) {
+    Ok(value) -> Ok(add(archive_value, entry: value))
+    Error(err) -> Error(err)
+  }
+}
+
+/// Panicking counterpart of `add_symlink_checked`.
+pub fn add_symlink(
+  archive archive_value: Archive,
+  path path: String,
+  target target: String,
+) -> Archive {
+  add(archive_value, entry: entry.symlink(path: path, target: target))
+}
+
+/// Add a hard link after checked path validation.  Formats without
+/// hard-link support reject the archive at encode time.
+pub fn add_hardlink_checked(
+  archive archive_value: Archive,
+  path path: String,
+  target target: String,
+) -> Result(Archive, entry.EntryError) {
+  case entry.hardlink_checked(path: path, target: target) {
+    Ok(value) -> Ok(add(archive_value, entry: value))
+    Error(err) -> Error(err)
+  }
+}
+
+/// Panicking counterpart of `add_hardlink_checked`.
+pub fn add_hardlink(
+  archive archive_value: Archive,
+  path path: String,
+  target target: String,
+) -> Archive {
+  add(archive_value, entry: entry.hardlink(path: path, target: target))
+}
+
 /// Attach an optional archive comment.
 pub fn with_comment(archive: Archive, comment comment: String) -> Archive {
   Archive(..archive, comment: Some(comment))

@@ -104,9 +104,11 @@ pub fn decode(
   decode_with_limits(bytes: bytes, limits: limit.default())
 }
 
-/// Decode a 7z byte stream using explicit limits.  Currently enforces
-/// `max_input_bytes` and `max_entry_depth`; the underlying LZMA/LZMA2
-/// decoder uses its own internal output guards.
+/// Decode a 7z byte stream using explicit limits.  Enforces
+/// `max_input_bytes` at entry, `max_output_bytes` against the
+/// declared unpack size before invoking the LZMA/LZMA2 decoder,
+/// and `max_members` / `max_entry_depth` while materialising the
+/// logical entry list.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
@@ -950,12 +952,43 @@ fn decode_archive(
   limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
   let _ = parsed.pack_pos
+
+  // The declared unpack size lives in the header, so we can refuse an
+  // oversized payload before the LZMA range coder runs — a malicious
+  // archive that advertises a multi-GB unpack size shouldn't be able
+  // to make us allocate it just to be rejected at the end.
+  use _ <- result.try(enforce_max_output(parsed.unpack_sizes, limits))
+
+  // Likewise refuse archives that advertise more members than the
+  // caller is willing to materialise — independent of the unpack
+  // payload, since the file list lives in the next header.
+  let declared_members = list.length(parsed.file_names)
+  use <- bool.guard(
+    when: declared_members > limit.max_members(limits),
+    return: Error(error.ArchiveLimitExceeded(
+      limit: "max_members",
+      actual: declared_members,
+    )),
+  )
+
   use plain <- result.try(decode_folder(
     packed,
     parsed.folder,
     parsed.unpack_sizes,
   ))
   build_archive_entries(plain, parsed, limits)
+}
+
+fn enforce_max_output(
+  unpack_sizes: List(Int),
+  limits: limit.Limits,
+) -> Result(Nil, error.ArchiveError) {
+  let total = sum_list(unpack_sizes, 0)
+  case total > limit.max_output_bytes(limits) {
+    True ->
+      Error(error.ArchiveLimitExceeded(limit: "max_output_bytes", actual: total))
+    False -> Ok(Nil)
+  }
 }
 
 fn decode_folder(
