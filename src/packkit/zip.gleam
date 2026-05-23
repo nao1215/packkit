@@ -118,6 +118,13 @@ pub fn encode_with_method(
   use _ <- result.try(check_u32(central_size, "central_directory_size"))
   use _ <- result.try(check_u32(central_offset, "central_directory_offset"))
 
+  let comment_bytes = case archives.comment(archive_value) {
+    Some(c) -> bit_array.from_string(c)
+    None -> <<>>
+  }
+  let comment_size = bit_array.byte_size(comment_bytes)
+  use _ <- result.try(check_u16(comment_size, "archive_comment_length"))
+
   let eocd =
     bit_array.concat([
       le32(eocd_signature),
@@ -127,10 +134,44 @@ pub fn encode_with_method(
       le16(count),
       le32(central_size),
       le32(central_offset),
-      le16(0),
+      le16(comment_size),
+      comment_bytes,
     ])
 
   Ok(bit_array.concat([local_bytes, central_bytes, eocd]))
+}
+
+/// Run the deflate encoder honoring the requested level on the inner
+/// codec attached to the method.  Level 0 → stored deflate blocks;
+/// the implicit default level → fixed-Huffman LZ77; any other level
+/// is rejected with a typed `CodecOptionUnsupported`.  Previously this
+/// step silently fell back to the default encoder regardless of the
+/// caller's level request.
+fn deflate_with_level(
+  bytes: BitArray,
+  inner: Option(codecs.Codec),
+) -> Result(BitArray, error.CodecError) {
+  let level_value = case inner {
+    None -> None
+    Some(c) ->
+      case codecs.level(c) {
+        Some(l) -> Some(level.value(l))
+        None -> None
+      }
+  }
+  case level_value {
+    None -> deflate.encode(bytes: bytes)
+    Some(0) -> deflate.encode_stored_only(bytes: bytes)
+    Some(n) ->
+      case n == level.value(level.default()) {
+        True -> deflate.encode(bytes: bytes)
+        False ->
+          Error(error.CodecOptionUnsupported(
+            option: "level",
+            codec_name: "zip-deflate",
+          ))
+      }
+  }
 }
 
 const u16_max: Int = 0xFFFF
@@ -206,7 +247,12 @@ pub fn decode_with_limits(
     limits,
   ))
 
-  Ok(archives.from_entries(format: format(), entries: list.reverse(entries)))
+  let base =
+    archives.from_entries(format: format(), entries: list.reverse(entries))
+  case eocd.comment {
+    Some(c) -> Ok(archives.with_comment(base, comment: c))
+    None -> Ok(base)
+  }
 }
 
 fn encode_entries(
@@ -241,7 +287,7 @@ fn encode_entry(
   let raw_path = entry.to_string(entry.path(value))
 
   use <- bool.guard(
-    when: kind == "symlink" || kind == "hardlink",
+    when: kind == entry.Symlink || kind == entry.Hardlink,
     return: Error(error.ArchiveEntryRejected(
       path: raw_path,
       reason: "ZIP encode currently supports files and directories only",
@@ -249,7 +295,7 @@ fn encode_entry(
   )
 
   let canonical_path = case kind {
-    "directory" -> ensure_trailing_slash(raw_path)
+    entry.Directory -> ensure_trailing_slash(raw_path)
     _ -> raw_path
   }
 
@@ -265,25 +311,25 @@ fn encode_entry(
   )
 
   let raw_body = case kind {
-    "directory" -> <<>>
+    entry.Directory -> <<>>
     _ -> entry.body(value)
   }
 
   let uncomp_size = bit_array.byte_size(raw_body)
   let crc = case kind {
-    "directory" -> 0
+    entry.Directory -> 0
     _ -> checksum.crc32(raw_body)
   }
 
   let entry_method = case kind {
-    "directory" -> store()
+    entry.Directory -> store()
     _ -> method
   }
 
   use #(method_code, compressed_body) <- result.try(case entry_method.name {
     "store" -> Ok(#(method_store, raw_body))
     "deflate" ->
-      deflate.encode(bytes: raw_body)
+      deflate_with_level(raw_body, entry_method.inner_codec)
       |> result.map(fn(b) { #(method_deflate, b) })
       |> result.map_error(codec_to_archive_error(_, canonical_path))
     other -> Error(error.ArchiveNotImplemented(feature: "ZIP method " <> other))
@@ -300,7 +346,7 @@ fn encode_entry(
   let metadata = entry.metadata(value)
   let mode = entry.mode(metadata)
   let external_attrs = case kind {
-    "directory" ->
+    entry.Directory ->
       int.bitwise_or(external_attr_dir, int.bitwise_shift_left(mode, 16))
     _ -> int.bitwise_shift_left(mode, 16)
   }
@@ -363,7 +409,12 @@ fn ensure_trailing_slash(value: String) -> String {
 }
 
 type EocdRecord {
-  EocdRecord(total_entries: Int, central_offset: Int, central_size: Int)
+  EocdRecord(
+    total_entries: Int,
+    central_offset: Int,
+    central_size: Int,
+    comment: Option(String),
+  )
 }
 
 fn locate_eocd(bytes: BitArray) -> Result(Int, error.ArchiveError) {
@@ -406,10 +457,25 @@ fn read_eocd(
   use total_entries <- result.try(read_le16_at(bytes, position + 10))
   use central_size <- result.try(read_le32_at(bytes, position + 12))
   use central_offset <- result.try(read_le32_at(bytes, position + 16))
+  use comment_length <- result.try(read_le16_at(bytes, position + 20))
+  use comment <- result.try(case comment_length {
+    0 -> Ok(None)
+    n -> {
+      use comment_bits <- result.try(slice_or_error(bytes, position + 22, n))
+      case bit_array.to_string(comment_bits) {
+        Ok(text) -> Ok(Some(text))
+        Error(_) ->
+          Error(error.ArchiveInvalid(
+            message: "non-UTF-8 archive comment in ZIP EOCD",
+          ))
+      }
+    }
+  })
   Ok(EocdRecord(
     total_entries: total_entries,
     central_offset: central_offset,
     central_size: central_size,
+    comment: comment,
   ))
 }
 

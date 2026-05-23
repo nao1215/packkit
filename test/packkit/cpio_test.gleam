@@ -19,8 +19,8 @@ pub fn roundtrip_file_test() -> Nil {
     #(entry.kind(e), entry.to_string(entry.path(e)), entry.body(e))
   })
   |> should.equal([
-    #("file", "hello.txt", <<"hello":utf8>>),
-    #("file", "dir/world.txt", <<"world":utf8>>),
+    #(entry.File, "hello.txt", <<"hello":utf8>>),
+    #(entry.File, "dir/world.txt", <<"world":utf8>>),
   ])
 }
 
@@ -39,9 +39,9 @@ pub fn roundtrip_directory_and_symlink_test() -> Nil {
   let assert [restored_dir, restored_link] = archive.entries(decoded)
 
   entry.kind(restored_dir)
-  |> should.equal("directory")
+  |> should.equal(entry.Directory)
   entry.kind(restored_link)
-  |> should.equal("symlink")
+  |> should.equal(entry.Symlink)
   entry.link_target(restored_link)
   |> should.equal(Some("spec.md"))
 }
@@ -54,6 +54,17 @@ pub fn rejects_hardlinks_on_encode_test() -> Nil {
 
   case cpio.encode(archive: archive_value) {
     Error(error.ArchiveEntryRejected(_, _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn encoder_rejects_archive_comment_test() -> Nil {
+  let with_note =
+    cpio.new()
+    |> archive_add_file("x", <<"x":utf8>>)
+    |> archive.with_comment(comment: "nope")
+  case cpio.encode(archive: with_note) {
+    Error(error.ArchiveCommentUnsupported(format: "cpio-newc")) -> Nil
     _ -> should.fail()
   }
 }

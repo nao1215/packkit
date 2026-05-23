@@ -34,7 +34,7 @@ pub fn entry_accepts_safe_nested_path_test() -> Nil {
     entry.file_checked(path: "doc/reference/spec.md", body: <<"ok":utf8>>)
 
   entry.kind(file)
-  |> should.equal("file")
+  |> should.equal(entry.File)
 
   file
   |> entry.path
@@ -288,8 +288,7 @@ pub fn write_rejects_format_mismatch_test() -> Nil {
   // An `Archive` is bound to one format at construction time. Asking
   // `packkit.write` to serialise it as a different format would silently
   // corrupt the output, so the facade refuses with a typed error.
-  let tar_archive =
-    tar.new() |> tar.add_file(path: "x.txt", body: <<"x":utf8>>)
+  let tar_archive = tar.new() |> tar.add_file(path: "x.txt", body: <<"x":utf8>>)
   packkit.write(archive_value: tar_archive, format: archive.zip())
   |> should.equal(
     Error(error.ArchiveFormatMismatch(archive: "tar", requested: "zip")),
@@ -297,8 +296,7 @@ pub fn write_rejects_format_mismatch_test() -> Nil {
 }
 
 pub fn write_accepts_matching_format_test() -> Nil {
-  let tar_archive =
-    tar.new() |> tar.add_file(path: "x.txt", body: <<"x":utf8>>)
+  let tar_archive = tar.new() |> tar.add_file(path: "x.txt", body: <<"x":utf8>>)
   case packkit.write(archive_value: tar_archive, format: archive.tar()) {
     Ok(_) -> Nil
     _ -> should.fail()
@@ -365,14 +363,11 @@ pub fn read_with_limits_propagates_to_archive_decoder_test() -> Nil {
     |> tar.add_file(path: "a.txt", body: <<>>)
     |> tar.add_file(path: "b.txt", body: <<>>)
     |> tar.add_file(path: "c.txt", body: <<>>)
-  let assert Ok(bytes) = packkit.write(archive_value: archive_value, format: tar.format())
+  let assert Ok(bytes) =
+    packkit.write(archive_value: archive_value, format: tar.format())
   let tight = limit.default() |> limit.with_max_members(count: 2)
   case
-    packkit.read_with_limits(
-      bytes: bytes,
-      format: tar.format(),
-      limits: tight,
-    )
+    packkit.read_with_limits(bytes: bytes, format: tar.format(), limits: tight)
   {
     Error(error.ArchiveLimitExceeded(limit: "max_members", actual: _)) -> Nil
     _ -> should.fail()
@@ -388,7 +383,13 @@ pub fn unpack_with_limits_propagates_to_codec_chain_test() -> Nil {
   let assert Ok(bytes) =
     packkit.pack(archive_value: archive_value, using: recipe.tar_gzip())
   let tight = limit.default() |> limit.with_max_input_bytes(bytes: 4)
-  case packkit.unpack_with_limits(bytes: bytes, using: recipe.tar_gzip(), limits: tight) {
+  case
+    packkit.unpack_with_limits(
+      bytes: bytes,
+      using: recipe.tar_gzip(),
+      limits: tight,
+    )
+  {
     Error(error.ArchiveCodecFailed(
       step: "decode",
       cause: error.CodecLimitExceeded(limit: "max_input_bytes", actual: _),
@@ -434,8 +435,7 @@ pub fn compress_accepts_default_level_on_fixed_level_codecs_test() -> Nil {
     packkit.decompress(bytes: out_xz, with: codec.xz())
   restored_xz
   |> should.equal(payload)
-  let assert Ok(out_gzip) =
-    packkit.compress(bytes: payload, with: codec.gzip())
+  let assert Ok(out_gzip) = packkit.compress(bytes: payload, with: codec.gzip())
   let assert Ok(restored_gzip) =
     packkit.decompress(bytes: out_gzip, with: codec.gzip())
   restored_gzip
@@ -450,10 +450,7 @@ pub fn compress_identity_rejects_level_test() -> Nil {
     codec.identity() |> codec.with_level(level: level.best())
   packkit.compress(bytes: <<"data":utf8>>, with: identity_with_level)
   |> should.equal(
-    Error(error.CodecOptionUnsupported(
-      option: "level",
-      codec_name: "identity",
-    )),
+    Error(error.CodecOptionUnsupported(option: "level", codec_name: "identity")),
   )
 }
 

@@ -50,9 +50,7 @@ pub fn unchecked_with_max_entry_name_bytes_clamps_non_positive_test() -> Nil {
 }
 
 pub fn checked_with_max_entry_name_bytes_rejects_non_positive_test() -> Nil {
-  case
-    limit.with_max_entry_name_bytes_checked(limit.default(), bytes: 0)
-  {
+  case limit.with_max_entry_name_bytes_checked(limit.default(), bytes: 0) {
     Error(limit.LimitMustBePositive(name: "max_entry_name_bytes", value: 0)) ->
       Nil
     _ -> should.fail()
@@ -61,8 +59,7 @@ pub fn checked_with_max_entry_name_bytes_rejects_non_positive_test() -> Nil {
 
 pub fn tar_decoder_enforces_max_entry_name_bytes_test() -> Nil {
   // The new public setter must actually flow into the tar decoder.
-  let archive_value =
-    tar.new() |> tar.add_file(path: "ten-bytes!", body: <<>>)
+  let archive_value = tar.new() |> tar.add_file(path: "ten-bytes!", body: <<>>)
   let assert Ok(bytes) = tar.encode(archive: archive_value)
   let assert Ok(tight) =
     limit.with_max_entry_name_bytes_checked(limit.default(), bytes: 5)

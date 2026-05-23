@@ -29,7 +29,7 @@ fn single_file_roundtrip(
   let assert Ok(bytes) = encode(original)
   let assert Ok(decoded) = decode(bytes)
   let assert [restored] = archive.entries(decoded)
-  restored |> entry.kind |> should.equal("file")
+  restored |> entry.kind |> should.equal(entry.File)
   restored |> entry.path |> entry.to_string |> should.equal(name)
   restored |> entry.body |> should.equal(body)
 }
@@ -107,8 +107,8 @@ pub fn tar_roundtrip_directory_and_symlink_test() -> Nil {
   let assert Ok(bytes) = tar.encode(archive: original)
   let assert Ok(decoded) = tar.decode(bytes: bytes)
   let assert [file_e, link_e] = archive.entries(decoded)
-  file_e |> entry.kind |> should.equal("file")
-  link_e |> entry.kind |> should.equal("symlink")
+  file_e |> entry.kind |> should.equal(entry.File)
+  link_e |> entry.kind |> should.equal(entry.Symlink)
   link_e |> entry.link_target |> should.equal(Some("spec.md"))
 }
 

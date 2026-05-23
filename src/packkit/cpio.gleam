@@ -46,6 +46,7 @@ pub fn new() -> archives.Archive {
 pub fn encode(
   archive archive_value: archives.Archive,
 ) -> Result(BitArray, error.ArchiveError) {
+  use _ <- result.try(reject_comment(archive_value))
   archive_value
   |> archives.entries
   |> list.try_map(encode_entry)
@@ -53,6 +54,15 @@ pub fn encode(
     [bit_array.concat(blocks), trailer_record()]
     |> bit_array.concat
   })
+}
+
+fn reject_comment(
+  archive_value: archives.Archive,
+) -> Result(Nil, error.ArchiveError) {
+  case archives.comment(archive_value) {
+    None -> Ok(Nil)
+    Some(_) -> Error(error.ArchiveCommentUnsupported(format: "cpio-newc"))
+  }
 }
 
 /// Decode a newc byte stream using default limits.
@@ -251,7 +261,7 @@ fn entry_error_to_archive_error(
 fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   let kind = entry.kind(value)
   use <- bool.guard(
-    when: kind == "hardlink",
+    when: kind == entry.Hardlink,
     return: Error(error.ArchiveEntryRejected(
       path: entry.to_string(entry.path(value)),
       reason: "cpio newc cannot represent hard links",
@@ -264,16 +274,16 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   let metadata = entry.metadata(value)
 
   let #(mode_bits, body) = case kind {
-    "file" -> #(s_ifreg, entry.body(value))
-    "directory" -> #(s_ifdir, <<>>)
-    "symlink" -> {
+    entry.File -> #(s_ifreg, entry.body(value))
+    entry.Directory -> #(s_ifdir, <<>>)
+    entry.Symlink -> {
       let target = case entry.link_target(value) {
         Some(t) -> t
         None -> ""
       }
       #(s_iflnk, bit_array.from_string(target))
     }
-    _ -> #(s_ifreg, entry.body(value))
+    entry.Hardlink -> #(s_ifreg, entry.body(value))
   }
 
   let mode = int.bitwise_or(mode_bits, entry.mode(metadata))
@@ -299,9 +309,9 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
       mode: mode,
       uid: uid,
       gid: gid,
-      nlink: case kind {
-        "directory" -> 2
-        _ -> 1
+      nlink: case kind == entry.Directory {
+        True -> 2
+        False -> 1
       },
       mtime: mtime,
       filesize: body_size,
@@ -323,10 +333,7 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
 
 const newc_field_max: Int = 0xFFFFFFFF
 
-fn check_hex_field(
-  value: Int,
-  field: String,
-) -> Result(Nil, error.ArchiveError) {
+fn check_hex_field(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
   case value < 0 || value > newc_field_max {
     True ->
       Error(error.ArchiveFieldOverflow(

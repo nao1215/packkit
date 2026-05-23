@@ -3,6 +3,72 @@ import packkit/codec
 import packkit/error
 import packkit/zstd
 
+pub fn frame_header_fcs_one_byte_test() -> Nil {
+  // Single_Segment + 1-byte FCS for sizes < 256.
+  let assert Ok(header) = zstd.frame_header_for_size(7)
+  header
+  |> should.equal(<<0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x07>>)
+}
+
+pub fn frame_header_fcs_two_byte_test() -> Nil {
+  // 2-byte FCS, stored as `size - 256` little-endian (RFC 8478 §3.1.1.1.2).
+  // 1024 - 256 = 768 = 0x0300.
+  let assert Ok(header) = zstd.frame_header_for_size(1024)
+  header
+  |> should.equal(<<0x28, 0xB5, 0x2F, 0xFD, 0x60, 768:size(16)-little>>)
+}
+
+pub fn frame_header_fcs_four_byte_boundary_test() -> Nil {
+  // 0xFFFFFFFF (max 32-bit FCS) → uses the 4-byte FCS variant.
+  let assert Ok(header) = zstd.frame_header_for_size(0xFFFFFFFF)
+  header
+  |> should.equal(<<
+    0x28,
+    0xB5,
+    0x2F,
+    0xFD,
+    0xA0,
+    0xFFFFFFFF:size(32)-little,
+  >>)
+}
+
+pub fn frame_header_fcs_eight_byte_low_test() -> Nil {
+  // 2^32 — just above the 4-byte FCS range, smallest 8-byte FCS value.
+  // Regression for the bug where the encoder packed the value into the
+  // low 32 bits and a literal 0 into the high 32, silently truncating
+  // any payload >= 4 GiB to its low 32 bits.
+  let assert Ok(header) = zstd.frame_header_for_size(0x1_0000_0000)
+  header
+  |> should.equal(<<
+    0x28,
+    0xB5,
+    0x2F,
+    0xFD,
+    0xE0,
+    0:size(32)-little,
+    1:size(32)-little,
+  >>)
+}
+
+pub fn frame_header_fcs_eight_byte_high_test() -> Nil {
+  // Mixed low/high 32-bit halves: 0xAB_CDEF_0001 →
+  //   lo = 0xCDEF_0001, hi = 0x000000AB.  This proves both halves are
+  //   written separately and at the right position.  Stays under
+  //   2^53 so the test is exact on both Erlang and JavaScript
+  //   targets (JS numbers cannot represent values past 2^53).
+  let assert Ok(header) = zstd.frame_header_for_size(0xAB_CDEF_0001)
+  header
+  |> should.equal(<<
+    0x28,
+    0xB5,
+    0x2F,
+    0xFD,
+    0xE0,
+    0xCDEF_0001:size(32)-little,
+    0xAB:size(32)-little,
+  >>)
+}
+
 pub fn codec_marker_test() -> Nil {
   zstd.codec()
   |> codec.name

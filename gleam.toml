@@ -75,7 +75,9 @@ unused_exports = "off"
 ]
 "src/packkit/gzip.gleam" = [
   "assert_ok_pattern",
+  "avoid_panic",
   "discarded_result",
+  "thrown_away_error",
 ]
 "src/packkit/lz4.gleam" = [
   "assert_ok_pattern",

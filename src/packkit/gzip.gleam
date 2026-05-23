@@ -98,6 +98,10 @@ pub fn with_comment(header: Header, comment comment: String) -> Header {
 pub type HeaderError {
   HeaderNameContainsNul
   HeaderCommentContainsNul
+  /// `modified_at_unix` must fit in gzip's 32-bit MTIME field
+  /// (`0..2^32-1`).  Surfaced here rather than silently wrapping at
+  /// `encode` time.
+  HeaderModifiedAtOutOfRange(value: Int)
 }
 
 /// Attach an optional filename after validating that it does not
@@ -127,12 +131,32 @@ pub fn with_comment_checked(
   Ok(Header(..header, comment: Some(comment)))
 }
 
-/// Attach an optional Unix mtime.
+/// Attach an optional Unix mtime.  Out-of-range values panic at
+/// construction time so a `Header` value cannot quietly carry a
+/// timestamp gzip's 32-bit MTIME field cannot represent.  Use
+/// [with_modified_at_checked] when the input is untrusted.
 pub fn with_modified_at(
   header: Header,
   unix_seconds unix_seconds: Int,
 ) -> Header {
-  Header(..header, modified_at_unix: Some(unix_seconds))
+  case with_modified_at_checked(header, unix_seconds: unix_seconds) {
+    Ok(h) -> h
+    Error(_) ->
+      panic as "packkit/gzip.with_modified_at: unix_seconds must be in the inclusive range 0..0xFFFFFFFF"
+  }
+}
+
+/// Attach an optional Unix mtime after validating it fits gzip's
+/// 32-bit MTIME field.
+pub fn with_modified_at_checked(
+  header: Header,
+  unix_seconds unix_seconds: Int,
+) -> Result(Header, HeaderError) {
+  use <- bool.guard(
+    when: unix_seconds < 0 || unix_seconds > 0xFFFFFFFF,
+    return: Error(HeaderModifiedAtOutOfRange(value: unix_seconds)),
+  )
+  Ok(Header(..header, modified_at_unix: Some(unix_seconds)))
 }
 
 /// Read the optional filename field.
@@ -446,13 +470,16 @@ pub fn new_decoder_with_limits(limits: limit.Limits) -> Decoder {
 /// Append a chunk of input bytes to the decoder, enforcing
 /// `max_input_bytes` incrementally.  Returns the updated decoder; no
 /// output is produced until [finish] runs (the underlying DEFLATE
-/// decoder is eager).  The empty list in the result tuple reserves
-/// space for a future incremental implementation that emits payload
-/// bytes as they decode.
+/// decoder is eager).
+///
+/// The shape mirrors [packkit/stream] so callers don't have to remember
+/// which streaming module returns which tuple — previously this push
+/// returned `(Decoder, List(BitArray))` and the equivalent
+/// `stream.push` returned a bare `Decoder`.
 pub fn push(
   decoder: Decoder,
   chunk: BitArray,
-) -> Result(#(Decoder, List(BitArray)), error.CodecError) {
+) -> Result(Decoder, error.CodecError) {
   let chunk_size = bit_array.byte_size(chunk)
   let new_total = decoder.buffered_bytes + chunk_size
   case new_total > limit.max_input_bytes(decoder.limits) {
@@ -463,28 +490,26 @@ pub fn push(
       ))
     False ->
       Ok(
-        #(
-          Decoder(
-            ..decoder,
-            reversed_chunks: [chunk, ..decoder.reversed_chunks],
-            buffered_bytes: new_total,
-          ),
-          [],
+        Decoder(
+          ..decoder,
+          reversed_chunks: [chunk, ..decoder.reversed_chunks],
+          buffered_bytes: new_total,
         ),
       )
   }
 }
 
-/// Finalize the decoder and return the full decoded payload split
-/// into a single-element list (one chunk).  The list shape mirrors
-/// the chunked output future implementations can emit.
-pub fn finish(decoder: Decoder) -> Result(List(BitArray), error.CodecError) {
+/// Finalize the decoder and return the full decoded payload.
+///
+/// Returns a bare `BitArray` (not `List(BitArray)`) so the gzip
+/// streaming surface matches `packkit/stream` exactly.
+pub fn finish(decoder: Decoder) -> Result(BitArray, error.CodecError) {
   // `bit_array.concat` over the forward-order list is O(total_bytes);
   // the previous fold called `concat([head, acc])` per chunk, which
   // copied `acc` each iteration and produced O(N * B * N) behaviour.
   let bytes = bit_array.concat(list.reverse(decoder.reversed_chunks))
   case decode_with_limits(bytes: bytes, limits: decoder.limits) {
-    Ok(decoded) -> Ok([decoded.payload])
+    Ok(decoded) -> Ok(decoded.payload)
     Error(e) -> Error(e)
   }
 }

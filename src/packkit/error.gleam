@@ -40,6 +40,10 @@ pub type ArchiveError {
   /// the format.  Surfaced instead of silently truncating to the
   /// field's modulus, which would corrupt the archive.
   ArchiveFieldOverflow(field: String, value: Int, max: Int)
+  /// The supplied archive carries an optional comment but the
+  /// destination format has no slot for it.  Surfaced instead of
+  /// silently dropping the comment on encode.
+  ArchiveCommentUnsupported(format: String)
 }
 
 /// Errors returned by recipe constructors or validators.

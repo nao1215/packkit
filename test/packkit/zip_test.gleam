@@ -1,5 +1,7 @@
 import gleam/bit_array
 import gleam/list
+import gleam/option
+import gleam/string
 import gleeunit/should
 import packkit/archive
 import packkit/entry
@@ -34,7 +36,7 @@ pub fn roundtrip_mixed_entries_test() -> Nil {
   let entries = archive.entries(decoded)
 
   list.map(entries, entry.kind)
-  |> should.equal(["directory", "file", "file"])
+  |> should.equal([entry.Directory, entry.File, entry.File])
 
   let assert [_, doc_spec, readme] = entries
   entry.body(doc_spec)
@@ -85,7 +87,9 @@ pub fn decodes_python_deflate_zip_test() -> Nil {
   |> should.equal(repeat_bytes(<<"0123456789":utf8>>, 100))
 }
 
-pub fn encode_deflate_method_roundtrip_test() -> Nil {
+pub fn encode_deflate_method_default_level_roundtrip_test() -> Nil {
+  // The default level maps to the fixed-Huffman DEFLATE encoder we
+  // actually ship; round-trip should be lossless.
   let original =
     zip.new()
     |> archive_add_file(
@@ -94,11 +98,69 @@ pub fn encode_deflate_method_roundtrip_test() -> Nil {
     )
 
   let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.deflate(level.best()))
+    zip.encode_with_method(
+      archive: original,
+      method: zip.deflate(level.default()),
+    )
   let assert Ok(decoded) = zip.decode(bytes: bytes)
   let assert [restored] = archive.entries(decoded)
   entry.body(restored)
   |> should.equal(repeat_bytes(<<"hello world":utf8>>, 30))
+}
+
+pub fn encode_deflate_method_store_level_emits_stored_blocks_test() -> Nil {
+  // Level 0 (store) is honoured by emitting stored DEFLATE blocks
+  // rather than fixed-Huffman blocks.  The output is still a valid
+  // ZIP/deflate stream that the decoder reads back losslessly.
+  let payload = <<"deflate level 0 round trip":utf8>>
+  let original = zip.new() |> archive_add_file("a.bin", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(
+      archive: original,
+      method: zip.deflate(level.store()),
+    )
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.body(restored)
+  |> should.equal(payload)
+}
+
+pub fn encode_deflate_method_rejects_non_default_level_test() -> Nil {
+  // Levels that the fixed-Huffman backend can't honour must be
+  // surfaced as a typed `CodecOptionUnsupported` (wrapped as
+  // `ArchiveEntryRejected`), not silently coerced to the default.
+  let original = zip.new() |> archive_add_file("a.bin", <<"data":utf8>>)
+  case
+    zip.encode_with_method(archive: original, method: zip.deflate(level.best()))
+  {
+    Error(error.ArchiveEntryRejected(path: _, reason: reason)) ->
+      reason
+      |> string.contains("zip-deflate")
+      |> should.be_true
+    _ -> should.fail()
+  }
+}
+
+pub fn archive_comment_round_trips_through_eocd_test() -> Nil {
+  // The ZIP EOCD record has a comment slot; `archive.with_comment`
+  // must be encoded there and restored on decode.  Previously the
+  // comment was silently dropped on encode.
+  let original =
+    zip.new()
+    |> archive_add_file("a.txt", <<"a":utf8>>)
+    |> archive.with_comment(comment: "packkit zip comment")
+  let assert Ok(bytes) = zip.encode(archive: original)
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  archive.comment(decoded)
+  |> should.equal(option.Some("packkit zip comment"))
+}
+
+pub fn archive_without_comment_decodes_to_none_test() -> Nil {
+  let original = zip.new() |> archive_add_file("a.txt", <<"a":utf8>>)
+  let assert Ok(bytes) = zip.encode(archive: original)
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  archive.comment(decoded)
+  |> should.equal(option.None)
 }
 
 fn repeat_bytes(value: BitArray, times: Int) -> BitArray {
@@ -133,22 +195,16 @@ fn python_deflate_zip() -> BitArray {
   >>
 }
 
-pub fn encoder_rejects_external_attrs_overflow_test() -> Nil {
-  // `external_attrs = mode << 16` and the field is 32 bits wide.  A
-  // mode of 0x10000 would push external_attrs to 2^32, overflowing the
-  // u32 field and previously corrupting the central directory record
-  // through silent truncation.
+pub fn entry_with_mode_checked_rejects_overflow_test() -> Nil {
+  // `external_attrs = mode << 16` in the ZIP central directory, and
+  // the field is 32 bits wide, so any mode that doesn't fit in 16
+  // bits would push external_attrs past 2^32.  The mode-side validator
+  // catches that at the `entry` boundary instead of letting it reach
+  // the encoder.
   let assert Ok(file_entry) =
     entry.file_checked(path: "x.txt", body: <<"x":utf8>>)
-  let with_huge_mode = file_entry |> entry.with_mode(mode: 0x10000)
-  let archive_value =
-    archive.new(format: zip.format()) |> archive.add(entry: with_huge_mode)
-  case zip.encode(archive: archive_value) {
-    Error(error.ArchiveFieldOverflow(
-      field: "zip external_attributes",
-      value: _,
-      max: _,
-    )) -> Nil
+  case entry.with_mode_checked(file_entry, mode: 0x10000) {
+    Error(entry.ModeOutOfRange(value: 0x10000)) -> Nil
     _ -> should.fail()
   }
 }

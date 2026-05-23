@@ -102,6 +102,7 @@ pub fn add_symlink(
 pub fn encode(
   archive archive_value: archives.Archive,
 ) -> Result(BitArray, error.ArchiveError) {
+  use _ <- result.try(reject_comment(archive_value))
   archive_value
   |> archives.entries
   |> list.try_map(encode_entry)
@@ -109,6 +110,15 @@ pub fn encode(
     [bit_array.concat(blocks), end_marker()]
     |> bit_array.concat
   })
+}
+
+fn reject_comment(
+  archive_value: archives.Archive,
+) -> Result(Nil, error.ArchiveError) {
+  case archives.comment(archive_value) {
+    None -> Ok(Nil)
+    Some(_) -> Error(error.ArchiveCommentUnsupported(format: "tar"))
+  }
 }
 
 /// Decode a USTAR byte stream into a logical archive using the default
@@ -171,10 +181,9 @@ fn decode_loop_with_pending(
   let assert Ok(header_bits) = bit_array.slice(bytes, 0, block_size)
   // POSIX 1003.1 requires two consecutive zero blocks at end-of-archive;
   // a single zero block followed by truncation is malformed.
-  use <- bool.lazy_guard(
-    when: is_zero_block(header_bits),
-    return: fn() { verify_double_zero_terminator(bytes, acc) },
-  )
+  use <- bool.lazy_guard(when: is_zero_block(header_bits), return: fn() {
+    verify_double_zero_terminator(bytes, acc)
+  })
   use header <- result.try(parse_header(header_bits))
   let body_padded = round_up_to_block(header.size)
   let total_advance = block_size + body_padded
@@ -506,15 +515,14 @@ fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   use #(name_field, prefix_field) <- result.try(split_name_field(path, kind))
 
   let typeflag = case kind {
-    "file" -> 0x30
-    "directory" -> 0x35
-    "symlink" -> 0x32
-    "hardlink" -> 0x31
-    _ -> 0x30
+    entry.File -> 0x30
+    entry.Directory -> 0x35
+    entry.Symlink -> 0x32
+    entry.Hardlink -> 0x31
   }
 
   let size = case kind {
-    "file" -> bit_array.byte_size(entry.body(value))
+    entry.File -> bit_array.byte_size(entry.body(value))
     _ -> 0
   }
 
@@ -591,10 +599,10 @@ fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
 
 fn split_name_field(
   path: String,
-  kind: String,
+  kind: entry.EntryKind,
 ) -> Result(#(BitArray, BitArray), error.ArchiveError) {
   let canonical = case kind {
-    "directory" -> path <> "/"
+    entry.Directory -> path <> "/"
     _ -> path
   }
 

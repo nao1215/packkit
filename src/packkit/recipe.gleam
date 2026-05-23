@@ -13,10 +13,7 @@ import packkit/codec
 /// `reversed_codecs` stores codecs in outer-to-inner order so [wrap]
 /// runs in O(1); accessors reverse on read.
 pub opaque type Recipe {
-  Recipe(
-    format: archive.ArchiveFormat,
-    reversed_codecs: List(codec.Codec),
-  )
+  Recipe(format: archive.ArchiveFormat, reversed_codecs: List(codec.Codec))
 }
 
 /// Create a recipe that carries an archive but no outer codec yet.

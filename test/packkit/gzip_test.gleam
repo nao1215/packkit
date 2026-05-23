@@ -53,8 +53,7 @@ pub fn decode_preserves_mtime_test() -> Nil {
 }
 
 pub fn decode_with_limits_preserves_mtime_test() -> Nil {
-  let header =
-    gzip.default_header() |> gzip.with_modified_at(unix_seconds: 42)
+  let header = gzip.default_header() |> gzip.with_modified_at(unix_seconds: 42)
   let payload = <<"mtime via decode_with_limits":utf8>>
   let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
   let assert Ok(decoded) =
@@ -116,10 +115,31 @@ pub fn with_name_checked_accepts_nul_free_name_test() -> Nil {
   |> should.equal(Some("valid.txt"))
 }
 
+pub fn with_modified_at_checked_rejects_negative_test() -> Nil {
+  gzip.default_header()
+  |> gzip.with_modified_at_checked(unix_seconds: -1)
+  |> should.equal(Error(gzip.HeaderModifiedAtOutOfRange(value: -1)))
+}
+
+pub fn with_modified_at_checked_rejects_above_u32_test() -> Nil {
+  gzip.default_header()
+  |> gzip.with_modified_at_checked(unix_seconds: 0x1_0000_0000)
+  |> should.equal(Error(gzip.HeaderModifiedAtOutOfRange(value: 0x1_0000_0000)))
+}
+
+pub fn with_modified_at_checked_accepts_u32_boundary_test() -> Nil {
+  let assert Ok(header) =
+    gzip.default_header()
+    |> gzip.with_modified_at_checked(unix_seconds: 0xFFFFFFFF)
+  gzip.modified_at_unix(header)
+  |> should.equal(Some(0xFFFFFFFF))
+}
+
 pub fn streaming_decoder_round_trips_test() -> Nil {
   // gzip.new_decoder / push / finish now buffers chunks and runs the
-  // eager decoder at finish time.  Regression for the period when
-  // both push and finish returned `CodecNotImplemented`.
+  // eager decoder at finish time.  The shape mirrors `packkit/stream`
+  // exactly — push returns `Result(Decoder, _)` and finish returns
+  // `Result(BitArray, _)`.
   let payload = <<"streaming gzip round trip":utf8>>
   let assert Ok(encoded) =
     gzip.encode(bytes: payload, header: gzip.default_header())
@@ -128,9 +148,9 @@ pub fn streaming_decoder_round_trips_test() -> Nil {
   let assert Ok(first_chunk) = bit_array.slice(encoded, 0, half)
   let assert Ok(second_chunk) = bit_array.slice(encoded, half, total - half)
   let decoder = gzip.new_decoder()
-  let assert Ok(#(decoder, _)) = gzip.push(decoder, first_chunk)
-  let assert Ok(#(decoder, _)) = gzip.push(decoder, second_chunk)
-  let assert Ok([chunk]) = gzip.finish(decoder)
+  let assert Ok(decoder) = gzip.push(decoder, first_chunk)
+  let assert Ok(decoder) = gzip.push(decoder, second_chunk)
+  let assert Ok(chunk) = gzip.finish(decoder)
   chunk
   |> should.equal(payload)
 }

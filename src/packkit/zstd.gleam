@@ -28,6 +28,9 @@ pub fn codec() -> codecs.Codec {
 
 const max_block_size: Int = 0x20_000
 
+/// Maximum frame content size representable in the 8-byte FCS field.
+const fcs_max: Int = 0xFFFFFFFFFFFFFFFF
+
 /// Encode `bytes` as a Zstandard frame.  The encoder always emits raw
 /// blocks (no compression, no checksum) — the output is a valid
 /// Zstandard frame that any conforming decoder can read, but it
@@ -35,44 +38,63 @@ const max_block_size: Int = 0x20_000
 /// compression-aware encoder is intentionally future work.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let size = bit_array.byte_size(bytes)
-  let header = build_zstd_frame_header(size)
+  use header <- result.try(frame_header_for_size(size))
   let blocks = build_raw_blocks(bytes, size)
   Ok(bit_array.concat([header, blocks]))
 }
 
-fn build_zstd_frame_header(size: Int) -> BitArray {
+/// Build the Zstandard frame header for a payload of `size` bytes.
+/// Exposed for tests that need to assert on the FCS layout for sizes
+/// too large to materialise in memory (e.g. 4 GiB+ frames where the
+/// header used to silently truncate the FCS field to its low 32 bits).
+pub fn frame_header_for_size(size: Int) -> Result(BitArray, error.CodecError) {
   // Single_Segment_flag = 1, no Window_Descriptor, no Dictionary_ID,
   // no Content_Checksum.  FCS encoding follows the size — 1 byte for
   // < 256, 2 bytes (FCS_flag = 1) for the 256..65535 range, 4 bytes
   // (FCS_flag = 2) for the 65536..(2^32)-1 range, otherwise 8 bytes
   // (FCS_flag = 3).
   case size {
-    n if n < 256 -> <<0x28, 0xB5, 0x2F, 0xFD, 0x20, n>>
-    n if n < 0x1_0000 -> <<
-      0x28,
-      0xB5,
-      0x2F,
-      0xFD,
-      0x60,
-      { n - 256 }:size(16)-little,
-    >>
-    n if n < 0x1_0000_0000 -> <<
-      0x28,
-      0xB5,
-      0x2F,
-      0xFD,
-      0xA0,
-      n:size(32)-little,
-    >>
-    n -> <<
-      0x28,
-      0xB5,
-      0x2F,
-      0xFD,
-      0xE0,
-      n:size(32)-little,
-      0:size(32)-little,
-    >>
+    n if n < 256 -> Ok(<<0x28, 0xB5, 0x2F, 0xFD, 0x20, n>>)
+    n if n < 0x1_0000 ->
+      Ok(<<
+        0x28,
+        0xB5,
+        0x2F,
+        0xFD,
+        0x60,
+        { n - 256 }:size(16)-little,
+      >>)
+    n if n < 0x1_0000_0000 ->
+      Ok(<<
+        0x28,
+        0xB5,
+        0x2F,
+        0xFD,
+        0xA0,
+        n:size(32)-little,
+      >>)
+    n if n <= fcs_max -> {
+      // FCS_flag = 3: full unsigned 64-bit little-endian field.
+      // The previous encoder packed `n` into the low 32 bits and a
+      // literal `0` into the high 32 bits, silently truncating any
+      // payload at or above 4 GiB to `n mod 2^32` bytes.
+      let lo = int.bitwise_and(n, 0xFFFFFFFF)
+      let hi = int.bitwise_and(int.bitwise_shift_right(n, 32), 0xFFFFFFFF)
+      Ok(<<
+        0x28,
+        0xB5,
+        0x2F,
+        0xFD,
+        0xE0,
+        lo:size(32)-little,
+        hi:size(32)-little,
+      >>)
+    }
+    n ->
+      Error(error.CodecLimitExceeded(
+        limit: "zstd frame_content_size",
+        actual: n,
+      ))
   }
 }
 

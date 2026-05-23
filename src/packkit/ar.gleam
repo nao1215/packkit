@@ -9,6 +9,7 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
+import gleam/option
 import gleam/result
 import gleam/string
 import packkit/archive as archives
@@ -40,6 +41,7 @@ pub fn new() -> archives.Archive {
 pub fn encode(
   archive archive_value: archives.Archive,
 ) -> Result(BitArray, error.ArchiveError) {
+  use _ <- result.try(reject_comment(archive_value))
   archive_value
   |> archives.entries
   |> list.try_map(encode_entry)
@@ -47,6 +49,15 @@ pub fn encode(
     [bit_array.from_string(magic), bit_array.concat(records)]
     |> bit_array.concat
   })
+}
+
+fn reject_comment(
+  archive_value: archives.Archive,
+) -> Result(Nil, error.ArchiveError) {
+  case archives.comment(archive_value) {
+    option.None -> Ok(Nil)
+    option.Some(_) -> Error(error.ArchiveCommentUnsupported(format: "ar"))
+  }
 }
 
 /// Decode an `ar` byte stream using default limits.
@@ -245,7 +256,7 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
 fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   let kind = entry.kind(value)
   use <- bool.guard(
-    when: kind != "file",
+    when: kind != entry.File,
     return: Error(error.ArchiveEntryRejected(
       path: entry.to_string(entry.path(value)),
       reason: "ar only supports regular file entries",

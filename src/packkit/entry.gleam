@@ -8,6 +8,17 @@ pub opaque type EntryPath {
   EntryPath(raw: String, segments: List(String))
 }
 
+/// Pattern-matchable tag identifying the kind of an `Entry`.  The
+/// `Entry` itself stays opaque; this transparent enum replaces the
+/// previous stringly-typed kind so callers and encoders get
+/// compile-time exhaustiveness instead of "did I spell that right?".
+pub type EntryKind {
+  File
+  Directory
+  Symlink
+  Hardlink
+}
+
 /// Common metadata carried by archive entries.
 pub opaque type Metadata {
   Metadata(mode: Int, user_id: Int, group_id: Int, modified_at_unix: Int)
@@ -16,7 +27,7 @@ pub opaque type Metadata {
 /// Opaque logical archive entry.
 pub opaque type Entry {
   Entry(
-    kind: String,
+    kind: EntryKind,
     path: EntryPath,
     body: BitArray,
     link_target: Option(String),
@@ -33,6 +44,22 @@ pub type EntryError {
   EmptySegment(value: String)
   DotSegment(value: String)
   ContainsNul(value: String)
+}
+
+/// Why a checked metadata setter rejected the input.  Distinct from
+/// the path-validation `EntryError` so callers can pattern-match on the
+/// numeric-field cases without conflating them.
+pub type MetadataError {
+  /// `mode` must fit in 16 unsigned bits (the widest field shape any
+  /// of our archive families serialise it through).
+  ModeOutOfRange(value: Int)
+  /// `uid` / `gid` must be non-negative.  Maximum is 2^32-1 (the
+  /// widest format-side cap, cpio newc).
+  OwnerOutOfRange(value: Int)
+  /// `modified_at_unix` must be non-negative.  Maximum is 2^32-1
+  /// (32-bit gzip / cpio newc cap); larger timestamps are rejected
+  /// here rather than silently corrupted at encode time.
+  ModifiedAtOutOfRange(value: Int)
 }
 
 /// Validate a relative archive path.
@@ -87,7 +114,7 @@ pub fn file_checked(
   case path_checked(path) {
     Ok(safe_path) ->
       Ok(Entry(
-        kind: "file",
+        kind: File,
         path: safe_path,
         body: body,
         link_target: None,
@@ -111,7 +138,7 @@ pub fn directory_checked(path path: String) -> Result(Entry, EntryError) {
   case path_checked(path) {
     Ok(safe_path) ->
       Ok(Entry(
-        kind: "directory",
+        kind: Directory,
         path: safe_path,
         body: <<>>,
         link_target: None,
@@ -144,7 +171,7 @@ pub fn symlink_checked(
   case path_checked(path) {
     Ok(safe_path) ->
       Ok(Entry(
-        kind: "symlink",
+        kind: Symlink,
         path: safe_path,
         body: <<>>,
         link_target: Some(target),
@@ -177,7 +204,7 @@ pub fn hardlink_checked(
   case path_checked(path) {
     Ok(safe_path) ->
       Ok(Entry(
-        kind: "hardlink",
+        kind: Hardlink,
         path: safe_path,
         body: <<>>,
         link_target: Some(target),
@@ -197,7 +224,7 @@ pub fn hardlink(path path: String, target target: String) -> Entry {
 }
 
 /// Read the logical entry kind.
-pub fn kind(entry: Entry) -> String {
+pub fn kind(entry: Entry) -> EntryKind {
   entry.kind
 }
 
@@ -221,8 +248,32 @@ pub fn metadata(entry: Entry) -> Metadata {
   entry.metadata
 }
 
-/// Override the entry mode.
+/// Maximum mode the metadata can carry.  Sized to cover the 16-bit
+/// `external_attrs >> 16` window that ZIP and the widest POSIX mode
+/// shape both fit into.  Stricter than uid/gid/mtime because no archive
+/// family in scope uses a mode wider than 16 bits.
+const mode_max: Int = 0xFFFF
+
+/// Override the entry mode.  Out-of-range values panic; use
+/// [with_mode_checked] for caller-controlled error handling.
 pub fn with_mode(entry: Entry, mode mode: Int) -> Entry {
+  case with_mode_checked(entry, mode: mode) {
+    Ok(e) -> e
+    Error(_) ->
+      panic as "packkit/entry.with_mode: mode must be in the inclusive range 0..0xFFFF"
+  }
+}
+
+/// Override the entry mode after validating it fits the widest mode
+/// field any of our archive families serialise it through.
+pub fn with_mode_checked(
+  entry: Entry,
+  mode mode: Int,
+) -> Result(Entry, MetadataError) {
+  use <- bool.guard(
+    when: mode < 0 || mode > mode_max,
+    return: Error(ModeOutOfRange(value: mode)),
+  )
   let Metadata(
     user_id: user_id,
     group_id: group_id,
@@ -230,49 +281,104 @@ pub fn with_mode(entry: Entry, mode mode: Int) -> Entry {
     ..,
   ) = entry.metadata
 
-  Entry(
-    ..entry,
-    metadata: Metadata(
-      mode: mode,
-      user_id: user_id,
-      group_id: group_id,
-      modified_at_unix: modified_at_unix,
+  Ok(
+    Entry(
+      ..entry,
+      metadata: Metadata(
+        mode: mode,
+        user_id: user_id,
+        group_id: group_id,
+        modified_at_unix: modified_at_unix,
+      ),
     ),
   )
 }
 
-/// Override the entry owner identifiers.
+/// Override the entry owner identifiers.  Negative values panic;
+/// see [with_owner_checked] for the validated variant.  No upper
+/// bound is enforced here — format-specific encoders (tar, ar, cpio
+/// newc) each apply their own narrower field-width checks at encode
+/// time, so a value that's valid for one format and oversized for
+/// another can still be expressed as an `Entry`.
 pub fn with_owner(
   entry: Entry,
   user_id user_id: Int,
   group_id group_id: Int,
 ) -> Entry {
+  case with_owner_checked(entry, user_id: user_id, group_id: group_id) {
+    Ok(e) -> e
+    Error(_) ->
+      panic as "packkit/entry.with_owner: uid/gid must be non-negative"
+  }
+}
+
+/// Override the entry owner identifiers after validating they are
+/// non-negative.  Format-side overflow (e.g. tar's 21-bit field) is
+/// still surfaced at encode time as `ArchiveFieldOverflow`.
+pub fn with_owner_checked(
+  entry: Entry,
+  user_id user_id: Int,
+  group_id group_id: Int,
+) -> Result(Entry, MetadataError) {
+  use <- bool.guard(
+    when: user_id < 0,
+    return: Error(OwnerOutOfRange(value: user_id)),
+  )
+  use <- bool.guard(
+    when: group_id < 0,
+    return: Error(OwnerOutOfRange(value: group_id)),
+  )
   let Metadata(mode: mode, modified_at_unix: modified_at_unix, ..) =
     entry.metadata
 
-  Entry(
-    ..entry,
-    metadata: Metadata(
-      mode: mode,
-      user_id: user_id,
-      group_id: group_id,
-      modified_at_unix: modified_at_unix,
+  Ok(
+    Entry(
+      ..entry,
+      metadata: Metadata(
+        mode: mode,
+        user_id: user_id,
+        group_id: group_id,
+        modified_at_unix: modified_at_unix,
+      ),
     ),
   )
 }
 
-/// Override the last-modified timestamp.
+/// Override the last-modified timestamp.  Negative values panic;
+/// see [with_modified_at_checked] for the validated variant.  As
+/// with [with_owner], the format-specific upper bound (gzip 32-bit,
+/// tar 11-octal-digit, …) is enforced at encode time.
 pub fn with_modified_at(entry: Entry, unix_seconds unix_seconds: Int) -> Entry {
+  case with_modified_at_checked(entry, unix_seconds: unix_seconds) {
+    Ok(e) -> e
+    Error(_) ->
+      panic as "packkit/entry.with_modified_at: unix_seconds must be non-negative"
+  }
+}
+
+/// Override the last-modified timestamp after validating it is
+/// non-negative.  The format-specific upper bound is enforced at
+/// encode time as `ArchiveFieldOverflow`.
+pub fn with_modified_at_checked(
+  entry: Entry,
+  unix_seconds unix_seconds: Int,
+) -> Result(Entry, MetadataError) {
+  use <- bool.guard(
+    when: unix_seconds < 0,
+    return: Error(ModifiedAtOutOfRange(value: unix_seconds)),
+  )
   let Metadata(mode: mode, user_id: user_id, group_id: group_id, ..) =
     entry.metadata
 
-  Entry(
-    ..entry,
-    metadata: Metadata(
-      mode: mode,
-      user_id: user_id,
-      group_id: group_id,
-      modified_at_unix: unix_seconds,
+  Ok(
+    Entry(
+      ..entry,
+      metadata: Metadata(
+        mode: mode,
+        user_id: user_id,
+        group_id: group_id,
+        modified_at_unix: unix_seconds,
+      ),
     ),
   )
 }

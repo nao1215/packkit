@@ -47,13 +47,25 @@ pub fn rejects_directory_entries_test() -> Nil {
   }
 }
 
+pub fn encoder_rejects_archive_comment_test() -> Nil {
+  let with_note =
+    ar.new()
+    |> archive_add_file("a.o", <<>>)
+    |> archive.with_comment(comment: "nope")
+  case ar.encode(archive: with_note) {
+    Error(error.ArchiveCommentUnsupported(format: "ar")) -> Nil
+    _ -> should.fail()
+  }
+}
+
 pub fn encoder_rejects_uid_overflow_test() -> Nil {
   // The ar uid field is 6 ASCII decimal digits.  999_999 fits;
   // 1_000_000 does not, and used to silently truncate via
   // `right_pad`.
   let assert Ok(base) = entry.file_checked(path: "a.o", body: <<>>)
   let huge = base |> entry.with_owner(user_id: 1_000_000, group_id: 0)
-  let archive_value = archive.new(format: ar.format()) |> archive.add(entry: huge)
+  let archive_value =
+    archive.new(format: ar.format()) |> archive.add(entry: huge)
   case ar.encode(archive: archive_value) {
     Error(error.ArchiveFieldOverflow(field: "ar uid", value: 1_000_000, max: _)) ->
       Nil
