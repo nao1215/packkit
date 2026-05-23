@@ -111,3 +111,33 @@ pub fn facade_pack_unpack_tar_gzip_test() -> Nil {
   archive.entry_count(decoded)
   |> should.equal(2)
 }
+
+pub fn facade_bzip2_roundtrip_test() -> Nil {
+  let payload = <<"facade-level bzip2 round trip":utf8>>
+  let assert Ok(compressed) =
+    packkit.compress(bytes: payload, with: codec.bzip2())
+  let assert Ok(restored) =
+    packkit.decompress(bytes: compressed, with: codec.bzip2())
+  restored
+  |> should.equal(payload)
+}
+
+pub fn facade_lzw_roundtrip_test() -> Nil {
+  let payload = <<"facade-level LZW round trip":utf8>>
+  let assert Ok(compressed) =
+    packkit.compress(bytes: payload, with: codec.lzw())
+  let assert Ok(restored) =
+    packkit.decompress(bytes: compressed, with: codec.lzw())
+  restored
+  |> should.equal(payload)
+}
+
+pub fn facade_deflate_roundtrip_test() -> Nil {
+  let payload = <<"deflate via facade — fixed Huffman LZ77":utf8>>
+  let assert Ok(compressed) =
+    packkit.compress(bytes: payload, with: codec.deflate())
+  let assert Ok(restored) =
+    packkit.decompress(bytes: compressed, with: codec.deflate())
+  restored
+  |> should.equal(payload)
+}
