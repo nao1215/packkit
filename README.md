@@ -42,10 +42,12 @@ Implemented codecs and archive families:
 - **xz**: stream header / block header / index / footer + LZMA2 with
   both uncompressed and LZMA-compressed chunks (via the pure-Gleam
   LZMA range coder in `packkit/internal/lzma`)
-- **zstd**: frame envelope + raw + RLE blocks (FSE/Huffman compressed
-  blocks return `CodecNotImplemented`)
-- **brotli**: recognises the canonical empty stream `0x3F`
-  (RFC 7932 metablock layer + static dictionary still pending)
+- **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
+  with Raw / RLE literals and predefined FSE modes; Huffman
+  literals and non-predefined FSE modes still pending
+- **brotli**: empty stream + any `ISUNCOMPRESSED` metablock
+  (RFC 7932 §9.2); compressed metablocks + static dictionary
+  still pending
 
 The facade (`packkit.compress`, `packkit.decompress`, `packkit.read`,
 `packkit.write`, `packkit.pack`, `packkit.unpack`) is wired to these

@@ -23,11 +23,14 @@
   `packkit/internal/lzma`.
 - Added a 7z reader covering the common `7z a` single-file case
   (single folder, single coder, raw LZMA `03 01 01` or LZMA2 `21`).
-- Added a partial Zstandard decoder: frame envelope, raw and RLE
-  blocks, plus the predefined FSE distributions at
-  `packkit/internal/fse` ready for the entropy-decode follow-up.
-- Added a partial Brotli decoder that recognises any empty stream via
-  RFC 7932 WBITS + ISLASTEMPTY parsing.
+- Added a Zstandard decoder covering frame envelope + raw + RLE
+  blocks + FSE-compressed sequences (Raw / RLE literals, predefined
+  FSE modes).  The FSE primitives live in `packkit/internal/fse`
+  along with the predefined LL/ML/Offset distributions and the LL /
+  ML base+extra-bits lookup tables.
+- Added a Brotli decoder covering the empty stream and any
+  `ISUNCOMPRESSED` metablock (RFC 7932 §9.2).  Compressed
+  metablocks + the 122 KiB static dictionary are still pending.
 - Wired the `packkit.compress` / `decompress` / `read` / `write` /
   `pack` / `unpack` facade and turned byte-signature detection into a
   real magic-number scan.
