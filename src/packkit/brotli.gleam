@@ -1,11 +1,6 @@
 //// Brotli codec — pure-Gleam decoder.
 ////
-//// Decodes RFC 7932 brotli streams whose metablocks use a single
-//// block type for each of the literal, insert-and-copy, and
-//// distance categories (i.e. `NBLTYPES = 1` and `NTREES = 1` for
-//// both literal and distance categories — the case brotli's stock
-//// encoder emits for the overwhelming majority of inputs).  Within
-//// that envelope it handles:
+//// Decodes RFC 7932 brotli streams, including:
 ////
 //// * The canonical empty stream `0x3F`.
 //// * Any stream that uses uncompressed metablocks
@@ -21,19 +16,26 @@
 ////   back to the embedded 122 KiB dictionary, with the prefix /
 ////   suffix / `OMIT_FIRST` / `OMIT_LAST` / `UPPERCASE_FIRST` /
 ////   `UPPERCASE_ALL` transforms applied per `transform_idx`.
+//// * Context-mapped literal and distance trees (§7.3) when
+////   `NTREES > 1`, including the `RLEMAX` zero-run encoding and the
+////   optional inverse move-to-front transform.
+//// * Block switching (§6) when `NBLTYPES > 1`: each category
+////   tracks its own block-type prefix code, a 26-symbol block-length
+////   code, and a 2-entry recent-type ring buffer that feeds back
+////   into context-map indexing so the right tree is picked for every
+////   symbol.
 ////
 //// What still returns a typed `CodecNotImplemented`:
 ////
-//// * Block switching (NBLTYPES > 1).
-//// * Context maps (NTREES > 1) for the literal or distance trees.
-//// * The `SHIFT_FIRST` / `SHIFT_ALL` transforms used by the shared-
-////   dictionary extension (the basic RFC 7932 transform set never
-////   selects them).
+//// * The `SHIFT_FIRST` / `SHIFT_ALL` transforms used by the
+////   shared-dictionary extension (the basic RFC 7932 transform set
+////   never selects them).
 
 import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
@@ -172,9 +174,9 @@ fn decode_compressed_metablock(
   use #(nbl_command, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_distance, reader) <- result.try(decode_var_len_uint8(reader))
 
-  use _ <- result.try(reject_block_switching("literal", nbl_literal))
-  use _ <- result.try(reject_block_switching("insert-and-copy", nbl_command))
-  use _ <- result.try(reject_block_switching("distance", nbl_distance))
+  use #(block_l, reader) <- result.try(read_block_state(reader, nbl_literal))
+  use #(block_i, reader) <- result.try(read_block_state(reader, nbl_command))
+  use #(block_d, reader) <- result.try(read_block_state(reader, nbl_distance))
 
   use #(npostfix, reader) <- result.try(read_bits(reader, 2))
   use #(ndirect_code, reader) <- result.try(read_bits(reader, 4))
@@ -238,6 +240,9 @@ fn decode_compressed_metablock(
       context_modes: context_modes,
       literal_context_map: literal_context_map,
       distance_context_map: distance_context_map,
+      block_l: block_l,
+      block_i: block_i,
+      block_d: block_d,
       prev1: byte_at_or_zero(output, pos - 1),
       prev2: byte_at_or_zero(output, pos - 2),
       limits: limits,
@@ -332,11 +337,44 @@ type CommandState {
     /// `nbl_distance × 4` entries (or empty when NTREESD = 1).  Indexed
     /// by `block_type_d × 4 + distance_context`.
     distance_context_map: BitArray,
+    block_l: BlockState,
+    block_i: BlockState,
+    block_d: BlockState,
     /// Most recent literal byte (for context computation).
     prev1: Int,
     /// Second-most-recent literal byte.
     prev2: Int,
     limits: limit.Limits,
+  )
+}
+
+/// Per-category block-switching state.  When `nbltypes == 1`, no
+/// switching ever happens: `length` is set high enough to never tick
+/// down to zero within a metablock, and the type/length codes are
+/// `None`.  Otherwise we maintain a 2-entry "ring buffer" of recent
+/// block types so the next switch's `(0, 1, n+2)` encoding can
+/// resolve to the right new type.
+type BlockState {
+  BlockState(
+    type_: Int,
+    length: Int,
+    nbltypes: Int,
+    type_code: Option(PrefixCode),
+    length_code: Option(PrefixCode),
+    rb_prev: Int,
+    rb_curr: Int,
+  )
+}
+
+fn trivial_block_state() -> BlockState {
+  BlockState(
+    type_: 0,
+    length: 0x7FFF_FFFF,
+    nbltypes: 1,
+    type_code: None,
+    length_code: None,
+    rb_prev: 1,
+    rb_curr: 0,
   )
 }
 
@@ -347,7 +385,13 @@ fn run_commands(
   case state.remaining <= 0 {
     True -> Ok(#(state.output, state.ring, reader))
     False -> {
-      let assert [command_tree, ..] = state.command_codes
+      use #(block_i, reader) <- result.try(maybe_switch_block(
+        reader,
+        state.block_i,
+      ))
+      let state = CommandState(..state, block_i: block_i)
+      let command_tree =
+        pick_tree_by_index(state.command_codes, state.block_i.type_)
       use #(cmd, reader) <- result.try(decode_command(reader, command_tree))
       use #(state, reader) <- result.try(emit_literals(
         reader,
@@ -367,11 +411,9 @@ fn execute_copy_step(
   state: CommandState,
   cmd: Command,
 ) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
-  use #(distance, push_to_ring, reader) <- result.try(decode_distance_value(
-    reader,
-    state,
-    cmd,
-  ))
+  use #(distance, push_to_ring, state, reader) <- result.try(
+    decode_distance_value(reader, state, cmd),
+  )
   let pos = bit_array.byte_size(state.output)
   let is_dict_ref = distance > pos
   let ring = case push_to_ring && !is_dict_ref {
@@ -397,36 +439,48 @@ fn decode_distance_value(
   reader: Reader,
   state: CommandState,
   cmd: Command,
-) -> Result(#(Int, Bool, Reader), error.CodecError) {
+) -> Result(#(Int, Bool, CommandState, Reader), error.CodecError) {
   case cmd.distance_code {
     0 -> {
-      // Implicit reuse — no distance bits in the stream.
+      // Implicit reuse — no distance bits in the stream, no block tick.
       let distance = ring_get(state.ring, state.ring.idx - 1)
-      Ok(#(distance, False, reader))
+      Ok(#(distance, False, state, reader))
     }
-    _ -> {
-      let distance_tree =
-        pick_tree_by_index(
-          state.distance_codes,
-          select_distance_tree_idx(state, cmd.distance_context),
-        )
-      use #(code, reader) <- result.try(decode_prefix_symbol(
-        reader,
-        distance_tree,
-      ))
-      case code < 16 {
-        True -> {
-          let #(distance, push) = short_distance(code, state.ring)
-          Ok(#(distance, push, reader))
+    _ -> read_distance_code(reader, state, cmd)
+  }
+}
+
+fn read_distance_code(
+  reader: Reader,
+  state: CommandState,
+  cmd: Command,
+) -> Result(#(Int, Bool, CommandState, Reader), error.CodecError) {
+  use #(block_d, reader) <- result.try(maybe_switch_block(reader, state.block_d))
+  let state = CommandState(..state, block_d: block_d)
+  let distance_tree =
+    pick_tree_by_index(
+      state.distance_codes,
+      select_distance_tree_idx(state, cmd.distance_context),
+    )
+  use #(code, reader) <- result.try(decode_prefix_symbol(reader, distance_tree))
+  case code < 16 {
+    True -> {
+      let #(distance, push) = short_distance(code, state.ring)
+      Ok(#(distance, push, state, reader))
+    }
+    False ->
+      case code < 16 + state.ndirect {
+        True -> Ok(#(code - 15, True, state, reader))
+        False -> {
+          use #(distance, push, reader) <- result.try(apply_long_distance(
+            reader,
+            code,
+            state.npostfix,
+            state.ndirect,
+          ))
+          Ok(#(distance, push, state, reader))
         }
-        False ->
-          case code < 16 + state.ndirect {
-            True -> Ok(#(code - 15, True, reader))
-            False ->
-              apply_long_distance(reader, code, state.npostfix, state.ndirect)
-          }
       }
-    }
   }
 }
 
@@ -624,6 +678,11 @@ fn emit_literals_loop(
   case remaining {
     0 -> Ok(#(state, reader))
     _ -> {
+      use #(block_l, reader) <- result.try(maybe_switch_block(
+        reader,
+        state.block_l,
+      ))
+      let state = CommandState(..state, block_l: block_l)
       let tree =
         pick_tree_by_index(state.literal_codes, select_literal_tree_idx(state))
       use #(byte, reader) <- result.try(decode_prefix_symbol(reader, tree))
@@ -651,23 +710,36 @@ fn emit_literals_loop(
 // -- Context-driven tree selection (RFC 7932 §7.3) ---------------------
 
 fn select_literal_tree_idx(state: CommandState) -> Int {
-  let context_mode = case state.context_modes {
-    [m, ..] -> m
-    [] -> 0
-  }
+  let block_type = state.block_l.type_
+  let context_mode = pick_int_by_index(state.context_modes, block_type)
   let ctx = brotli_ctx.context_id(context_mode, state.prev1, state.prev2)
-  // block_type_l = 0 since NBLTYPES_L = 1.
   case bit_array.byte_size(state.literal_context_map) {
     0 -> 0
-    _ -> byte_at_or_zero(state.literal_context_map, ctx)
+    _ ->
+      byte_at_or_zero(
+        state.literal_context_map,
+        int.bitwise_shift_left(block_type, 6) + ctx,
+      )
   }
 }
 
 fn select_distance_tree_idx(state: CommandState, distance_context: Int) -> Int {
-  // block_type_d = 0 since NBLTYPES_D = 1.
+  let block_type = state.block_d.type_
   case bit_array.byte_size(state.distance_context_map) {
     0 -> 0
-    _ -> byte_at_or_zero(state.distance_context_map, distance_context)
+    _ ->
+      byte_at_or_zero(
+        state.distance_context_map,
+        int.bitwise_shift_left(block_type, 2) + distance_context,
+      )
+  }
+}
+
+fn pick_int_by_index(values: List(Int), idx: Int) -> Int {
+  case values, idx {
+    [head, ..], 0 -> head
+    [_, ..tail], _ -> pick_int_by_index(tail, idx - 1)
+    [], _ -> 0
   }
 }
 
@@ -860,16 +932,144 @@ fn cumulative_offset_loop(
   }
 }
 
-fn reject_block_switching(
-  category: String,
-  count: Int,
-) -> Result(Nil, error.CodecError) {
-  case count > 1 {
-    True ->
-      Error(error.CodecNotImplemented(
-        feature: "brotli " <> category <> " block switching (NBLTYPES > 1)",
-      ))
-    False -> Ok(Nil)
+/// Read the block-switching trees and initial block-length for a
+/// category.  For `nbltypes == 1` no bits are read — block switching
+/// is disabled and the trivial state is returned.
+fn read_block_state(
+  reader: Reader,
+  nbltypes: Int,
+) -> Result(#(BlockState, Reader), error.CodecError) {
+  case nbltypes <= 1 {
+    True -> Ok(#(trivial_block_state(), reader))
+    False -> read_active_block_state(reader, nbltypes)
+  }
+}
+
+fn read_active_block_state(
+  reader: Reader,
+  nbltypes: Int,
+) -> Result(#(BlockState, Reader), error.CodecError) {
+  use #(type_code, reader) <- result.try(decode_prefix_code(
+    reader,
+    nbltypes + 2,
+    "block-type",
+  ))
+  use #(length_code, reader) <- result.try(decode_prefix_code(
+    reader,
+    26,
+    "block-length",
+  ))
+  use #(length, reader) <- result.try(read_block_length(reader, length_code))
+  Ok(#(
+    BlockState(
+      type_: 0,
+      length: length,
+      nbltypes: nbltypes,
+      type_code: Some(type_code),
+      length_code: Some(length_code),
+      rb_prev: 1,
+      rb_curr: 0,
+    ),
+    reader,
+  ))
+}
+
+fn read_block_length(
+  reader: Reader,
+  code: PrefixCode,
+) -> Result(#(Int, Reader), error.CodecError) {
+  use #(symbol, reader) <- result.try(decode_prefix_symbol(reader, code))
+  let #(offset, nbits) = block_length_range(symbol)
+  use #(extra, reader) <- result.try(read_bits(reader, nbits))
+  Ok(#(offset + extra, reader))
+}
+
+/// `_kBrotliPrefixCodeRanges` from `c/common/constants.c`.  Indexed by
+/// the 26-symbol block-length alphabet; returns the `(offset, nbits)`
+/// pair used to compute `length = offset + extra` where `extra` is an
+/// `nbits`-bit unsigned value following the symbol.
+fn block_length_range(symbol: Int) -> #(Int, Int) {
+  case symbol {
+    0 -> #(1, 2)
+    1 -> #(5, 2)
+    2 -> #(9, 2)
+    3 -> #(13, 2)
+    4 -> #(17, 3)
+    5 -> #(25, 3)
+    6 -> #(33, 3)
+    7 -> #(41, 3)
+    8 -> #(49, 4)
+    9 -> #(65, 4)
+    10 -> #(81, 4)
+    11 -> #(97, 4)
+    12 -> #(113, 5)
+    13 -> #(145, 5)
+    14 -> #(177, 5)
+    15 -> #(209, 5)
+    16 -> #(241, 6)
+    17 -> #(305, 6)
+    18 -> #(369, 7)
+    19 -> #(497, 8)
+    20 -> #(753, 9)
+    21 -> #(1265, 10)
+    22 -> #(2289, 11)
+    23 -> #(4337, 12)
+    24 -> #(8433, 13)
+    _ -> #(16_625, 24)
+  }
+}
+
+/// Decrement the block-length counter; if it hits zero and the block
+/// has more than one type, read a block-switch (new type + length).
+fn maybe_switch_block(
+  reader: Reader,
+  block: BlockState,
+) -> Result(#(BlockState, Reader), error.CodecError) {
+  case block.length > 1 {
+    True -> Ok(#(BlockState(..block, length: block.length - 1), reader))
+    False -> {
+      case block.type_code, block.length_code {
+        Some(type_code), Some(length_code) ->
+          perform_block_switch(reader, block, type_code, length_code)
+        _, _ -> Ok(#(BlockState(..block, length: block.length - 1), reader))
+      }
+    }
+  }
+}
+
+fn perform_block_switch(
+  reader: Reader,
+  block: BlockState,
+  type_code: PrefixCode,
+  length_code: PrefixCode,
+) -> Result(#(BlockState, Reader), error.CodecError) {
+  use #(type_symbol, reader) <- result.try(decode_prefix_symbol(
+    reader,
+    type_code,
+  ))
+  let new_type = resolve_block_type(type_symbol, block)
+  use #(length, reader) <- result.try(read_block_length(reader, length_code))
+  Ok(#(
+    BlockState(
+      ..block,
+      type_: new_type,
+      length: length,
+      rb_prev: block.rb_curr,
+      rb_curr: new_type,
+    ),
+    reader,
+  ))
+}
+
+fn resolve_block_type(symbol: Int, block: BlockState) -> Int {
+  let raw = case symbol {
+    0 -> block.rb_prev
+    1 -> int.bitwise_and(block.rb_curr + 1, 0x7FFF_FFFF)
+    n -> n - 2
+  }
+  case raw >= block.nbltypes {
+    True -> raw - block.nbltypes
+    False -> raw
   }
 }
 
