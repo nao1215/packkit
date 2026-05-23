@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- Fixed an LZW decoder width-promote off-by-one bug that injected a
+  phantom `0` byte into round trips of the 256-byte sequence
+  `[0..255]`.  The encoder pads to the 9-bit byte-block boundary
+  right after writing code 254, but the decoder's promote check used
+  `free_ent > max_code`, which fires one iteration too late given
+  LZW's classical encoder/decoder insert-pair asymmetry; the new
+  `>=` check promotes between codes 254 and 255 to match the
+  encoder.  Added regression tests at the promote boundary ±1 to
+  guard against re-introducing the bug.  See
+  [packkit/lzw.promote_decoder_width].
+- Extended `packkit/stream` to cover every codec uniformly.
+  Previously only DEFLATE, zlib, and gzip had streaming decoders;
+  added `new_lz4_decoder`, `new_snappy_decoder`, `new_bzip2_decoder`,
+  `new_lzw_decoder`, `new_xz_decoder`, `new_zstd_decoder`, and
+  `new_brotli_decoder` so the streaming surface is consistent across
+  all ten supported codecs.
+- Added metamon-driven property-based round-trip tests
+  (`test/packkit/property_test.gleam`) over every codec for arbitrary
+  `BitArray` inputs in the 0..256-byte range, plus length-preservation
+  invariants for DEFLATE and LZW.  Together with the existing
+  fixture-based round-trip tests this materially widens coverage at
+  the empty-input, single-byte, and width-promote / window
+  boundaries that have historically been failure-prone.
+- Added panic-free fuzz tests for `seven_z.decode/1`
+  (`test/packkit/seven_z_fuzz_test.gleam`) covering empty, partial
+  signature, garbage, alternating, all-zeros, all-`FF`, and counter
+  inputs so a future regression that panics on a malformed 7z stream
+  fails noisily instead of silently propagating.
 - Scaffolded the repository as a cross-target Gleam package.
 - Added an opaque-first public API skeleton for codecs, archives,
   recipes, safe entries, limits, and detection.

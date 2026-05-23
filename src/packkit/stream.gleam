@@ -9,11 +9,18 @@
 import gleam/bit_array
 import gleam/list
 import gleam/result
+import packkit/brotli
+import packkit/bzip2
 import packkit/deflate
 import packkit/error
 import packkit/gzip
 import packkit/limit
+import packkit/lz4
+import packkit/lzw
+import packkit/snappy
+import packkit/xz
 import packkit/zlib
+import packkit/zstd
 
 /// Opaque incremental decoder state.  The wrapped codec selector is
 /// kept private; callers should construct one of the `new_*_decoder`
@@ -36,6 +43,13 @@ type DecoderKind {
   Deflate
   Zlib
   Gzip
+  Lz4
+  Snappy
+  Bzip2
+  Lzw
+  Xz
+  Zstd
+  Brotli
 }
 
 /// Start a new incremental DEFLATE decoder using the default limits.
@@ -51,6 +65,43 @@ pub fn new_zlib_decoder() -> Decoder {
 /// Start a new incremental gzip decoder using the default limits.
 pub fn new_gzip_decoder() -> Decoder {
   new_decoder(Gzip, limit.default())
+}
+
+/// Start a new incremental LZ4 frame decoder using the default limits.
+pub fn new_lz4_decoder() -> Decoder {
+  new_decoder(Lz4, limit.default())
+}
+
+/// Start a new incremental Snappy (framed) decoder using the default
+/// limits.  See [packkit/snappy] for the raw-block variants.
+pub fn new_snappy_decoder() -> Decoder {
+  new_decoder(Snappy, limit.default())
+}
+
+/// Start a new incremental bzip2 decoder using the default limits.
+pub fn new_bzip2_decoder() -> Decoder {
+  new_decoder(Bzip2, limit.default())
+}
+
+/// Start a new incremental Unix `.Z` (LZW) decoder using the default
+/// limits.
+pub fn new_lzw_decoder() -> Decoder {
+  new_decoder(Lzw, limit.default())
+}
+
+/// Start a new incremental xz decoder using the default limits.
+pub fn new_xz_decoder() -> Decoder {
+  new_decoder(Xz, limit.default())
+}
+
+/// Start a new incremental zstd decoder using the default limits.
+pub fn new_zstd_decoder() -> Decoder {
+  new_decoder(Zstd, limit.default())
+}
+
+/// Start a new incremental brotli decoder using the default limits.
+pub fn new_brotli_decoder() -> Decoder {
+  new_decoder(Brotli, limit.default())
 }
 
 fn new_decoder(kind: DecoderKind, limits: limit.Limits) -> Decoder {
@@ -101,6 +152,13 @@ pub fn finish(decoder: Decoder) -> Result(BitArray, error.CodecError) {
     Gzip ->
       gzip.decode_with_limits(bytes: bytes, limits: decoder.limits)
       |> result.map(fn(decoded) { decoded.payload })
+    Lz4 -> lz4.decode_with_limits(bytes: bytes, limits: decoder.limits)
+    Snappy -> snappy.decode_with_limits(bytes: bytes, limits: decoder.limits)
+    Bzip2 -> bzip2.decode_with_limits(bytes: bytes, limits: decoder.limits)
+    Lzw -> lzw.decode_with_limits(bytes: bytes, limits: decoder.limits)
+    Xz -> xz.decode_with_limits(bytes: bytes, limits: decoder.limits)
+    Zstd -> zstd.decode_with_limits(bytes: bytes, limits: decoder.limits)
+    Brotli -> brotli.decode_with_limits(bytes: bytes, limits: decoder.limits)
   }
 }
 

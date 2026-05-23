@@ -400,8 +400,19 @@ fn decode_loop(
   }
 }
 
+/// The decoder must promote one iteration "earlier" than the encoder
+/// because of the classical LZW insertion off-by-one: encoder inserts
+/// the `(prefix, byte)` pair at the iter that writes the OLD prefix's
+/// code, while the decoder inserts `(prev_code, first_of_current_code)`
+/// at the iter that reads the current code — same final entries, but
+/// the decoder's `free_ent` lags one bump behind the encoder's view
+/// of the stream.  We check `free_ent >= max_code` so the decoder
+/// promotes between codes 254 and 255 (when the encoder pads), instead
+/// of between codes 255 and 256 (when the decoder's own free_ent would
+/// naturally exceed max_code).  Without this, a 256-unique-byte stream
+/// reads the encoder's 9-bit pad as a phantom literal code 0.
 fn promote_decoder_width(state: DecodeState, _reader: Reader) -> DecodeState {
-  case state.free_ent > state.max_code && state.n_bits < state.max_bits {
+  case state.free_ent >= state.max_code && state.n_bits < state.max_bits {
     True -> DecodeState(..state, codes_at_width: -1)
     False -> state
   }

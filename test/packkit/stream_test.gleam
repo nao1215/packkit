@@ -1,11 +1,18 @@
 import gleam/bit_array
 import gleeunit/should
+import packkit/brotli
+import packkit/bzip2
 import packkit/deflate
 import packkit/error
 import packkit/gzip
 import packkit/limit
+import packkit/lz4
+import packkit/lzw
+import packkit/snappy
 import packkit/stream
+import packkit/xz
 import packkit/zlib
+import packkit/zstd
 
 pub fn stream_deflate_matches_eager_test() -> Nil {
   let payload = <<"stream deflate fixture":utf8>>
@@ -34,6 +41,76 @@ pub fn stream_gzip_matches_eager_test() -> Nil {
   let chunks = split_in_thirds(compressed)
   let assert Ok(restored) =
     stream.decode_chunks(decoder: stream.new_gzip_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_lz4_matches_eager_test() -> Nil {
+  let payload = <<"stream lz4 fixture">>
+  let assert Ok(compressed) = lz4.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_lz4_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_snappy_matches_eager_test() -> Nil {
+  let payload = <<"stream snappy fixture">>
+  let assert Ok(compressed) = snappy.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_snappy_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_bzip2_matches_eager_test() -> Nil {
+  let payload = <<"stream bzip2 fixture">>
+  let assert Ok(compressed) = bzip2.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_bzip2_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_lzw_matches_eager_test() -> Nil {
+  let payload = <<"stream lzw fixture">>
+  let assert Ok(compressed) = lzw.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_lzw_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_xz_matches_eager_test() -> Nil {
+  let payload = <<"stream xz fixture">>
+  let assert Ok(compressed) = xz.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_xz_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_zstd_matches_eager_test() -> Nil {
+  let payload = <<"stream zstd fixture">>
+  let assert Ok(compressed) = zstd.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_zstd_decoder(), chunks: chunks)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn stream_brotli_matches_eager_test() -> Nil {
+  let payload = <<"stream brotli fixture">>
+  let assert Ok(compressed) = brotli.encode(bytes: payload)
+  let chunks = split_in_thirds(compressed)
+  let assert Ok(restored) =
+    stream.decode_chunks(decoder: stream.new_brotli_decoder(), chunks: chunks)
   restored
   |> should.equal(payload)
 }
