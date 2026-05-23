@@ -37,6 +37,7 @@ unused_exports = "off"
   "short_variable_name",
   "unused_exports",
 ]
+"test/packkit/*_fuzz_test.gleam" = ["discarded_result"]
 "src/packkit/detect.gleam" = ["deep_nesting"]
 "src/packkit/entry.gleam" = ["avoid_panic", "thrown_away_error"]
 "src/packkit/level.gleam" = ["avoid_panic"]
