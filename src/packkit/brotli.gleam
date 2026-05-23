@@ -7,14 +7,17 @@
 ////   (`ISUNCOMPRESSED` bit set) — i.e. payloads that brotli chose
 ////   not to compress.
 ////
-//// Compressed metablocks still require the full RFC 7932 machinery
-//// — context modelling, two prefix-code alphabets, and the
-//// ~120 KiB built-in static dictionary — and currently return
-//// `CodecNotImplemented`.
+//// For compressed metablocks the decoder reads the metablock header
+//// up to and including the per-block-type context modes, but does
+//// not yet decode prefix-code descriptors, context maps, or the
+//// command loop.  Those return a typed `CodecNotImplemented` error
+//// whose `feature` string names the missing stage.  The ~120 KiB
+//// RFC 7932 static dictionary is also still pending.
 
 import gleam/bit_array
 import gleam/bool
 import gleam/int
+import gleam/list
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
@@ -113,10 +116,96 @@ fn decode_one_metablock(
       })
       case is_uncompressed {
         1 -> decode_uncompressed_metablock(reader, output, mlen, limits)
-        _ ->
-          Error(error.CodecNotImplemented(
-            feature: "brotli compressed metablocks (RFC 7932 prefix codes + static dictionary)",
-          ))
+        _ -> decode_compressed_metablock(reader, output, mlen, limits)
+      }
+    }
+  }
+}
+
+// -- Compressed metablock (RFC 7932 §9.2) ------------------------------
+//
+// Only the prelude is implemented at this stage: NBLTYPES for the three
+// block categories (literal, insert-and-copy, distance), NPOSTFIX +
+// NDIRECT, and the literal context modes.  Anything further (prefix-code
+// descriptors, context maps, command loop, static dictionary) returns
+// `CodecNotImplemented` so callers see exactly which stage is missing.
+
+fn decode_compressed_metablock(
+  reader: Reader,
+  _output: BitArray,
+  _mlen: Int,
+  _limits: limit.Limits,
+) -> Result(#(BitArray, Reader), error.CodecError) {
+  use #(nbl_literal, reader) <- result.try(decode_var_len_uint8(reader))
+  use #(nbl_command, reader) <- result.try(decode_var_len_uint8(reader))
+  use #(nbl_distance, reader) <- result.try(decode_var_len_uint8(reader))
+
+  // Block switching adds a HTREE_BTYPE + HTREE_BLEN + BLEN prelude per
+  // category — we don't read those yet.
+  use _ <- result.try(reject_block_switching("literal", nbl_literal))
+  use _ <- result.try(reject_block_switching("insert-and-copy", nbl_command))
+  use _ <- result.try(reject_block_switching("distance", nbl_distance))
+
+  use #(_npostfix, reader) <- result.try(read_bits(reader, 2))
+  use #(_ndirect, reader) <- result.try(read_bits(reader, 4))
+
+  // Per RFC 7932 §7.3 the literal context mode is 2 bits per literal
+  // block type (1 entry when NBLTYPES_L == 1).
+  use #(_context_modes, _reader) <- result.try(
+    read_context_modes(reader, nbl_literal, []),
+  )
+
+  Error(error.CodecNotImplemented(
+    feature: "brotli prefix-code descriptors, context maps, and command loop (RFC 7932 §3.4–§4)",
+  ))
+}
+
+fn reject_block_switching(
+  category: String,
+  count: Int,
+) -> Result(Nil, error.CodecError) {
+  case count > 1 {
+    True ->
+      Error(error.CodecNotImplemented(
+        feature: "brotli " <> category <> " block switching (NBLTYPES > 1)",
+      ))
+    False -> Ok(Nil)
+  }
+}
+
+fn read_context_modes(
+  reader: Reader,
+  remaining: Int,
+  acc: List(Int),
+) -> Result(#(List(Int), Reader), error.CodecError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), reader))
+    _ -> {
+      use #(mode, reader) <- result.try(read_bits(reader, 2))
+      read_context_modes(reader, remaining - 1, [mode, ..acc])
+    }
+  }
+}
+
+// -- RFC 7932 §9.2 variable-length 8-bit integer -----------------------
+//
+// Encodes a number in 0..255 using 1–11 bits.  Used for NBLTYPES,
+// NTREES, and other small population counts.
+fn decode_var_len_uint8(
+  reader: Reader,
+) -> Result(#(Int, Reader), error.CodecError) {
+  use #(first, reader) <- result.try(read_bits(reader, 1))
+  case first {
+    0 -> Ok(#(1, reader))
+    _ -> {
+      use #(triple, reader) <- result.try(read_bits(reader, 3))
+      case triple {
+        0 -> Ok(#(2, reader))
+        n -> {
+          use #(extra, reader) <- result.try(read_bits(reader, n))
+          let base = int.bitwise_shift_left(1, n)
+          Ok(#(base + extra + 1, reader))
+        }
       }
     }
   }
@@ -165,21 +254,42 @@ fn decode_uncompressed_metablock(
 
 // -- WBITS prefix ------------------------------------------------------
 
+/// Read the WBITS prefix per RFC 7932 §9.1.  The encoding is:
+///
+/// * `0` → 16
+/// * `1nnn` where `nnn ≠ 000` → 17 + nnn (range 18..24)
+/// * `1000 nnn` where `nnn ≠ 000` and `nnn ≠ 001` → 8 + nnn (range 10..15)
+/// * `1000 000` → 17
+/// * `1000 001` → reserved / large-window indicator (not supported)
 fn read_wbits(reader: Reader) -> Result(#(Int, Reader), error.CodecError) {
   use #(first, reader) <- result.try(read_bits(reader, 1))
   case first {
     0 -> Ok(#(16, reader))
-    _ -> {
-      use #(triple, reader) <- result.try(read_bits(reader, 3))
-      case triple {
-        0 -> {
-          use #(extra, reader) <- result.try(read_bits(reader, 3))
-          Ok(#(17 + extra, reader))
-        }
-        n if n < 4 -> Ok(#(10 + n + 1, reader))
-        n -> Ok(#(17 + n, reader))
-      }
-    }
+    _ -> read_wbits_after_lead(reader)
+  }
+}
+
+fn read_wbits_after_lead(
+  reader: Reader,
+) -> Result(#(Int, Reader), error.CodecError) {
+  use #(triple, reader) <- result.try(read_bits(reader, 3))
+  case triple {
+    0 -> read_wbits_short_range(reader)
+    n -> Ok(#(17 + n, reader))
+  }
+}
+
+fn read_wbits_short_range(
+  reader: Reader,
+) -> Result(#(Int, Reader), error.CodecError) {
+  use #(extra, reader) <- result.try(read_bits(reader, 3))
+  case extra {
+    0 -> Ok(#(17, reader))
+    1 ->
+      Error(error.CodecInvalidData(
+        message: "brotli large-window WBITS prefix is not supported",
+      ))
+    n -> Ok(#(8 + n, reader))
   }
 }
 
