@@ -37,6 +37,7 @@ import gleam/list
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
+import packkit/internal/brotli_context as brotli_ctx
 import packkit/internal/brotli_dictionary as brotli_dict
 import packkit/internal/brotli_transform as brotli_xfm
 import packkit/limit
@@ -171,8 +172,6 @@ fn decode_compressed_metablock(
   use #(nbl_command, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_distance, reader) <- result.try(decode_var_len_uint8(reader))
 
-  // Block switching adds a HTREE_BTYPE + HTREE_BLEN + BLEN prelude per
-  // category — we don't read those yet.
   use _ <- result.try(reject_block_switching("literal", nbl_literal))
   use _ <- result.try(reject_block_switching("insert-and-copy", nbl_command))
   use _ <- result.try(reject_block_switching("distance", nbl_distance))
@@ -181,21 +180,24 @@ fn decode_compressed_metablock(
   use #(ndirect_code, reader) <- result.try(read_bits(reader, 4))
   let ndirect = int.bitwise_shift_left(ndirect_code, npostfix)
 
-  // Per RFC 7932 §7.3 the literal context mode is 2 bits per literal
-  // block type (1 entry when NBLTYPES_L == 1).
-  use #(_context_modes, reader) <- result.try(
+  use #(context_modes, reader) <- result.try(
     read_context_modes(reader, nbl_literal, []),
   )
 
-  // RFC 7932 §9.2: NTREESL precedes the literal context map (which is
-  // emitted only when NTREESL ≥ 2).  Same shape for distances.
   use #(ntrees_literal, reader) <- result.try(decode_var_len_uint8(reader))
-  use _ <- result.try(reject_context_map("literal", ntrees_literal))
+  use #(literal_context_map, reader) <- result.try(decode_context_map(
+    reader,
+    ntrees_literal,
+    nbl_literal * 64,
+  ))
 
   use #(ntrees_distance, reader) <- result.try(decode_var_len_uint8(reader))
-  use _ <- result.try(reject_context_map("distance", ntrees_distance))
+  use #(distance_context_map, reader) <- result.try(decode_context_map(
+    reader,
+    ntrees_distance,
+    nbl_distance * 4,
+  ))
 
-  // §3.3 alphabet sizes.
   let literal_alphabet = 256
   let command_alphabet = 704
   let distance_alphabet = 16 + ndirect + int.bitwise_shift_left(48, npostfix)
@@ -222,24 +224,37 @@ fn decode_compressed_metablock(
     ),
   )
 
-  let assert [literal_code, ..] = literal_codes
-  let assert [command_code, ..] = command_codes
-  let assert [distance_code, ..] = distance_codes
-
+  let pos = bit_array.byte_size(output)
   let state =
     CommandState(
       output: output,
       ring: ring,
       remaining: mlen,
-      literal: literal_code,
-      command: command_code,
-      distance: distance_code,
+      literal_codes: literal_codes,
+      command_codes: command_codes,
+      distance_codes: distance_codes,
       npostfix: npostfix,
       ndirect: ndirect,
+      context_modes: context_modes,
+      literal_context_map: literal_context_map,
+      distance_context_map: distance_context_map,
+      prev1: byte_at_or_zero(output, pos - 1),
+      prev2: byte_at_or_zero(output, pos - 2),
       limits: limits,
     )
   use #(new_output, new_ring, reader) <- result.try(run_commands(reader, state))
   Ok(#(new_output, new_ring, reader))
+}
+
+fn byte_at_or_zero(bytes: BitArray, idx: Int) -> Int {
+  case idx < 0 {
+    True -> 0
+    False ->
+      case bit_array.slice(bytes, idx, 1) {
+        Ok(<<b>>) -> b
+        _ -> 0
+      }
+  }
 }
 
 // -- Distance ring buffer (RFC 7932 §4) --------------------------------
@@ -305,11 +320,22 @@ type CommandState {
     output: BitArray,
     ring: DistRing,
     remaining: Int,
-    literal: PrefixCode,
-    command: PrefixCode,
-    distance: PrefixCode,
+    literal_codes: List(PrefixCode),
+    command_codes: List(PrefixCode),
+    distance_codes: List(PrefixCode),
     npostfix: Int,
     ndirect: Int,
+    context_modes: List(Int),
+    /// `nbl_literal × 64` entries (or empty when NTREESL = 1).  Indexed
+    /// by `block_type_l × 64 + literal_context_id`.
+    literal_context_map: BitArray,
+    /// `nbl_distance × 4` entries (or empty when NTREESD = 1).  Indexed
+    /// by `block_type_d × 4 + distance_context`.
+    distance_context_map: BitArray,
+    /// Most recent literal byte (for context computation).
+    prev1: Int,
+    /// Second-most-recent literal byte.
+    prev2: Int,
     limits: limit.Limits,
   )
 }
@@ -321,7 +347,8 @@ fn run_commands(
   case state.remaining <= 0 {
     True -> Ok(#(state.output, state.ring, reader))
     False -> {
-      use #(cmd, reader) <- result.try(decode_command(reader, state.command))
+      let assert [command_tree, ..] = state.command_codes
+      use #(cmd, reader) <- result.try(decode_command(reader, command_tree))
       use #(state, reader) <- result.try(emit_literals(
         reader,
         state,
@@ -378,9 +405,14 @@ fn decode_distance_value(
       Ok(#(distance, False, reader))
     }
     _ -> {
+      let distance_tree =
+        pick_tree_by_index(
+          state.distance_codes,
+          select_distance_tree_idx(state, cmd.distance_context),
+        )
       use #(code, reader) <- result.try(decode_prefix_symbol(
         reader,
-        state.distance,
+        distance_tree,
       ))
       case code < 16 {
         True -> {
@@ -485,13 +517,13 @@ fn in_window_copy(
       value: projected,
     )),
   )
-  Ok(
+  Ok(refresh_prev_bytes(
     CommandState(
       ..state,
       output: new_output,
       remaining: state.remaining - actual,
     ),
-  )
+  ))
 }
 
 /// Resolve a copy whose distance exceeds the current output position
@@ -549,13 +581,13 @@ fn dictionary_copy(
       value: projected,
     )),
   )
-  Ok(
+  Ok(refresh_prev_bytes(
     CommandState(
       ..state,
       output: new_output,
       remaining: state.remaining - truncated_len,
     ),
-  )
+  ))
 }
 
 /// LZ77-style self-overlapping copy: emit `count` bytes by reading
@@ -592,10 +624,9 @@ fn emit_literals_loop(
   case remaining {
     0 -> Ok(#(state, reader))
     _ -> {
-      use #(byte, reader) <- result.try(decode_prefix_symbol(
-        reader,
-        state.literal,
-      ))
+      let tree =
+        pick_tree_by_index(state.literal_codes, select_literal_tree_idx(state))
+      use #(byte, reader) <- result.try(decode_prefix_symbol(reader, tree))
       let projected = bit_array.byte_size(state.output) + 1
       use <- bool.guard(
         when: projected > limit.max_output_bytes(state.limits),
@@ -609,10 +640,59 @@ fn emit_literals_loop(
           ..state,
           output: <<state.output:bits, byte>>,
           remaining: state.remaining - 1,
+          prev2: state.prev1,
+          prev1: byte,
         )
       emit_literals_loop(reader, new_state, remaining - 1)
     }
   }
+}
+
+// -- Context-driven tree selection (RFC 7932 §7.3) ---------------------
+
+fn select_literal_tree_idx(state: CommandState) -> Int {
+  let context_mode = case state.context_modes {
+    [m, ..] -> m
+    [] -> 0
+  }
+  let ctx = brotli_ctx.context_id(context_mode, state.prev1, state.prev2)
+  // block_type_l = 0 since NBLTYPES_L = 1.
+  case bit_array.byte_size(state.literal_context_map) {
+    0 -> 0
+    _ -> byte_at_or_zero(state.literal_context_map, ctx)
+  }
+}
+
+fn select_distance_tree_idx(state: CommandState, distance_context: Int) -> Int {
+  // block_type_d = 0 since NBLTYPES_D = 1.
+  case bit_array.byte_size(state.distance_context_map) {
+    0 -> 0
+    _ -> byte_at_or_zero(state.distance_context_map, distance_context)
+  }
+}
+
+fn pick_tree_by_index(trees: List(PrefixCode), idx: Int) -> PrefixCode {
+  case trees, idx {
+    [head, ..], 0 -> head
+    [_, ..tail], _ -> pick_tree_by_index(tail, idx - 1)
+    [], _ -> {
+      let assert [head, ..] = trees
+      head
+    }
+  }
+}
+
+// -- Update copy bookkeeping with `prev1`/`prev2` from the tail of the
+//    copy or dictionary insert.  Called by `in_window_copy` and
+//    `dictionary_copy` after the output buffer has grown.
+
+fn refresh_prev_bytes(state: CommandState) -> CommandState {
+  let pos = bit_array.byte_size(state.output)
+  CommandState(
+    ..state,
+    prev1: byte_at_or_zero(state.output, pos - 1),
+    prev2: byte_at_or_zero(state.output, pos - 2),
+  )
 }
 
 // -- Insert-and-copy alphabet (RFC 7932 §5 / brotli `kCmdLut`) ---------
@@ -793,18 +873,170 @@ fn reject_block_switching(
   }
 }
 
-fn reject_context_map(
-  category: String,
+/// Decode a context map per RFC 7932 §7.3.  When `ntrees == 1` the
+/// map is implicitly all zeros and no bits are read.  Otherwise:
+///
+/// 1. Read 1 bit.  If 1, read 4 more bits to compute `RLEMAX = bits + 1`
+///    (range 1..16).  If 0, `RLEMAX = 0`.
+/// 2. Read a prefix code for the alphabet of size `ntrees + RLEMAX`.
+/// 3. Decode `size` entries:
+///    * `code == 0` → emit a 0
+///    * `code > RLEMAX` → emit `code - RLEMAX`
+///    * `1 <= code <= RLEMAX` → read `code` extra bits; reps
+///      = extra + (1 << code); emit that many zeros
+/// 4. Read 1 bit.  If 1, apply inverse-move-to-front transform.
+fn decode_context_map(
+  reader: Reader,
   ntrees: Int,
-) -> Result(Nil, error.CodecError) {
-  case ntrees > 1 {
-    True ->
-      Error(error.CodecNotImplemented(
-        feature: "brotli "
-        <> category
-        <> " context map decoding (NTREES > 1, RFC 7932 §7.3)",
-      ))
-    False -> Ok(Nil)
+  size: Int,
+) -> Result(#(BitArray, Reader), error.CodecError) {
+  case ntrees <= 1 {
+    True -> Ok(#(byte_repeat(0, size), reader))
+    False -> decode_nontrivial_context_map(reader, ntrees, size)
+  }
+}
+
+fn decode_nontrivial_context_map(
+  reader: Reader,
+  ntrees: Int,
+  size: Int,
+) -> Result(#(BitArray, Reader), error.CodecError) {
+  use #(use_rle, reader) <- result.try(read_bits(reader, 1))
+  use #(rlemax, reader) <- result.try(case use_rle {
+    0 -> Ok(#(0, reader))
+    _ -> {
+      use #(extra, reader) <- result.try(read_bits(reader, 4))
+      Ok(#(extra + 1, reader))
+    }
+  })
+  let alphabet_size = ntrees + rlemax
+  use #(code, reader) <- result.try(decode_prefix_code(
+    reader,
+    alphabet_size,
+    "context-map",
+  ))
+  use #(entries, reader) <- result.try(
+    decode_context_map_entries(reader, code, rlemax, size, []),
+  )
+  use #(imtf_flag, reader) <- result.try(read_bits(reader, 1))
+  let entries = case imtf_flag {
+    0 -> entries
+    _ -> imtf(entries)
+  }
+  Ok(#(bytes_from_int_list(entries), reader))
+}
+
+fn decode_context_map_entries(
+  reader: Reader,
+  code: PrefixCode,
+  rlemax: Int,
+  remaining: Int,
+  acc: List(Int),
+) -> Result(#(List(Int), Reader), error.CodecError) {
+  case remaining {
+    n if n <= 0 -> Ok(#(list.reverse(acc), reader))
+    _ -> step_context_map_entry(reader, code, rlemax, remaining, acc)
+  }
+}
+
+fn step_context_map_entry(
+  reader: Reader,
+  code: PrefixCode,
+  rlemax: Int,
+  remaining: Int,
+  acc: List(Int),
+) -> Result(#(List(Int), Reader), error.CodecError) {
+  use #(symbol, reader) <- result.try(decode_prefix_symbol(reader, code))
+  case symbol == 0 || symbol > rlemax {
+    True -> {
+      let value = symbol_to_value(symbol, rlemax)
+      decode_context_map_entries(reader, code, rlemax, remaining - 1, [
+        value,
+        ..acc
+      ])
+    }
+    False -> {
+      // 1 ≤ symbol ≤ rlemax: zero-run.
+      use #(extra, reader) <- result.try(read_bits(reader, symbol))
+      let reps = extra + int.bitwise_shift_left(1, symbol)
+      use <- bool.guard(
+        when: reps > remaining,
+        return: Error(error.CodecInvalidData(
+          message: "brotli context-map zero run overruns map size",
+        )),
+      )
+      decode_context_map_entries(
+        reader,
+        code,
+        rlemax,
+        remaining - reps,
+        prepend_zeros(reps, acc),
+      )
+    }
+  }
+}
+
+fn symbol_to_value(symbol: Int, rlemax: Int) -> Int {
+  case symbol {
+    0 -> 0
+    _ -> symbol - rlemax
+  }
+}
+
+fn prepend_zeros(n: Int, acc: List(Int)) -> List(Int) {
+  case n {
+    0 -> acc
+    _ -> prepend_zeros(n - 1, [0, ..acc])
+  }
+}
+
+fn bytes_from_int_list(values: List(Int)) -> BitArray {
+  list.fold(values, <<>>, fn(acc, v) { <<acc:bits, v>> })
+}
+
+fn byte_repeat(byte: Int, count: Int) -> BitArray {
+  byte_repeat_loop(byte, count, <<>>)
+}
+
+fn byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    n if n <= 0 -> acc
+    _ -> byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
+// -- Inverse Move-to-Front transform (RFC 7932 §7.3) -------------------
+
+/// Apply IMTF to a list of byte indices.  Initial table is [0..255].
+/// For each index `i`: emit `table[i]`, then move that value to the
+/// front (shifting earlier entries one place back).
+fn imtf(input: List(Int)) -> List(Int) {
+  imtf_loop(input, init_mtf(255, []), [])
+}
+
+fn init_mtf(n: Int, acc: List(Int)) -> List(Int) {
+  case n < 0 {
+    True -> acc
+    False -> init_mtf(n - 1, [n, ..acc])
+  }
+}
+
+fn imtf_loop(input: List(Int), table: List(Int), output: List(Int)) -> List(Int) {
+  case input {
+    [] -> list.reverse(output)
+    [idx, ..rest] -> {
+      let value = mtf_value_at(table, idx)
+      let new_table = [value, ..list.filter(table, fn(v) { v != value })]
+      imtf_loop(rest, new_table, [value, ..output])
+    }
+  }
+}
+
+fn mtf_value_at(table: List(Int), idx: Int) -> Int {
+  case table, idx {
+    [head, ..], 0 -> head
+    [_, ..tail], _ -> mtf_value_at(tail, idx - 1)
+    [], _ -> 0
   }
 }
 

@@ -139,3 +139,4 @@ unused_exports = "off"
   "discarded_result",
   "prefer_guard_clause",
 ]
+"src/packkit/internal/brotli_context.gleam" = ["assert_ok_pattern"]
