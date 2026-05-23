@@ -134,3 +134,8 @@ unused_exports = "off"
   "short_variable_name",
   "thrown_away_error",
 ]
+"src/packkit/internal/brotli_transform.gleam" = [
+  "assert_ok_pattern",
+  "discarded_result",
+  "prefer_guard_clause",
+]

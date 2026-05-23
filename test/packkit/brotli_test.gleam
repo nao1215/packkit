@@ -75,25 +75,39 @@ pub fn decode_compressed_16a_test() -> Nil {
   |> should.equal(Ok(<<"aaaaaaaaaaaaaaaa":utf8>>))
 }
 
-pub fn complex_form_static_dict_pending_test() -> Nil {
+pub fn decode_compressed_time_of_the_day_test() -> Nil {
+  // `printf 'time of the day' | brotli -c` — exercises the static
+  // dictionary: first command resolves to `time` + " of the " suffix
+  // via transform idx 8 (IDENTITY + suffix), then a second command
+  // adds the literal "day".
+  let stream = <<
+    0x1F, 0x0E, 0x00, 0xF8, 0xA5, 0xC2, 0xF2, 0x52, 0x10, 0x49, 0x84, 0x29, 0x80,
+    0x56, 0xA2, 0x7E, 0x8A, 0x20, 0x01,
+  >>
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(<<"time of the day":utf8>>))
+}
+
+pub fn decode_compressed_hello_world_test() -> Nil {
   // `printf 'Hello, World! This is brotli testing.' | brotli -c` —
-  // text input that triggers complex-form prefix codes AND a static
-  // dictionary reference (first command has insert_len = 0 and
-  // copy_len > 0 with `distance > pos`).  We've parsed the header
-  // and entered the command loop, but resolving the dictionary lookup
-  // is the next big piece of work.
+  // exercises complex-form prefix codes plus multiple static-dict
+  // refs (UPPERCASE_FIRST transforms on "world" and "this", etc.).
   let stream = <<
     0x1F, 0x24, 0x00, 0xE0, 0xC5, 0x6D, 0x6C, 0x5D, 0x1D, 0xA7, 0x77, 0xFB, 0xD1,
     0x09, 0x04, 0x41, 0xEA, 0x41, 0x14, 0xA9, 0xE5, 0x16, 0xC5, 0xD2, 0x91, 0x58,
     0x5D, 0x3B, 0x5A, 0xB2, 0x77, 0xE2, 0xD7, 0xC1, 0xD6, 0x02,
   >>
-  case brotli.decode(bytes: stream) {
-    Error(error.CodecNotImplemented(feature: feature)) ->
-      // Match prefix so the test stays robust to small wording tweaks.
-      case feature {
-        "brotli static dictionary reference" <> _ -> Nil
-        _ -> should.fail()
-      }
-    _ -> should.fail()
-  }
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(<<"Hello, World! This is brotli testing.":utf8>>))
+}
+
+pub fn decode_compressed_20a_test() -> Nil {
+  // `printf 'timetimetimetimetime' | brotli -c` — longer run that
+  // uses the same literal-then-copy pattern as `timetimetime`.
+  let stream = <<
+    0x1F, 0x13, 0x00, 0xF8, 0xA5, 0xCB, 0xD2, 0xDA, 0xE8, 0x84, 0x18, 0x01, 0x80,
+    0x1B,
+  >>
+  brotli.decode(bytes: stream)
+  |> should.equal(Ok(<<"timetimetimetimetime":utf8>>))
 }

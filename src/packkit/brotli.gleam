@@ -1,23 +1,34 @@
-//// Brotli codec — partial pure-Gleam decoder.
+//// Brotli codec — pure-Gleam decoder.
 ////
-//// The decoder currently handles:
+//// Decodes RFC 7932 brotli streams whose metablocks use a single
+//// block type for each of the literal, insert-and-copy, and
+//// distance categories (i.e. `NBLTYPES = 1` and `NTREES = 1` for
+//// both literal and distance categories — the case brotli's stock
+//// encoder emits for the overwhelming majority of inputs).  Within
+//// that envelope it handles:
 ////
 //// * The canonical empty stream `0x3F`.
-//// * Any stream that uses only uncompressed metablocks
+//// * Any stream that uses uncompressed metablocks
 ////   (`ISUNCOMPRESSED` bit set).
-//// * Compressed metablocks whose copies stay inside the sliding
-////   window — full header (NBLTYPES, NPOSTFIX, NDIRECT, context
-////   modes, NTREES, both simple and complex prefix-code
-////   descriptors) is parsed, the I+C alphabet is decoded into
-////   `(insert_len, copy_len, distance)` per command, and literals
-////   are emitted from the literal prefix code while distances pull
-////   from a 4-entry recent-distance ring buffer.
+//// * Compressed metablocks with both simple-form (RFC 7932 §3.4)
+////   and complex-form (§3.5) prefix-code descriptors.
+//// * The command loop (§4): insert-and-copy alphabet → literals
+////   from the literal prefix code → distance code → LZ77 copy from
+////   the sliding window, with the 4-entry recent-distance ring
+////   buffer.
+//// * Static-dictionary references (§8): any command whose
+////   resolved distance exceeds the current output position falls
+////   back to the embedded 122 KiB dictionary, with the prefix /
+////   suffix / `OMIT_FIRST` / `OMIT_LAST` / `UPPERCASE_FIRST` /
+////   `UPPERCASE_ALL` transforms applied per `transform_idx`.
 ////
 //// What still returns a typed `CodecNotImplemented`:
 ////
-//// * Block switching (NBLTYPES > 1) and context maps (NTREES > 1).
-//// * Distance references into the ~120 KiB RFC 7932 static
-////   dictionary (any command with `distance > pos`).
+//// * Block switching (NBLTYPES > 1).
+//// * Context maps (NTREES > 1) for the literal or distance trees.
+//// * The `SHIFT_FIRST` / `SHIFT_ALL` transforms used by the shared-
+////   dictionary extension (the basic RFC 7932 transform set never
+////   selects them).
 
 import gleam/bit_array
 import gleam/bool
@@ -26,6 +37,8 @@ import gleam/list
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
+import packkit/internal/brotli_dictionary as brotli_dict
+import packkit/internal/brotli_transform as brotli_xfm
 import packkit/limit
 
 /// Brotli codec smart constructor.
@@ -327,116 +340,104 @@ fn execute_copy_step(
   state: CommandState,
   cmd: Command,
 ) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
-  use #(distance_code, reader) <- result.try(case cmd.distance_code {
-    -1 -> Ok(#(0, reader))
-    _ -> decode_prefix_symbol(reader, state.distance)
-  })
-  use #(distance, ring) <- result.try(resolve_distance(
-    distance_code,
-    state.ring,
-    state.npostfix,
-    state.ndirect,
-    cmd.distance_code,
+  use #(distance, push_to_ring, reader) <- result.try(decode_distance_value(
+    reader,
+    state,
+    cmd,
   ))
-  use #(distance, ring, reader) <- result.try(
-    case cmd.distance_code != -1 && distance_code >= 16 + state.ndirect {
-      True ->
-        apply_long_distance(
-          reader,
-          distance_code,
-          state.npostfix,
-          state.ndirect,
-          state.ring,
-        )
-      False -> Ok(#(distance, ring, reader))
-    },
-  )
+  let pos = bit_array.byte_size(state.output)
+  let is_dict_ref = distance > pos
+  let ring = case push_to_ring && !is_dict_ref {
+    True -> ring_push(state.ring, distance)
+    False -> state.ring
+  }
   let state = CommandState(..state, ring: ring)
-  use state <- result.try(perform_copy(state, distance, cmd.copy_len))
+  use state <- result.try(perform_copy(state, distance, cmd.copy_len, pos))
   run_commands(reader, state)
 }
 
-/// `resolve_distance` handles the short-code (0..15) path and direct
-/// codes.  Long codes need additional extra-bits reads and are routed
-/// through `apply_long_distance` after this call.
-fn resolve_distance(
-  distance_code: Int,
-  ring: DistRing,
-  _npostfix: Int,
-  ndirect: Int,
-  reuse_marker: Int,
-) -> Result(#(Int, DistRing), error.CodecError) {
-  case reuse_marker {
-    -1 -> {
-      // Implicit reuse of the most recent distance (no code read).
-      let distance = ring_get(ring, ring.idx - 1)
-      Ok(#(distance, ring))
+/// Decode the command's distance and report whether normal in-window
+/// copies should push it onto the ring buffer.  Matches brotli's
+/// `kCmdLut[].distance_code` convention:
+///
+/// * `0` — implicit reuse: take the most-recent distance from the
+///   ring buffer and DO NOT advance it (the slot already holds that
+///   value).  Used when the I+C `cell_idx < 2`.
+/// * `-1` — read a distance code from the distance prefix tree and
+///   resolve it via short-code, direct, or long-code paths.  Used
+///   when the I+C `cell_idx ≥ 2`.
+fn decode_distance_value(
+  reader: Reader,
+  state: CommandState,
+  cmd: Command,
+) -> Result(#(Int, Bool, Reader), error.CodecError) {
+  case cmd.distance_code {
+    0 -> {
+      // Implicit reuse — no distance bits in the stream.
+      let distance = ring_get(state.ring, state.ring.idx - 1)
+      Ok(#(distance, False, reader))
     }
-    _ ->
-      case distance_code < 16 {
-        True -> Ok(short_distance(distance_code, ring))
+    _ -> {
+      use #(code, reader) <- result.try(decode_prefix_symbol(
+        reader,
+        state.distance,
+      ))
+      case code < 16 {
+        True -> {
+          let #(distance, push) = short_distance(code, state.ring)
+          Ok(#(distance, push, reader))
+        }
         False ->
-          case distance_code < 16 + ndirect {
-            True -> {
-              let distance = distance_code - 15
-              Ok(#(distance, ring_push(ring, distance)))
-            }
-            // Long code — caller fills in via apply_long_distance.
-            False -> Ok(#(0, ring))
+          case code < 16 + state.ndirect {
+            True -> Ok(#(code - 15, True, reader))
+            False ->
+              apply_long_distance(reader, code, state.npostfix, state.ndirect)
           }
       }
+    }
   }
 }
 
-fn short_distance(code: Int, ring: DistRing) -> #(Int, DistRing) {
+fn short_distance(code: Int, ring: DistRing) -> #(Int, Bool) {
   case code <= 3 {
     True -> {
-      let dist_context = case code {
-        0 -> 1
-        _ -> 0
-      }
+      // Codes 0..3 read the kᵗʰ-most-recent distance.  Code 0 reuses
+      // the slot the ring already holds, so we skip the ring push.
       let offset = code - 3
-      let slot = ring.idx - offset
-      let distance = ring_get(ring, slot)
-      // Per RFC 7932 §4: rb_idx -= distance_context, then ring_push
-      // (which re-increments).  Net for code 0: no change; for codes
-      // 1..3: the reused distance becomes the new most recent.
-      let ring = DistRing(..ring, idx: ring.idx - dist_context)
-      #(distance, ring_push(ring, distance))
+      let distance = ring_get(ring, ring.idx - offset)
+      #(distance, code != 0)
     }
     False -> {
-      // Codes 4..15: 6 derived offsets from ring[0] or ring[3].
+      // Codes 4..15: six derived offsets from ring[0] or ring[3].
       // delta table from C `0x605142` packed-nibble lookup.
       let #(base, index_delta) = case code < 10 {
         True -> #(code - 4, 3)
         False -> #(code - 10, 2)
       }
-      let nibbles = 0x605142
       let pre_delta =
-        int.bitwise_and(int.bitwise_shift_right(nibbles, 4 * base), 0xF)
+        int.bitwise_and(int.bitwise_shift_right(0x60_5142, 4 * base), 0xF)
       let delta = pre_delta - 3
-      let slot = ring.idx + index_delta
-      let distance = ring_get(ring, slot) + delta
-      #(distance, ring_push(ring, distance))
+      let distance = ring_get(ring, ring.idx + index_delta) + delta
+      #(distance, True)
     }
   }
 }
 
 /// Long-distance branch: read `extra_bits` extra bits and combine with
-/// the per-code base offset.  Pushes the result onto the supplied
-/// ring buffer.
+/// the per-code base offset.  Returns `push_to_ring = True`; the
+/// caller suppresses the push if the resolved distance turns out to
+/// be a static-dictionary reference.
 fn apply_long_distance(
   reader: Reader,
   distance_code: Int,
   npostfix: Int,
   ndirect: Int,
-  ring: DistRing,
-) -> Result(#(Int, DistRing, Reader), error.CodecError) {
+) -> Result(#(Int, Bool, Reader), error.CodecError) {
   let #(extra_bits, base) =
     long_distance_params(distance_code, npostfix, ndirect)
   use #(extra, reader) <- result.try(read_bits(reader, extra_bits))
   let distance = base + int.bitwise_shift_left(extra, npostfix)
-  Ok(#(distance, ring_push(ring, distance), reader))
+  Ok(#(distance, True, reader))
 }
 
 /// Per RFC 7932 §4 the long-distance code group `g` (counting from 0)
@@ -460,36 +461,101 @@ fn perform_copy(
   state: CommandState,
   distance: Int,
   copy_len: Int,
+  pos: Int,
 ) -> Result(CommandState, error.CodecError) {
-  let pos = bit_array.byte_size(state.output)
   case distance > pos {
-    True ->
-      Error(error.CodecNotImplemented(
-        feature: "brotli static dictionary reference (RFC 7932 §8) — distance "
-        <> int.to_string(distance)
-        <> " > output position "
-        <> int.to_string(pos),
-      ))
+    True -> dictionary_copy(state, distance, copy_len, pos)
+    False -> in_window_copy(state, distance, copy_len, pos)
+  }
+}
+
+fn in_window_copy(
+  state: CommandState,
+  distance: Int,
+  copy_len: Int,
+  pos: Int,
+) -> Result(CommandState, error.CodecError) {
+  let actual = int.min(copy_len, state.remaining)
+  let new_output = lz77_copy(state.output, distance, actual, pos)
+  let projected = bit_array.byte_size(new_output)
+  use <- bool.guard(
+    when: projected > limit.max_output_bytes(state.limits),
+    return: Error(error.CodecLimitExceeded(
+      limit: "max_output_bytes",
+      value: projected,
+    )),
+  )
+  Ok(
+    CommandState(
+      ..state,
+      output: new_output,
+      remaining: state.remaining - actual,
+    ),
+  )
+}
+
+/// Resolve a copy whose distance exceeds the current output position
+/// against the RFC 7932 §8 static dictionary.  `address = distance -
+/// pos - 1` is split into a word index (low `size_bits(copy_len)`
+/// bits) and a transform index (the rest).  The selected dictionary
+/// word is run through the chosen transform — which may add a prefix
+/// or suffix, omit characters at either end, or uppercase part of the
+/// word — and the resulting bytes are appended to the output.
+fn dictionary_copy(
+  state: CommandState,
+  distance: Int,
+  copy_len: Int,
+  pos: Int,
+) -> Result(CommandState, error.CodecError) {
+  let shift = brotli_dict.size_bits(copy_len)
+  use <- bool.guard(
+    when: shift == 0,
+    return: Error(error.CodecInvalidData(
+      message: "brotli dictionary reference at length "
+      <> int.to_string(copy_len)
+      <> " (valid range 4..24)",
+    )),
+  )
+  let address = distance - pos - 1
+  let mask = int.bitwise_shift_left(1, shift) - 1
+  let word_idx = int.bitwise_and(address, mask)
+  let transform_idx = int.bitwise_shift_right(address, shift)
+  use <- bool.guard(
+    when: transform_idx >= brotli_xfm.num_transforms,
+    return: Error(error.CodecInvalidData(
+      message: "brotli dictionary transform index "
+      <> int.to_string(transform_idx)
+      <> " out of range",
+    )),
+  )
+  let dict_offset = brotli_dict.offset(copy_len) + word_idx * copy_len
+  let assert Ok(word) = bit_array.slice(brotli_dict.data, dict_offset, copy_len)
+  let transformed = brotli_xfm.apply(word, transform_idx)
+  let transformed_len = bit_array.byte_size(transformed)
+  let truncated_len = int.min(transformed_len, state.remaining)
+  let actual_bytes = case truncated_len == transformed_len {
+    True -> transformed
     False -> {
-      let actual = int.min(copy_len, state.remaining)
-      let new_output = lz77_copy(state.output, distance, actual, pos)
-      let projected = bit_array.byte_size(new_output)
-      use <- bool.guard(
-        when: projected > limit.max_output_bytes(state.limits),
-        return: Error(error.CodecLimitExceeded(
-          limit: "max_output_bytes",
-          value: projected,
-        )),
-      )
-      Ok(
-        CommandState(
-          ..state,
-          output: new_output,
-          remaining: state.remaining - actual,
-        ),
-      )
+      let assert Ok(slice) = bit_array.slice(transformed, 0, truncated_len)
+      slice
     }
   }
+  let new_output = bit_array.concat([state.output, actual_bytes])
+  let projected = bit_array.byte_size(new_output)
+  use <- bool.guard(
+    when: projected > limit.max_output_bytes(state.limits),
+    return: Error(error.CodecLimitExceeded(
+      limit: "max_output_bytes",
+      value: projected,
+    )),
+  )
+  Ok(
+    CommandState(
+      ..state,
+      output: new_output,
+      remaining: state.remaining - truncated_len,
+    ),
+  )
 }
 
 /// LZ77-style self-overlapping copy: emit `count` bytes by reading
