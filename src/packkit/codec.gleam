@@ -1,6 +1,23 @@
 import gleam/option.{type Option, None, Some}
 import packkit/level
 
+/// Pattern-matchable tag identifying the codec family.  `Codec` itself
+/// is still opaque; this transparent enum is the internal taxonomy the
+/// facade uses for compile-time-checked dispatch.
+pub type CodecKind {
+  Identity
+  Deflate
+  Zlib
+  Gzip
+  Lz4
+  Snappy
+  Bzip2
+  Lzw
+  Xz
+  Zstd
+  Brotli
+}
+
 /// Preset dictionary bytes used by codecs that support them.
 pub opaque type Dictionary {
   Dictionary(bytes: BitArray)
@@ -9,7 +26,7 @@ pub opaque type Dictionary {
 /// Opaque byte-to-byte codec configuration.
 pub opaque type Codec {
   Codec(
-    name: String,
+    kind: CodecKind,
     level: Option(level.Level),
     dictionary: Option(Dictionary),
   )
@@ -17,59 +34,59 @@ pub opaque type Codec {
 
 /// No-op codec useful for testing and raw recipe assembly.
 pub fn identity() -> Codec {
-  Codec(name: "identity", level: None, dictionary: None)
+  Codec(kind: Identity, level: None, dictionary: None)
 }
 
 /// Gzip wrapper over deflate.
 pub fn gzip() -> Codec {
-  Codec(name: "gzip", level: Some(level.default()), dictionary: None)
+  Codec(kind: Gzip, level: Some(level.default()), dictionary: None)
 }
 
 /// Zlib wrapper over deflate.
 pub fn zlib() -> Codec {
-  Codec(name: "zlib", level: Some(level.default()), dictionary: None)
+  Codec(kind: Zlib, level: Some(level.default()), dictionary: None)
 }
 
 /// Raw deflate stream.
 pub fn deflate() -> Codec {
-  Codec(name: "deflate", level: Some(level.default()), dictionary: None)
+  Codec(kind: Deflate, level: Some(level.default()), dictionary: None)
 }
 
 /// LZ4 frame format.
 pub fn lz4() -> Codec {
-  Codec(name: "lz4", level: None, dictionary: None)
+  Codec(kind: Lz4, level: None, dictionary: None)
 }
 
 /// Snappy framed format.
 pub fn snappy() -> Codec {
-  Codec(name: "snappy", level: None, dictionary: None)
+  Codec(kind: Snappy, level: None, dictionary: None)
 }
 
 /// BZip2 stream.  Defaults to level 9 (900 KiB block size) to match
 /// the canonical `bzip2` default and the level `bzip2.encode` uses
 /// when no level is supplied explicitly.
 pub fn bzip2() -> Codec {
-  Codec(name: "bzip2", level: Some(level.custom(9)), dictionary: None)
+  Codec(kind: Bzip2, level: Some(level.custom(9)), dictionary: None)
 }
 
 /// XZ stream.
 pub fn xz() -> Codec {
-  Codec(name: "xz", level: Some(level.default()), dictionary: None)
+  Codec(kind: Xz, level: Some(level.default()), dictionary: None)
 }
 
 /// Brotli stream.
 pub fn brotli() -> Codec {
-  Codec(name: "brotli", level: Some(level.default()), dictionary: None)
+  Codec(kind: Brotli, level: Some(level.default()), dictionary: None)
 }
 
 /// Zstandard stream.
 pub fn zstd() -> Codec {
-  Codec(name: "zstd", level: Some(level.default()), dictionary: None)
+  Codec(kind: Zstd, level: Some(level.default()), dictionary: None)
 }
 
 /// Unix LZW `.Z` stream.
 pub fn lzw() -> Codec {
-  Codec(name: "lzw", level: None, dictionary: None)
+  Codec(kind: Lzw, level: None, dictionary: None)
 }
 
 /// Build a dictionary value from raw bytes.
@@ -102,9 +119,27 @@ pub fn clear_dictionary(codec: Codec) -> Codec {
   Codec(..codec, dictionary: None)
 }
 
-/// Codec family name.
+/// Internal tagged kind for the codec family.
+pub fn kind(codec: Codec) -> CodecKind {
+  codec.kind
+}
+
+/// Codec family name.  Kept for diagnostics and `description` output;
+/// internal dispatch uses [kind].
 pub fn name(codec: Codec) -> String {
-  codec.name
+  case codec.kind {
+    Identity -> "identity"
+    Deflate -> "deflate"
+    Zlib -> "zlib"
+    Gzip -> "gzip"
+    Lz4 -> "lz4"
+    Snappy -> "snappy"
+    Bzip2 -> "bzip2"
+    Lzw -> "lzw"
+    Xz -> "xz"
+    Zstd -> "zstd"
+    Brotli -> "brotli"
+  }
 }
 
 /// Optional level override.

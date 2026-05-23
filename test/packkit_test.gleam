@@ -46,7 +46,7 @@ pub fn tar_gzip_recipe_exposes_archive_and_outer_codec_test() -> Nil {
   let plan = recipe.tar_gzip()
 
   recipe.archive_format(plan)
-  |> should.equal(Some(archive.tar()))
+  |> should.equal(archive.tar())
 
   recipe.outermost_codec(plan)
   |> should.equal(Some(codec.gzip()))
@@ -394,6 +394,127 @@ pub fn unpack_with_limits_propagates_to_codec_chain_test() -> Nil {
       cause: error.CodecLimitExceeded(limit: "max_input_bytes", actual: _),
     )) -> Nil
     _ -> should.fail()
+  }
+}
+
+pub fn compress_rejects_non_default_level_on_zlib_test() -> Nil {
+  // The zlib encoder delegates to a fixed-Huffman DEFLATE backend with
+  // no level knob.  A caller-supplied non-default level used to be
+  // silently dropped on the floor; it must now surface a typed
+  // `CodecOptionUnsupported`.
+  let zlib_with_best = codec.zlib() |> codec.with_level(level: level.best())
+  packkit.compress(bytes: <<"x":utf8>>, with: zlib_with_best)
+  |> should.equal(
+    Error(error.CodecOptionUnsupported(option: "level", codec_name: "zlib")),
+  )
+}
+
+pub fn compress_rejects_non_default_level_on_gzip_test() -> Nil {
+  let gzip_with_best = codec.gzip() |> codec.with_level(level: level.best())
+  packkit.compress(bytes: <<"x":utf8>>, with: gzip_with_best)
+  |> should.equal(
+    Error(error.CodecOptionUnsupported(option: "level", codec_name: "gzip")),
+  )
+}
+
+pub fn compress_rejects_non_default_level_on_xz_test() -> Nil {
+  let xz_with_best = codec.xz() |> codec.with_level(level: level.fast())
+  packkit.compress(bytes: <<"x":utf8>>, with: xz_with_best)
+  |> should.equal(
+    Error(error.CodecOptionUnsupported(option: "level", codec_name: "xz")),
+  )
+}
+
+pub fn compress_accepts_default_level_on_fixed_level_codecs_test() -> Nil {
+  // The smart constructors carry `level.default()` by design; that
+  // should still round-trip cleanly.
+  let payload = <<"fixed-level default still works":utf8>>
+  let assert Ok(out_xz) = packkit.compress(bytes: payload, with: codec.xz())
+  let assert Ok(restored_xz) =
+    packkit.decompress(bytes: out_xz, with: codec.xz())
+  restored_xz
+  |> should.equal(payload)
+  let assert Ok(out_gzip) =
+    packkit.compress(bytes: payload, with: codec.gzip())
+  let assert Ok(restored_gzip) =
+    packkit.decompress(bytes: out_gzip, with: codec.gzip())
+  restored_gzip
+  |> should.equal(payload)
+}
+
+pub fn compress_identity_rejects_level_test() -> Nil {
+  // The identity codec carries no level by default, so a
+  // caller-supplied level is unambiguously a request the codec cannot
+  // honour.
+  let identity_with_level =
+    codec.identity() |> codec.with_level(level: level.best())
+  packkit.compress(bytes: <<"data":utf8>>, with: identity_with_level)
+  |> should.equal(
+    Error(error.CodecOptionUnsupported(
+      option: "level",
+      codec_name: "identity",
+    )),
+  )
+}
+
+pub fn archive_add_preserves_observable_order_test() -> Nil {
+  // The O(1) builder stores entries reversed internally; `entries`
+  // must restore the observable insertion order after the refactor.
+  let archive_value =
+    tar.new()
+    |> tar.add_file(path: "a.txt", body: <<"a":utf8>>)
+    |> tar.add_file(path: "b.txt", body: <<"b":utf8>>)
+    |> tar.add_file(path: "c.txt", body: <<"c":utf8>>)
+
+  archive.entries(archive_value)
+  |> list_map_paths
+  |> should.equal(["a.txt", "b.txt", "c.txt"])
+
+  archive.entry_count(archive_value)
+  |> should.equal(3)
+}
+
+pub fn archive_from_entries_preserves_order_test() -> Nil {
+  let assert Ok(a) = entry.file_checked(path: "a", body: <<>>)
+  let assert Ok(b) = entry.file_checked(path: "b", body: <<>>)
+  let assert Ok(c) = entry.file_checked(path: "c", body: <<>>)
+  let archive_value =
+    archive.from_entries(format: tar.format(), entries: [a, b, c])
+  archive.entries(archive_value)
+  |> list_map_paths
+  |> should.equal(["a", "b", "c"])
+}
+
+pub fn recipe_wrap_preserves_inner_to_outer_order_test() -> Nil {
+  // The reversed internal storage must surface inner-to-outer order
+  // through the `codecs` accessor.
+  let plan =
+    recipe.archive_with(format: archive.tar(), wrapped_by: codec.gzip())
+    |> recipe.wrap(with: codec.bzip2())
+    |> recipe.wrap(with: codec.lz4())
+
+  recipe.codecs(plan)
+  |> list_map_codec_names
+  |> should.equal(["gzip", "bzip2", "lz4"])
+
+  recipe.outermost_codec(plan)
+  |> should.equal(Some(codec.lz4()))
+}
+
+fn list_map_paths(entries: List(entry.Entry)) -> List(String) {
+  case entries {
+    [] -> []
+    [head, ..rest] -> [
+      entry.to_string(entry.path(head)),
+      ..list_map_paths(rest)
+    ]
+  }
+}
+
+fn list_map_codec_names(codecs: List(codec.Codec)) -> List(String) {
+  case codecs {
+    [] -> []
+    [head, ..rest] -> [codec.name(head), ..list_map_codec_names(rest)]
   }
 }
 

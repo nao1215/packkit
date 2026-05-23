@@ -8,6 +8,7 @@
 import gleam/bit_array
 import gleam/bool
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -51,8 +52,17 @@ pub opaque type Header {
 /// API still lets callers wire incremental pipelines from sources
 /// that hand them data in chunks.  See `packkit/stream` for the
 /// codec-neutral version of this surface.
+///
+/// `buffered_bytes` is tracked so `push` can enforce `max_input_bytes`
+/// incrementally: a hostile or buggy producer that streams ever-larger
+/// chunks can no longer overrun the limit silently by accumulating in
+/// the decoder before `finish` runs.
 pub opaque type Decoder {
-  Decoder(reversed_chunks: List(BitArray), limits: limit.Limits)
+  Decoder(
+    reversed_chunks: List(BitArray),
+    buffered_bytes: Int,
+    limits: limit.Limits,
+  )
 }
 
 /// Gzip codec smart constructor.
@@ -425,52 +435,56 @@ fn maybe_skip_header_crc(
 
 /// Create a new incremental decoder state using the default limits.
 pub fn new_decoder() -> Decoder {
-  Decoder(reversed_chunks: [], limits: limit.default())
+  Decoder(reversed_chunks: [], buffered_bytes: 0, limits: limit.default())
 }
 
 /// Create a new incremental decoder state with explicit limits.
 pub fn new_decoder_with_limits(limits: limit.Limits) -> Decoder {
-  Decoder(reversed_chunks: [], limits: limits)
+  Decoder(reversed_chunks: [], buffered_bytes: 0, limits: limits)
 }
 
-/// Append a chunk of input bytes to the decoder.  Returns the updated
-/// decoder; no output is produced until [finish] runs (the underlying
-/// DEFLATE decoder is eager).  The empty list in the result tuple
-/// reserves space for a future incremental implementation that emits
-/// payload bytes as they decode.
+/// Append a chunk of input bytes to the decoder, enforcing
+/// `max_input_bytes` incrementally.  Returns the updated decoder; no
+/// output is produced until [finish] runs (the underlying DEFLATE
+/// decoder is eager).  The empty list in the result tuple reserves
+/// space for a future incremental implementation that emits payload
+/// bytes as they decode.
 pub fn push(
   decoder: Decoder,
   chunk: BitArray,
 ) -> Result(#(Decoder, List(BitArray)), error.CodecError) {
-  Ok(
-    #(
-      Decoder(..decoder, reversed_chunks: [chunk, ..decoder.reversed_chunks]),
-      [],
-    ),
-  )
+  let chunk_size = bit_array.byte_size(chunk)
+  let new_total = decoder.buffered_bytes + chunk_size
+  case new_total > limit.max_input_bytes(decoder.limits) {
+    True ->
+      Error(error.CodecLimitExceeded(
+        limit: "max_input_bytes",
+        actual: new_total,
+      ))
+    False ->
+      Ok(
+        #(
+          Decoder(
+            ..decoder,
+            reversed_chunks: [chunk, ..decoder.reversed_chunks],
+            buffered_bytes: new_total,
+          ),
+          [],
+        ),
+      )
+  }
 }
 
 /// Finalize the decoder and return the full decoded payload split
 /// into a single-element list (one chunk).  The list shape mirrors
 /// the chunked output future implementations can emit.
 pub fn finish(decoder: Decoder) -> Result(List(BitArray), error.CodecError) {
-  let bytes =
-    decoder.reversed_chunks
-    |> list_reverse_bits
+  // `bit_array.concat` over the forward-order list is O(total_bytes);
+  // the previous fold called `concat([head, acc])` per chunk, which
+  // copied `acc` each iteration and produced O(N * B * N) behaviour.
+  let bytes = bit_array.concat(list.reverse(decoder.reversed_chunks))
   case decode_with_limits(bytes: bytes, limits: decoder.limits) {
     Ok(decoded) -> Ok([decoded.payload])
     Error(e) -> Error(e)
-  }
-}
-
-fn list_reverse_bits(reversed: List(BitArray)) -> BitArray {
-  list_reverse_bits_loop(reversed, <<>>)
-}
-
-fn list_reverse_bits_loop(reversed: List(BitArray), acc: BitArray) -> BitArray {
-  case reversed {
-    [] -> acc
-    [head, ..rest] ->
-      list_reverse_bits_loop(rest, bit_array.concat([head, acc]))
   }
 }

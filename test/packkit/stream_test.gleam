@@ -1,7 +1,9 @@
 import gleam/bit_array
 import gleeunit/should
 import packkit/deflate
+import packkit/error
 import packkit/gzip
+import packkit/limit
 import packkit/stream
 import packkit/zlib
 
@@ -67,6 +69,69 @@ pub fn stream_chunk_boundary_invariance_test() -> Nil {
   |> should.equal(payload)
   width_seven
   |> should.equal(payload)
+}
+
+pub fn stream_push_enforces_max_input_bytes_test() -> Nil {
+  // Regression: `push` used to swallow arbitrarily many chunks before
+  // `finish` ever checked `max_input_bytes`.  Now the limit is enforced
+  // chunk-by-chunk so a hostile producer can't pile bytes into the
+  // decoder past the budget.
+  let tight =
+    stream.new_deflate_decoder()
+    |> stream.with_limits(
+      limit.default() |> limit.with_max_input_bytes(bytes: 4),
+    )
+  case stream.push(tight, <<"abcde":utf8>>) {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: 5)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn stream_push_enforces_limit_across_chunks_test() -> Nil {
+  // Even if no single chunk exceeds the limit, the running buffered
+  // total must trip it.
+  let decoder =
+    stream.new_gzip_decoder()
+    |> stream.with_limits(
+      limit.default() |> limit.with_max_input_bytes(bytes: 4),
+    )
+  let assert Ok(decoder) = stream.push(decoder, <<"ab":utf8>>)
+  let assert Ok(decoder) = stream.push(decoder, <<"cd":utf8>>)
+  case stream.push(decoder, <<"e":utf8>>) {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: 5)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn stream_decode_chunks_propagates_limit_error_test() -> Nil {
+  // The convenience helper must surface the same typed error rather
+  // than silently dropping over-limit chunks.
+  let decoder =
+    stream.new_zlib_decoder()
+    |> stream.with_limits(
+      limit.default() |> limit.with_max_input_bytes(bytes: 3),
+    )
+  case
+    stream.decode_chunks(decoder: decoder, chunks: [
+      <<"ab":utf8>>,
+      <<"cd":utf8>>,
+    ])
+  {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: 4)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn gzip_decoder_push_enforces_max_input_bytes_test() -> Nil {
+  // The codec-specific decoder must apply the same incremental check.
+  let decoder =
+    gzip.new_decoder_with_limits(
+      limit.default() |> limit.with_max_input_bytes(bytes: 4),
+    )
+  case gzip.push(decoder, <<"abcde":utf8>>) {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: 5)) -> Nil
+    _ -> should.fail()
+  }
 }
 
 fn split_at_width(bytes: BitArray, width: Int) -> List(BitArray) {

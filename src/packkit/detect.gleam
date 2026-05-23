@@ -195,7 +195,7 @@ fn detected_recipe(
 ) -> Detected {
   Detected(
     codec: recipe.outermost_codec(value),
-    archive: recipe.archive_format(value),
+    archive: Some(recipe.archive_format(value)),
     recipe: Some(value),
     extension: Some(extension),
   )

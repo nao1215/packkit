@@ -3,21 +3,25 @@ import gleam/option.{type Option, None, Some}
 import gleam/string
 import packkit/archive
 import packkit/codec
-import packkit/error
 
-/// Opaque archive+codec composition.
+/// Opaque archive+codec composition.  Every public `Recipe` carries
+/// an archive layer; the raw byte-to-byte path is served by the
+/// codec-only `packkit.compress` / `packkit.decompress` entrypoints
+/// rather than by a "headless" recipe variant, so values constructed
+/// here cannot represent unusable states.
+///
+/// `reversed_codecs` stores codecs in outer-to-inner order so [wrap]
+/// runs in O(1); accessors reverse on read.
 pub opaque type Recipe {
-  Recipe(format: Option(archive.ArchiveFormat), codecs: List(codec.Codec))
-}
-
-/// Create a recipe for raw bytes wrapped in a codec chain.
-pub fn raw(with first_codec: codec.Codec) -> Recipe {
-  Recipe(format: None, codecs: [first_codec])
+  Recipe(
+    format: archive.ArchiveFormat,
+    reversed_codecs: List(codec.Codec),
+  )
 }
 
 /// Create a recipe that carries an archive but no outer codec yet.
 pub fn archive_only(format format: archive.ArchiveFormat) -> Recipe {
-  Recipe(format: Some(format), codecs: [])
+  Recipe(format: format, reversed_codecs: [])
 }
 
 /// Create a recipe with an archive and one outer codec.
@@ -28,22 +32,10 @@ pub fn archive_with(
   archive_only(format: format) |> wrap(with: wrapped_by)
 }
 
-/// Wrap an existing recipe in one more outer codec.
+/// Wrap an existing recipe in one more outer codec.  O(1) thanks to
+/// the reversed internal codec list.
 pub fn wrap(recipe: Recipe, with outer_codec: codec.Codec) -> Recipe {
-  Recipe(..recipe, codecs: list.append(recipe.codecs, [outer_codec]))
-}
-
-/// Attach an archive format to a raw recipe. Fails if the recipe
-/// already contains an archive layer.
-pub fn with_archive(
-  recipe: Recipe,
-  format format: archive.ArchiveFormat,
-) -> Result(Recipe, error.RecipeError) {
-  case recipe.format {
-    Some(existing) ->
-      Error(error.RecipeArchiveAlreadySet(current: archive.name(existing)))
-    None -> Ok(Recipe(..recipe, format: Some(format)))
-  }
+  Recipe(..recipe, reversed_codecs: [outer_codec, ..recipe.reversed_codecs])
 }
 
 /// Convenience constructor for `tar.gz`.
@@ -94,36 +86,26 @@ pub fn cpio_gzip() -> Recipe {
   archive_with(format: archive.cpio_newc(), wrapped_by: codec.gzip())
 }
 
-/// Read the optional archive format.
-pub fn archive_format(recipe: Recipe) -> Option(archive.ArchiveFormat) {
+/// Read the archive format the recipe was constructed with.
+pub fn archive_format(recipe: Recipe) -> archive.ArchiveFormat {
   recipe.format
 }
 
 /// Read the codec chain in inner-to-outer order.
 pub fn codecs(recipe: Recipe) -> List(codec.Codec) {
-  recipe.codecs
+  list.reverse(recipe.reversed_codecs)
 }
 
 /// Read the outermost codec, if any.
 pub fn outermost_codec(recipe: Recipe) -> Option(codec.Codec) {
-  last_codec(recipe.codecs)
+  case recipe.reversed_codecs {
+    [head, ..] -> Some(head)
+    [] -> None
+  }
 }
 
 /// Human-readable canonical description for debugging and tests.
 pub fn description(recipe: Recipe) -> String {
-  let prefix = case recipe.format {
-    Some(format) -> [archive.name(format)]
-    None -> []
-  }
-
-  prefix
-  |> list.append(list.map(recipe.codecs, codec.name))
+  [archive.name(recipe.format), ..list.map(codecs(recipe), codec.name)]
   |> string.join(with: ".")
-}
-
-fn last_codec(codecs: List(codec.Codec)) -> Option(codec.Codec) {
-  case list.reverse(codecs) {
-    [codec, ..] -> Some(codec)
-    [] -> None
-  }
 }

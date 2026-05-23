@@ -69,22 +69,24 @@ pub fn compress(
   bytes bytes: BitArray,
   with codec_value: Codec,
 ) -> Result(BitArray, error.CodecError) {
-  case codec.name(codec_value) {
-    "identity" -> {
+  case codec.kind(codec_value) {
+    codec.Identity -> {
       use _ <- result.try(reject_dictionary(codec_value))
+      use _ <- result.try(reject_non_default_level(codec_value, "identity"))
       Ok(bytes)
     }
-    "deflate" -> compress_deflate(bytes, codec_value)
-    "zlib" -> compress_zlib(bytes, codec_value)
-    "gzip" -> compress_gzip(bytes, codec_value)
-    "lz4" -> compress_levelless(bytes, codec_value, "lz4", lz4.encode)
-    "snappy" -> compress_levelless(bytes, codec_value, "snappy", snappy.encode)
-    "bzip2" -> compress_bzip2(bytes, codec_value)
-    "lzw" -> compress_levelless(bytes, codec_value, "lzw", lzw.encode)
-    "xz" -> compress_levellish(bytes, codec_value, "xz", xz.encode)
-    "zstd" -> compress_levellish(bytes, codec_value, "zstd", zstd.encode)
-    "brotli" -> compress_levellish(bytes, codec_value, "brotli", brotli.encode)
-    other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
+    codec.Deflate -> compress_deflate(bytes, codec_value)
+    codec.Zlib -> compress_zlib(bytes, codec_value)
+    codec.Gzip -> compress_gzip(bytes, codec_value)
+    codec.Lz4 -> compress_levelless(bytes, codec_value, "lz4", lz4.encode)
+    codec.Snappy ->
+      compress_levelless(bytes, codec_value, "snappy", snappy.encode)
+    codec.Bzip2 -> compress_bzip2(bytes, codec_value)
+    codec.Lzw -> compress_levelless(bytes, codec_value, "lzw", lzw.encode)
+    codec.Xz -> compress_fixed_level(bytes, codec_value, "xz", xz.encode)
+    codec.Zstd -> compress_fixed_level(bytes, codec_value, "zstd", zstd.encode)
+    codec.Brotli ->
+      compress_fixed_level(bytes, codec_value, "brotli", brotli.encode)
   }
 }
 
@@ -112,51 +114,51 @@ pub fn decompress_with_limits(
   with codec_value: Codec,
   limits limits: Limits,
 ) -> Result(BitArray, error.CodecError) {
-  case codec.name(codec_value) {
-    "identity" -> {
+  case codec.kind(codec_value) {
+    codec.Identity -> {
       use _ <- result.try(reject_dictionary(codec_value))
+      use _ <- result.try(reject_non_default_level(codec_value, "identity"))
       enforce_input_limit(bytes, limits)
       |> result.map(fn(_) { bytes })
     }
-    "deflate" -> {
+    codec.Deflate -> {
       use _ <- result.try(reject_dictionary(codec_value))
       deflate.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "zlib" -> decompress_zlib(bytes, codec_value, limits)
-    "gzip" -> {
+    codec.Zlib -> decompress_zlib(bytes, codec_value, limits)
+    codec.Gzip -> {
       use _ <- result.try(reject_dictionary(codec_value))
       gzip.decode_with_limits(bytes: bytes, limits: limits)
       |> result.map(fn(decoded) { decoded.payload })
     }
-    "lz4" -> {
+    codec.Lz4 -> {
       use _ <- result.try(reject_dictionary(codec_value))
       lz4.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "snappy" -> {
+    codec.Snappy -> {
       use _ <- result.try(reject_dictionary(codec_value))
       snappy.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "bzip2" -> {
+    codec.Bzip2 -> {
       use _ <- result.try(reject_dictionary(codec_value))
       bzip2.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "lzw" -> {
+    codec.Lzw -> {
       use _ <- result.try(reject_dictionary(codec_value))
       lzw.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "xz" -> {
+    codec.Xz -> {
       use _ <- result.try(reject_dictionary(codec_value))
       xz.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "zstd" -> {
+    codec.Zstd -> {
       use _ <- result.try(reject_dictionary(codec_value))
       zstd.decode_with_limits(bytes: bytes, limits: limits)
     }
-    "brotli" -> {
+    codec.Brotli -> {
       use _ <- result.try(reject_dictionary(codec_value))
       brotli.decode_with_limits(bytes: bytes, limits: limits)
     }
-    other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }
 
@@ -177,9 +179,21 @@ fn compress_deflate(
   codec_value: Codec,
 ) -> Result(BitArray, error.CodecError) {
   use _ <- result.try(reject_dictionary(codec_value))
+  // DEFLATE honours exactly two settings today: level 0 (`store`) and
+  // the implicit default (fixed-Huffman LZ77).  Anything else would be
+  // silently coerced, so reject it.
   case effective_level(codec_value) {
+    None -> deflate.encode(bytes: bytes)
     Some(0) -> deflate.encode_stored_only(bytes: bytes)
-    _ -> deflate.encode(bytes: bytes)
+    Some(n) ->
+      case n == default_level_value() {
+        True -> deflate.encode(bytes: bytes)
+        False ->
+          Error(error.CodecOptionUnsupported(
+            option: "level",
+            codec_name: "deflate",
+          ))
+      }
   }
 }
 
@@ -187,11 +201,11 @@ fn compress_zlib(
   bytes: BitArray,
   codec_value: Codec,
 ) -> Result(BitArray, error.CodecError) {
-  // The level is intentionally not threaded through: zlib.encode
-  // delegates to the fixed-Huffman DEFLATE encoder, which has no
-  // level knob today.  Rejecting non-default levels would break
-  // `codec.zlib() |> codec.with_level(...)` callers without giving
-  // them anything in return.
+  // zlib.encode delegates to the fixed-Huffman DEFLATE encoder, which
+  // has no level knob today.  Accept only the implicit default level
+  // so callers can't pass `with_level(level.best())` and silently get
+  // the same bytes as `with_level(level.fast())`.
+  use _ <- result.try(reject_non_default_level(codec_value, "zlib"))
   case codec.dictionary_of(codec_value) {
     None -> zlib.encode(bytes: bytes)
     Some(dict) ->
@@ -223,7 +237,9 @@ fn compress_gzip(
   codec_value: Codec,
 ) -> Result(BitArray, error.CodecError) {
   use _ <- result.try(reject_dictionary(codec_value))
-  // Level intentionally not threaded through (see `compress_zlib`).
+  // gzip.encode shares the zlib code path's lack of a level knob, so
+  // we accept only the implicit default level for the same reason.
+  use _ <- result.try(reject_non_default_level(codec_value, "gzip"))
   gzip.encode(bytes: bytes, header: gzip.default_header())
 }
 
@@ -260,19 +276,18 @@ fn compress_levelless(
 
 /// Codecs whose encoders accept a level conceptually but currently
 /// always emit the simplest representation (xz LZMA2 uncompressed,
-/// zstd raw frames, brotli uncompressed metablocks).  The level value
-/// is intentionally accepted and ignored: rejecting it would force
-/// every caller of `codec.xz()` / `codec.zstd()` / `codec.brotli()`
-/// (which all carry `level.default()`) to clear the level before
-/// using the facade, and that's an ergonomics regression for no
-/// safety win.  Dictionaries are still rejected.
-fn compress_levellish(
+/// zstd raw frames, brotli uncompressed metablocks).  We accept the
+/// implicit default level (so the smart constructor still works) but
+/// reject any caller-supplied non-default level so it's never
+/// silently dropped.  Dictionaries are still rejected.
+fn compress_fixed_level(
   bytes: BitArray,
   codec_value: Codec,
-  _codec_name: String,
+  codec_name: String,
   run: fn(BitArray) -> Result(BitArray, error.CodecError),
 ) -> Result(BitArray, error.CodecError) {
   use _ <- result.try(reject_dictionary(codec_value))
+  use _ <- result.try(reject_non_default_level(codec_value, codec_name))
   run(bytes)
 }
 
@@ -303,6 +318,32 @@ fn reject_level(
         codec_name: codec_name,
       ))
   }
+}
+
+/// Accepts the implicit default level, rejects anything else with
+/// `CodecOptionUnsupported`.  Used by codecs whose encoders share a
+/// single fixed strategy, so non-default levels would be silently
+/// dropped if accepted.
+fn reject_non_default_level(
+  codec_value: Codec,
+  codec_name: String,
+) -> Result(Nil, error.CodecError) {
+  case codec.level(codec_value) {
+    None -> Ok(Nil)
+    Some(l) ->
+      case level.value(l) == default_level_value() {
+        True -> Ok(Nil)
+        False ->
+          Error(error.CodecOptionUnsupported(
+            option: "level",
+            codec_name: codec_name,
+          ))
+      }
+  }
+}
+
+fn default_level_value() -> Int {
+  level.value(level.default())
 }
 
 fn effective_level(codec_value: Codec) -> Option(Int) {
@@ -338,13 +379,12 @@ pub fn read_with_limits(
   format format: ArchiveFormat,
   limits limits: Limits,
 ) -> Result(Archive, error.ArchiveError) {
-  case archive.name(format) {
-    "tar" -> tar.decode_with_limits(bytes: bytes, limits: limits)
-    "zip" -> zip_archive.decode_with_limits(bytes: bytes, limits: limits)
-    "cpio-newc" -> cpio.decode_with_limits(bytes: bytes, limits: limits)
-    "ar" -> ar.decode_with_limits(bytes: bytes, limits: limits)
-    "7z" -> seven_z.decode_with_limits(bytes: bytes, limits: limits)
-    other -> Error(error.ArchiveNotImplemented(feature: "read " <> other))
+  case archive.kind(format) {
+    archive.Tar -> tar.decode_with_limits(bytes: bytes, limits: limits)
+    archive.Zip -> zip_archive.decode_with_limits(bytes: bytes, limits: limits)
+    archive.CpioNewc -> cpio.decode_with_limits(bytes: bytes, limits: limits)
+    archive.Ar -> ar.decode_with_limits(bytes: bytes, limits: limits)
+    archive.SevenZ -> seven_z.decode_with_limits(bytes: bytes, limits: limits)
   }
 }
 
@@ -358,13 +398,12 @@ pub fn write(
   format format: ArchiveFormat,
 ) -> Result(BitArray, error.ArchiveError) {
   use _ <- result.try(ensure_archive_format_matches(archive_value, format))
-  case archive.name(format) {
-    "tar" -> tar.encode(archive: archive_value)
-    "zip" -> zip_archive.encode(archive: archive_value)
-    "cpio-newc" -> cpio.encode(archive: archive_value)
-    "ar" -> ar.encode(archive: archive_value)
-    "7z" -> seven_z.encode(archive: archive_value)
-    other -> Error(error.ArchiveNotImplemented(feature: "write " <> other))
+  case archive.kind(format) {
+    archive.Tar -> tar.encode(archive: archive_value)
+    archive.Zip -> zip_archive.encode(archive: archive_value)
+    archive.CpioNewc -> cpio.encode(archive: archive_value)
+    archive.Ar -> ar.encode(archive: archive_value)
+    archive.SevenZ -> seven_z.encode(archive: archive_value)
   }
 }
 
@@ -372,14 +411,14 @@ fn ensure_archive_format_matches(
   archive_value: Archive,
   requested: ArchiveFormat,
 ) -> Result(Nil, error.ArchiveError) {
-  let archive_name = archive.name(archive.format(archive_value))
-  let requested_name = archive.name(requested)
-  case archive_name == requested_name {
+  let archive_kind = archive.kind(archive.format(archive_value))
+  let requested_kind = archive.kind(requested)
+  case archive_kind == requested_kind {
     True -> Ok(Nil)
     False ->
       Error(error.ArchiveFormatMismatch(
-        archive: archive_name,
-        requested: requested_name,
+        archive: archive.name(archive.format(archive_value)),
+        requested: archive.name(requested),
       ))
   }
 }
@@ -389,13 +428,10 @@ pub fn pack(
   archive_value archive_value: Archive,
   using recipe_value: Recipe,
 ) -> Result(BitArray, error.ArchiveError) {
-  use archive_bytes <- result.try(case recipe.archive_format(recipe_value) {
-    Some(format) -> write(archive_value: archive_value, format: format)
-    None ->
-      Error(error.ArchiveInvalid(
-        message: "pack requires the recipe to declare an archive format",
-      ))
-  })
+  use archive_bytes <- result.try(write(
+    archive_value: archive_value,
+    format: recipe.archive_format(recipe_value),
+  ))
 
   apply_codec_chain_forward(archive_bytes, recipe.codecs(recipe_value))
   |> codec_to_archive_error(step: "encode")
@@ -427,14 +463,11 @@ pub fn unpack_with_limits(
     |> codec_to_archive_error(step: "decode"),
   )
 
-  case recipe.archive_format(recipe_value) {
-    Some(format) ->
-      read_with_limits(bytes: raw_bytes, format: format, limits: limits)
-    None ->
-      Error(error.ArchiveInvalid(
-        message: "unpack requires the recipe to declare an archive format",
-      ))
-  }
+  read_with_limits(
+    bytes: raw_bytes,
+    format: recipe.archive_format(recipe_value),
+    limits: limits,
+  )
 }
 
 /// Detect from a filename or path suffix.
