@@ -441,23 +441,24 @@ pub fn ll_base(code: Int) -> Int {
 
 /// `LL_bits[code]` — extra bits to read for a literal-length code.
 pub fn ll_extra_bits(code: Int) -> Int {
+  // Matches the reference zstd `LL_bits` table (RFC 8478 §3.1.1.3.2.1.1).
   case code {
     n if n >= 0 && n <= 15 -> 0
     n if n >= 16 && n <= 19 -> 1
-    n if n >= 20 && n <= 22 -> 2
-    23 -> 3
-    24 -> 3
-    25 -> 4
-    26 -> 6
-    27 -> 7
-    28 -> 8
-    29 -> 9
-    30 -> 10
-    31 -> 11
-    32 -> 12
-    33 -> 13
-    34 -> 14
-    35 -> 15
+    n if n >= 20 && n <= 21 -> 2
+    n if n >= 22 && n <= 23 -> 3
+    24 -> 4
+    25 -> 6
+    26 -> 7
+    27 -> 8
+    28 -> 9
+    29 -> 10
+    30 -> 11
+    31 -> 12
+    32 -> 13
+    33 -> 14
+    34 -> 15
+    35 -> 16
     _ -> 0
   }
 }
