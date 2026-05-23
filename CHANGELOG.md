@@ -35,9 +35,25 @@
   literal context modes, NTREES, and all three prefix-code
   descriptors in both simple form (§3.4) and complex form (§3.5,
   the 18-symbol code-length code with 16/17 run-length symbols).
-  The command loop and the 122 KiB static dictionary are still
-  pending; the decoder reports each missing stage with a
-  fine-grained `CodecNotImplemented(feature: …)` error.
+- Added the Brotli command loop with the I+C alphabet (`kCmdLut`
+  port), the 4-entry recent-distance ring buffer, and self-
+  overlapping LZ77 copies; end-to-end round-trip works for
+  `aaa…` / `time of the day` / `Hello, World!` style fixtures.
+- Embedded the RFC 7932 122,784-byte static dictionary and ported
+  the 121-entry transform table (IDENTITY / OMIT_FIRST_n /
+  OMIT_LAST_n / UPPERCASE_FIRST / UPPERCASE_ALL with the brotli
+  "overly simplified" UTF-8 case rules; SHIFT_FIRST / SHIFT_ALL
+  intentionally absent because the basic transform set never
+  selects them).
+- Added Brotli literal context-map decoding (§7.3): RLEMAX +
+  zero-run-encoded prefix code + optional inverse MTF, plus the
+  embedded 2 KiB `_kBrotliContextLookupTable` and the per-context
+  literal/distance tree selection on every emission.
+- Added Brotli block switching (§6) for the literal, insert-and-
+  copy, and distance categories: each tracks its own block-type
+  prefix code, the shared 26-symbol block-length alphabet, and a
+  2-entry recent-type ring buffer that feeds back into context-map
+  indexing.
 - Fixed the WBITS prefix decoder (RFC 7932 §9.1) for the
   `1 000 nnn` branch — previously returned `17 + extra` instead
   of `8 + extra` for `nnn ∈ {2..7}` and now rejects the
