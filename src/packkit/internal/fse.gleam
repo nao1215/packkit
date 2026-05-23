@@ -72,7 +72,18 @@ pub fn build_state_table(
   let table_size = int.bitwise_shift_left(1, accuracy_log)
   let position_dict = assign_positions(normalized, accuracy_log, table_size)
   let symbol_counts = real_counts(normalized, dict.new(), 0)
-  build_entries(position_dict, symbol_counts, accuracy_log, 0, dict.new())
+  // symbol_next[s] starts at the symbol's count (per zstd reference).
+  // As we walk cells in order, each occurrence consumes one increment
+  // and contributes to the cell's nb_bits + baseline.
+  build_entries(
+    position_dict,
+    symbol_counts,
+    dict.new(),
+    accuracy_log,
+    table_size,
+    0,
+    dict.new(),
+  )
 }
 
 fn real_counts(
@@ -219,11 +230,12 @@ fn advance_cursor(cursor: Int, mask: Int, step: Int, high_threshold: Int) -> Int
 fn build_entries(
   positions: dict.Dict(Int, Int),
   counts: dict.Dict(Int, Int),
+  symbol_next: dict.Dict(Int, Int),
   accuracy_log: Int,
+  table_size: Int,
   state_index: Int,
   acc: dict.Dict(Int, StateEntry),
 ) -> dict.Dict(Int, StateEntry) {
-  let table_size = int.bitwise_shift_left(1, accuracy_log)
   case state_index >= table_size {
     True -> acc
     False -> {
@@ -235,17 +247,25 @@ fn build_entries(
         Ok(v) -> v
         Error(_) -> 1
       }
-      // The state's nb_bits is `accuracy_log - ceil(log2(count))`, but
-      // expressed as the high-bit position of count so it can be
-      // computed cheaply.
-      let nb_bits = state_bits_for_count(count, accuracy_log)
-      let baseline = baseline_for_position(state_index, count, accuracy_log)
+      // symbol_next[s] tracks the next "occurrence index + count" for
+      // symbol s.  Per liblzma / libzstd, nb_bits =
+      // accuracy_log - BIT_highbit32(symbol_next), and the new
+      // baseline = (symbol_next << nb_bits) - table_size.  symbol_next
+      // increments after every cell that contains s.
+      let next_value = case dict.get(symbol_next, symbol) {
+        Ok(v) -> v
+        Error(_) -> count
+      }
+      let nb_bits = accuracy_log - high_bit_position(next_value)
+      let baseline = int.bitwise_shift_left(next_value, nb_bits) - table_size
       let entry =
         StateEntry(symbol: symbol, nb_bits: nb_bits, baseline: baseline)
       build_entries(
         positions,
         counts,
+        dict.insert(symbol_next, symbol, next_value + 1),
         accuracy_log,
+        table_size,
         state_index + 1,
         dict.insert(acc, state_index, entry),
       )
@@ -253,35 +273,15 @@ fn build_entries(
   }
 }
 
-fn state_bits_for_count(count: Int, accuracy_log: Int) -> Int {
-  let next_power = next_power_of_two(count)
-  accuracy_log - count_log2(next_power, 0)
-}
-
-fn next_power_of_two(n: Int) -> Int {
-  case n {
-    1 -> 1
-    _ -> int.bitwise_shift_left(1, count_log2(n - 1, 0) + 1)
+/// Position of the highest set bit (0-indexed).  `high_bit_position(1)`
+/// is `0`, `high_bit_position(2)` is `1`, `high_bit_position(4)` is `2`,
+/// and so on.  Matches the `BIT_highbit32` helper used by liblzma /
+/// libzstd in their FSE state-table builders.
+pub fn high_bit_position(value: Int) -> Int {
+  case value {
+    n if n <= 1 -> 0
+    _ -> 1 + high_bit_position(int.bitwise_shift_right(value, 1))
   }
-}
-
-fn count_log2(value: Int, acc: Int) -> Int {
-  case value <= 1 {
-    True -> acc
-    False -> count_log2(int.bitwise_shift_right(value, 1), acc + 1)
-  }
-}
-
-fn baseline_for_position(state_index: Int, count: Int, accuracy_log: Int) -> Int {
-  // The full computation needs the symbol's per-cell ordinal, which
-  // requires walking the position list and counting prior occurrences
-  // of the same symbol.  We surface a conservative starting baseline
-  // here so the StateEntry has consistent fields; the streaming
-  // decoder will refine this once it reads its first state value.
-  let _ = state_index
-  let _ = count
-  let _ = accuracy_log
-  0
 }
 
 /// Convenience: build the predefined Literals_Length state table.
