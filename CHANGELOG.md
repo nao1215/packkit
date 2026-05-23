@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Replaced the Snappy raw encoder's literal-only path with a real
+  LZ77 block compressor.  The match-finder mirrors LZ4 (greedy
+  4-byte hash table, 16-bit hash) but emits the Snappy block format:
+  literal (low 2 bits = 00) + copy-1 (01, length 4..11, 11-bit
+  offset) / copy-2 (10, length 1..64, 16-bit offset) / copy-4 (11,
+  length 1..64, 32-bit offset), with matches longer than 64 split
+  across consecutive copies sharing an offset.  The framed encoder
+  now dispatches each chunk through the raw encoder and picks the
+  smaller of the compressed (`0x00`) and uncompressed (`0x01`)
+  chunk types.
 - Replaced the LZ4 frame encoder's uncompressed-only path with a
   real LZ77 block compressor.  Each block runs a greedy 4-byte hash-
   chain match-finder (16-bit hash table, max distance 65 535,

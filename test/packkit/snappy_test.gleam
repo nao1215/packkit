@@ -60,3 +60,72 @@ pub fn raw_encode_decode_roundtrip_test() -> Nil {
   restored
   |> should.equal(payload)
 }
+
+pub fn raw_encode_compresses_run_test() -> Nil {
+  // 1 KiB of 'a' — extremely compressible.  The new LZ77 raw
+  // encoder must shrink it well below the input size; the previous
+  // literal-only encoder produced ~1 KiB + 3 bytes of varint
+  // overhead.
+  let payload = repeat_byte(0x61, 1024, <<>>)
+  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
+  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
+  restored
+  |> should.equal(payload)
+  // The encoder must shrink the input significantly — the precise
+  // output size depends on copy-tag fragmentation, but a 16-fold
+  // (or better) reduction is the floor.
+  { bit_array.byte_size(encoded) < 64 }
+  |> should.be_true
+}
+
+pub fn raw_encode_compresses_repeated_pattern_test() -> Nil {
+  let payload = bit_array.concat(list_repeat(<<"abcabcabc":utf8>>, 50))
+  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
+  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
+  restored
+  |> should.equal(payload)
+  { bit_array.byte_size(encoded) < bit_array.byte_size(payload) }
+  |> should.be_true
+}
+
+pub fn framed_encode_compresses_run_test() -> Nil {
+  // The framed encoder used to always emit chunk_uncompressed.  After
+  // wiring it through `compress_raw_body` it should emit a
+  // chunk_compressed chunk whenever the compressed body is shorter
+  // than the raw chunk.
+  let payload = repeat_byte(0x61, 1024, <<>>)
+  let assert Ok(framed) = snappy.encode(bytes: payload)
+  let assert Ok(restored) = snappy.decode(bytes: framed)
+  restored
+  |> should.equal(payload)
+  // Framed overhead is the 10-byte stream identifier + 8-byte chunk
+  // header (1 + 3 + 4 for type/size/crc) — so a compressed chunk
+  // should still fit in well under 100 bytes.
+  { bit_array.byte_size(framed) < 100 }
+  |> should.be_true
+}
+
+pub fn raw_encode_random_short_roundtrip_test() -> Nil {
+  let assert Ok(payload) =
+    bit_array.base16_decode(
+      "DE7374EF0634215A02948D5CBADC072B286F8175B5FE2FA00B1FCCB187702CF8",
+    )
+  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
+  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
+  restored
+  |> should.equal(payload)
+}
+
+fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
+fn list_repeat(value: a, n: Int) -> List(a) {
+  case n {
+    0 -> []
+    _ -> [value, ..list_repeat(value, n - 1)]
+  }
+}

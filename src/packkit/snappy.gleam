@@ -4,12 +4,15 @@
 //// Snappy block format documented in `snappy-format-description`.
 //// `snappy.decode` and `snappy.encode` operate on the streaming
 //// framed form (`sNaPpY` stream identifier and chunked layout).  The
-//// encoder emits uncompressed-chunk records so any framed-Snappy
-//// reader can decompress the output even before a Snappy compressor
-//// is added.
+//// raw encoder runs a greedy 4-byte hash-chain match-finder and
+//// emits literal + copy-1 / copy-2 / copy-4 sequences in the
+//// canonical block layout; the framed encoder dispatches each chunk
+//// through the raw encoder and picks the smaller of the compressed
+//// (`0x00`) and uncompressed (`0x01`) chunk types.
 
 import gleam/bit_array
 import gleam/bool
+import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/result
@@ -103,13 +106,16 @@ pub fn raw_decode_with_limits(
   }
 }
 
-/// Encode `bytes` as a Snappy raw block by emitting a single literal
-/// run covering the entire payload.
+/// Encode `bytes` as a Snappy raw block.  Runs a greedy LZ77 match-
+/// finder (4-byte hash table, 16-bit hash) and emits literal +
+/// copy-1 / copy-2 / copy-4 sequences in the canonical block layout.
+/// Inputs of fewer than 4 bytes — where no copy can fit the 4-byte
+/// minimum match — degenerate to a single literal run.
 pub fn raw_encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let length = bit_array.byte_size(bytes)
   let length_varint = write_varint(length)
-  let literal = emit_literal(bytes)
-  Ok(bit_array.concat([length_varint, literal]))
+  let body = compress_raw_body(bytes, length)
+  Ok(bit_array.concat([length_varint, body]))
 }
 
 fn encode_uncompressed_chunks(
@@ -129,19 +135,41 @@ fn encode_uncompressed_chunks(
         bit_array.slice(remaining, chunk_size, total - chunk_size)
 
       let crc = checksum.snappy_mask(crc: checksum.crc32c(data: chunk))
-      let payload_size = chunk_size + 4
-      let header = <<
-        chunk_uncompressed,
-        payload_size:size(24)-little,
-        crc:size(32)-little,
-      >>
-
-      encode_uncompressed_chunks(after, [
-        bit_array.concat([header, chunk]),
-        ..acc
-      ])
+      // Try Snappy compression and pick the chunk type that produces
+      // the shorter on-wire form.  The compressed chunk body is the
+      // raw-block stream (varint length + LZ77 sequences); the
+      // uncompressed chunk body is the chunk bytes verbatim.
+      let raw_body = encode_raw_block(chunk, chunk_size)
+      let raw_body_size = bit_array.byte_size(raw_body)
+      let framed = case raw_body_size < chunk_size {
+        True -> {
+          let payload_size = raw_body_size + 4
+          let header = <<
+            chunk_compressed,
+            payload_size:size(24)-little,
+            crc:size(32)-little,
+          >>
+          bit_array.concat([header, raw_body])
+        }
+        False -> {
+          let payload_size = chunk_size + 4
+          let header = <<
+            chunk_uncompressed,
+            payload_size:size(24)-little,
+            crc:size(32)-little,
+          >>
+          bit_array.concat([header, chunk])
+        }
+      }
+      encode_uncompressed_chunks(after, [framed, ..acc])
     }
   }
+}
+
+fn encode_raw_block(bytes: BitArray, size: Int) -> BitArray {
+  let varint = write_varint(size)
+  let body = compress_raw_body(bytes, size)
+  bit_array.concat([varint, body])
 }
 
 fn decode_chunks(
@@ -438,6 +466,285 @@ fn copy_byte_by_byte(
       use new_output <- result.try(append_with_limit(output, byte_slice, limits))
       copy_byte_by_byte(new_output, offset, length - 1, limits)
     }
+  }
+}
+
+// -- raw-block LZ77 compressor -----------------------------------------
+//
+// Snappy's raw block format encodes each sequence as either a literal
+// (low 2 bits of the tag = 00) or a copy (low 2 bits = 01 / 10 / 11
+// for 1 / 2 / 4-byte offsets).  Minimum match length is 4.  The
+// match-finder mirrors the LZ4 encoder: a 4-byte hash with a single-
+// position table keyed on a 16-bit hash, max distance 65 535 (so the
+// copy-2 form covers the common case and copy-4 only fires for
+// inputs > 64 KiB).
+
+const snappy_min_match: Int = 4
+
+const snappy_max_distance: Int = 65_535
+
+fn compress_raw_body(bytes: BitArray, size: Int) -> BitArray {
+  case size < snappy_min_match {
+    True -> emit_literal(bytes)
+    False -> {
+      let table = build_snappy_byte_table(bytes, 0, dict.new())
+      snappy_compress_loop(table, size, 0, 0, dict.new(), [])
+    }
+  }
+}
+
+fn snappy_compress_loop(
+  table: dict.Dict(Int, Int),
+  size: Int,
+  pos: Int,
+  last_lit_start: Int,
+  hashes: dict.Dict(Int, Int),
+  acc: List(BitArray),
+) -> BitArray {
+  case pos + snappy_min_match > size {
+    True -> {
+      let lit_len = size - last_lit_start
+      let tail = case lit_len {
+        0 -> <<>>
+        _ -> emit_literal(snappy_slice(table, last_lit_start, lit_len, <<>>))
+      }
+      bit_array.concat(list.reverse([tail, ..acc]))
+    }
+    False -> snappy_step(table, size, pos, last_lit_start, hashes, acc)
+  }
+}
+
+fn snappy_step(
+  table: dict.Dict(Int, Int),
+  size: Int,
+  pos: Int,
+  last_lit_start: Int,
+  hashes: dict.Dict(Int, Int),
+  acc: List(BitArray),
+) -> BitArray {
+  let key =
+    snappy_hash4(
+      snappy_byte_at(table, pos),
+      snappy_byte_at(table, pos + 1),
+      snappy_byte_at(table, pos + 2),
+      snappy_byte_at(table, pos + 3),
+    )
+  case dict.get(hashes, key) {
+    Ok(prev) -> {
+      let offset = pos - prev
+      let valid =
+        offset >= 1
+        && offset <= snappy_max_distance
+        && snappy_bytes4_equal(table, prev, pos)
+      case valid {
+        False ->
+          snappy_compress_loop(
+            table,
+            size,
+            pos + 1,
+            last_lit_start,
+            dict.insert(hashes, key, pos),
+            acc,
+          )
+        True -> {
+          let match_len = snappy_match_length(table, prev, pos, size, 0)
+          case match_len < snappy_min_match {
+            True ->
+              snappy_compress_loop(
+                table,
+                size,
+                pos + 1,
+                last_lit_start,
+                dict.insert(hashes, key, pos),
+                acc,
+              )
+            False -> {
+              let literals = case pos > last_lit_start {
+                True ->
+                  emit_literal(
+                    snappy_slice(
+                      table,
+                      last_lit_start,
+                      pos - last_lit_start,
+                      <<>>,
+                    ),
+                  )
+                False -> <<>>
+              }
+              let copy = emit_copy_for(offset, match_len, <<>>)
+              let next_pos = pos + match_len
+              let new_hashes =
+                snappy_insert_hashes(
+                  table,
+                  dict.insert(hashes, key, pos),
+                  pos + 1,
+                  next_pos - 1,
+                  size,
+                )
+              snappy_compress_loop(table, size, next_pos, next_pos, new_hashes, [
+                copy,
+                literals,
+                ..acc
+              ])
+            }
+          }
+        }
+      }
+    }
+    _ ->
+      snappy_compress_loop(
+        table,
+        size,
+        pos + 1,
+        last_lit_start,
+        dict.insert(hashes, key, pos),
+        acc,
+      )
+  }
+}
+
+fn build_snappy_byte_table(
+  bytes: BitArray,
+  index: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case bytes {
+    <<b, rest:bytes>> ->
+      build_snappy_byte_table(rest, index + 1, dict.insert(acc, index, b))
+    _ -> acc
+  }
+}
+
+fn snappy_byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
+  case dict.get(table, index) {
+    Ok(b) -> b
+    _ -> 0
+  }
+}
+
+fn snappy_hash4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int {
+  let combined =
+    int.bitwise_or(
+      b0,
+      int.bitwise_or(
+        int.bitwise_shift_left(b1, 8),
+        int.bitwise_or(
+          int.bitwise_shift_left(b2, 16),
+          int.bitwise_shift_left(b3, 24),
+        ),
+      ),
+    )
+  int.bitwise_and(combined * 2_654_435_761, 0xFFFF)
+}
+
+fn snappy_bytes4_equal(table: dict.Dict(Int, Int), p1: Int, p2: Int) -> Bool {
+  snappy_byte_at(table, p1) == snappy_byte_at(table, p2)
+  && snappy_byte_at(table, p1 + 1) == snappy_byte_at(table, p2 + 1)
+  && snappy_byte_at(table, p1 + 2) == snappy_byte_at(table, p2 + 2)
+  && snappy_byte_at(table, p1 + 3) == snappy_byte_at(table, p2 + 3)
+}
+
+fn snappy_match_length(
+  table: dict.Dict(Int, Int),
+  base: Int,
+  cursor: Int,
+  limit_pos: Int,
+  acc: Int,
+) -> Int {
+  case cursor + acc >= limit_pos {
+    True -> acc
+    False ->
+      case
+        snappy_byte_at(table, base + acc) == snappy_byte_at(table, cursor + acc)
+      {
+        True -> snappy_match_length(table, base, cursor, limit_pos, acc + 1)
+        False -> acc
+      }
+  }
+}
+
+fn snappy_insert_hashes(
+  table: dict.Dict(Int, Int),
+  hashes: dict.Dict(Int, Int),
+  from: Int,
+  to: Int,
+  size: Int,
+) -> dict.Dict(Int, Int) {
+  case from > to || from + snappy_min_match > size {
+    True -> hashes
+    False -> {
+      let key =
+        snappy_hash4(
+          snappy_byte_at(table, from),
+          snappy_byte_at(table, from + 1),
+          snappy_byte_at(table, from + 2),
+          snappy_byte_at(table, from + 3),
+        )
+      snappy_insert_hashes(
+        table,
+        dict.insert(hashes, key, from),
+        from + 1,
+        to,
+        size,
+      )
+    }
+  }
+}
+
+fn snappy_slice(
+  table: dict.Dict(Int, Int),
+  start: Int,
+  count: Int,
+  acc: BitArray,
+) -> BitArray {
+  case count {
+    0 -> acc
+    _ ->
+      snappy_slice(table, start + 1, count - 1, <<
+        acc:bits,
+        snappy_byte_at(table, start),
+      >>)
+  }
+}
+
+/// Emit one or more copy records that together cover a single LZ77
+/// match.  The Snappy 1-byte offset form caps match length at 11; the
+/// 2- and 4-byte forms cap at 64.  Matches longer than 64 are split
+/// into multiple back-to-back copies sharing the same offset.
+fn emit_copy_for(offset: Int, length: Int, acc: BitArray) -> BitArray {
+  case length {
+    0 -> acc
+    _ ->
+      case offset < 2048 && length >= 4 && length <= 11 {
+        True -> {
+          let tag =
+            int.bitwise_or(
+              int.bitwise_shift_left(length - 4, 2),
+              int.bitwise_or(
+                int.bitwise_shift_left(int.bitwise_shift_right(offset, 8), 5),
+                1,
+              ),
+            )
+          <<acc:bits, tag, int.bitwise_and(offset, 0xFF)>>
+        }
+        False -> {
+          let chunk = case length > 64 {
+            True -> 64
+            False -> length
+          }
+          let piece = case offset < 65_536 {
+            True -> {
+              let tag = int.bitwise_or(int.bitwise_shift_left(chunk - 1, 2), 2)
+              <<tag, offset:size(16)-little>>
+            }
+            False -> {
+              let tag = int.bitwise_or(int.bitwise_shift_left(chunk - 1, 2), 3)
+              <<tag, offset:size(32)-little>>
+            }
+          }
+          emit_copy_for(offset, length - chunk, <<acc:bits, piece:bits>>)
+        }
+      }
   }
 }
 

@@ -38,7 +38,9 @@ Implemented codecs and archive families:
   verification
 - **lz4**: frame decoder + LZ77 block encoder (greedy 4-byte hash-
   chain match-finder with uncompressed-block fallback)
-- **snappy**: raw-block and framed codec
+- **snappy**: raw-block and framed codec with LZ77 block compressor
+  (greedy 4-byte hash-chain match-finder, literal + copy-1 / copy-2
+  / copy-4 sequence emission)
 - **bzip2**: round-trip (BWT inverse + MTF + Huffman + RUNA/RUNB + RLE1
   for decode; naive forward BWT + length-limited Huffman for encode)
 - **lzw**: Unix `.Z` (compress) encoder + decoder
