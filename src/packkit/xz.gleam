@@ -678,6 +678,9 @@ fn read_varint_loop(
 }
 
 fn varint_size(value: Int) -> Int {
+  // The xz spec allows up to 9 bytes (63 bits), but values above
+  // 2^49 cannot round-trip exactly on JavaScript's number type, so
+  // the table is capped at 8 bytes — every realistic .xz block fits.
   case value {
     n if n < 0x80 -> 1
     n if n < 0x4000 -> 2
@@ -686,8 +689,7 @@ fn varint_size(value: Int) -> Int {
     n if n < 0x8_0000_0000 -> 5
     n if n < 0x400_0000_0000 -> 6
     n if n < 0x2_0000_0000_0000 -> 7
-    n if n < 0x100_0000_0000_0000 -> 8
-    _ -> 9
+    _ -> 8
   }
 }
 
