@@ -1,7 +1,7 @@
 #!/bin/sh
 # mise_bootstrap.sh -- Shared helper that makes mise-managed tools
-# (erlang, gleam, rebar, node) visible on PATH without requiring the
-# caller to have run `mise activate` in the current shell.
+# (erlang, gleam, rebar, node, just) visible on PATH without requiring
+# the caller to have run `mise activate` in the current shell.
 
 _packkit_mise_prepend() {
   case ":${PATH-}:" in
@@ -10,7 +10,7 @@ _packkit_mise_prepend() {
   esac
 }
 
-_PACKKIT_MISE_TOOLS="gleam escript erl rebar3 node"
+_PACKKIT_MISE_TOOLS="gleam escript erl rebar3 node just"
 
 packkit_mise_bootstrap() {
   if [ -n "${HOME:-}" ] && [ -d "$HOME/.local/bin" ]; then
