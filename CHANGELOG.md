@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Extended the Zstandard sequences-section parser to recognise the
+  non-`Predefined_Mode` symbol-description selectors.  `RLE_Mode`
+  builds a one-state FSE table from the inline byte and
+  `FSE_Compressed_Mode` decodes the RFC 8478 §4.1.1.2 distribution
+  header (variable-width count read with 2-bit zero-RLE jumps) to
+  build the table via the existing `internal/fse.build_state_table`
+  primitive.  `Repeat_Mode` still surfaces a typed
+  `CodecNotImplemented` because reusing tables across blocks requires
+  cross-block state the current decoder does not carry.
 - Implemented the DEFLATE dynamic-Huffman encoder
   (`deflate.encode_dynamic`).  It reuses the existing LZ77 match-
   finder, builds per-stream Huffman codes for the literal/length and

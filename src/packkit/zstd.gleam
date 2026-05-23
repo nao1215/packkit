@@ -4,15 +4,21 @@
 //// header descriptor, window descriptor, optional dictionary id,
 //// optional frame content size, optional trailing content checksum)
 //// and walks the block stream.  Raw and RLE blocks decode directly;
-//// compressed blocks (type 2) decode through the predefined FSE
-//// tables in `packkit/internal/fse` when the literals section is in
-//// Raw or RLE mode.  Huffman-compressed literals and non-predefined
-//// FSE compression modes still return `CodecNotImplemented` for now.
+//// compressed blocks (type 2) decode through the FSE tables in
+//// `packkit/internal/fse`.  Sequences with `Predefined_Mode`,
+//// `RLE_Mode`, and `FSE_Compressed_Mode` symbol descriptions all
+//// decode (LL, OF, ML independently).  Literal blocks decode for
+//// `Raw_Literals_Block`, `RLE_Literals_Block`, and the single-stream
+//// `Compressed_Literals_Block` variant; four-stream Huffman literals
+//// and `Treeless_Literals_Block` still return `CodecNotImplemented`,
+//// and `Repeat_Mode` for sequence-symbol descriptions also remains
+//// future work because it spans multiple blocks.
 
 import gleam/bit_array
 import gleam/bool
 import gleam/dict
 import gleam/int
+import gleam/list
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
@@ -478,17 +484,37 @@ fn parse_sequences(
           message: "zstd sequences mode byte has reserved bits set",
         )),
       )
-      use <- bool.guard(
-        when: literal_lengths_mode != 0
-          || offsets_mode != 0
-          || match_lengths_mode != 0,
-        return: Error(error.CodecNotImplemented(
-          feature: "zstd non-predefined FSE compression modes",
-        )),
+      use after_modes <- result.try(slice_after(
+        after_count,
+        1,
+        "zstd sequences mode byte",
+      ))
+      use #(ll_table, ll_log, after_ll) <- result.try(load_sequence_table(
+        after_modes,
+        literal_lengths_mode,
+        SeqAlphabetLl,
+      ))
+      use #(of_table, of_log, after_of) <- result.try(load_sequence_table(
+        after_ll,
+        offsets_mode,
+        SeqAlphabetOf,
+      ))
+      use #(ml_table, ml_log, bitstream) <- result.try(load_sequence_table(
+        after_of,
+        match_lengths_mode,
+        SeqAlphabetMl,
+      ))
+      apply_sequences_with_tables(
+        num_sequences,
+        bitstream,
+        literals,
+        ll_table,
+        ll_log,
+        of_table,
+        of_log,
+        ml_table,
+        ml_log,
       )
-      let assert Ok(bitstream) =
-        bit_array.slice(after_count, 1, bit_array.byte_size(after_count) - 1)
-      apply_sequences_with_predefined(num_sequences, bitstream, literals)
     }
     _ ->
       Error(error.CodecInvalidData(
@@ -497,14 +523,129 @@ fn parse_sequences(
   }
 }
 
-fn apply_sequences_with_predefined(
+/// Identifies which sequence alphabet a table description applies to.
+/// Used to look up the correct predefined distribution, the maximum
+/// allowed accuracy_log, and the maximum symbol value when parsing an
+/// FSE_Compressed_Mode header.
+type SeqAlphabet {
+  SeqAlphabetLl
+  SeqAlphabetOf
+  SeqAlphabetMl
+}
+
+fn alphabet_max_log(alphabet: SeqAlphabet) -> Int {
+  case alphabet {
+    SeqAlphabetLl -> 9
+    SeqAlphabetOf -> 8
+    SeqAlphabetMl -> 9
+  }
+}
+
+fn alphabet_max_symbol(alphabet: SeqAlphabet) -> Int {
+  // The RFC 8478 sequence-symbol alphabets have upper bounds that
+  // both bound the predefined distributions and cap any user-supplied
+  // FSE distribution.
+  case alphabet {
+    SeqAlphabetLl -> 35
+    SeqAlphabetOf -> 31
+    SeqAlphabetMl -> 52
+  }
+}
+
+fn predefined_for(
+  alphabet: SeqAlphabet,
+) -> #(dict.Dict(Int, fse.StateEntry), Int) {
+  case alphabet {
+    SeqAlphabetLl -> #(
+      fse.predefined_literal_length_table(),
+      fse.predefined_literal_length_log(),
+    )
+    SeqAlphabetOf -> #(
+      fse.predefined_offset_table(),
+      fse.predefined_offset_log(),
+    )
+    SeqAlphabetMl -> #(
+      fse.predefined_match_length_table(),
+      fse.predefined_match_length_log(),
+    )
+  }
+}
+
+fn alphabet_label(alphabet: SeqAlphabet) -> String {
+  case alphabet {
+    SeqAlphabetLl -> "literal_length"
+    SeqAlphabetOf -> "offset"
+    SeqAlphabetMl -> "match_length"
+  }
+}
+
+/// Read the table description for one sequence alphabet, honouring the
+/// Predefined / RLE / FSE_Compressed / Repeat selector encoded in the
+/// modes byte.  Returns the materialised state table, its accuracy_log
+/// (so the sequence decoder knows how many bits to read for the
+/// initial state), and the byte slice that immediately follows the
+/// table description.
+fn load_sequence_table(
+  bytes: BitArray,
+  mode: Int,
+  alphabet: SeqAlphabet,
+) -> Result(#(dict.Dict(Int, fse.StateEntry), Int, BitArray), error.CodecError) {
+  case mode {
+    0 -> {
+      let #(table, accuracy_log) = predefined_for(alphabet)
+      Ok(#(table, accuracy_log, bytes))
+    }
+    1 ->
+      case bytes {
+        <<symbol, rest:bytes>> -> {
+          // RLE_Mode: the entire table maps state 0 to the single
+          // symbol with zero baseline and zero nb_bits.  Accuracy_log
+          // is 0 so the decoder reads no bits to seed the state.
+          let table =
+            dict.from_list([
+              #(0, fse.StateEntry(symbol: symbol, nb_bits: 0, baseline: 0)),
+            ])
+          Ok(#(table, 0, rest))
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd "
+            <> alphabet_label(alphabet)
+            <> " RLE mode symbol",
+          ))
+      }
+    2 -> {
+      use #(distribution, accuracy_log, rest) <- result.try(
+        read_fse_distribution(
+          bytes,
+          alphabet_max_log(alphabet),
+          alphabet_max_symbol(alphabet),
+          alphabet_label(alphabet),
+        ),
+      )
+      let table = fse.build_state_table(distribution, accuracy_log)
+      Ok(#(table, accuracy_log, rest))
+    }
+    _ ->
+      Error(error.CodecNotImplemented(
+        feature: "zstd "
+        <> alphabet_label(alphabet)
+        <> " Repeat_Mode (FSE table reuse across blocks)",
+      ))
+  }
+}
+
+fn apply_sequences_with_tables(
   num_sequences: Int,
   bitstream: BitArray,
   literals: BitArray,
+  ll_table: dict.Dict(Int, fse.StateEntry),
+  ll_log: Int,
+  of_table: dict.Dict(Int, fse.StateEntry),
+  of_log: Int,
+  ml_table: dict.Dict(Int, fse.StateEntry),
+  ml_log: Int,
 ) -> Result(BitArray, error.CodecError) {
-  let ll_table = fse.predefined_literal_length_table()
-  let ml_table = fse.predefined_match_length_table()
-  let of_table = fse.predefined_offset_table()
   case fse.new_backward_reader(bitstream) {
     Error(_) ->
       Error(error.CodecInvalidData(
@@ -514,17 +655,17 @@ fn apply_sequences_with_predefined(
       // Read initial states: literal_length first, offset, then match_length
       use #(ll_state, reader) <- result.try(read_state_init(
         reader,
-        fse.predefined_literal_length_log(),
+        ll_log,
         "literal_length",
       ))
       use #(of_state, reader) <- result.try(read_state_init(
         reader,
-        fse.predefined_offset_log(),
+        of_log,
         "offset",
       ))
       use #(ml_state, reader) <- result.try(read_state_init(
         reader,
-        fse.predefined_match_length_log(),
+        ml_log,
         "match_length",
       ))
       let ctx =
@@ -563,6 +704,275 @@ type SeqContext {
     of_table: dict.Dict(Int, fse.StateEntry),
     ml_table: dict.Dict(Int, fse.StateEntry),
   )
+}
+
+// -- FSE distribution decoder (RFC 8478 §4.1.1.2) ----------------------
+//
+// The distribution header is a forward-read bit stream encoded LSB-
+// first inside its enclosing byte sequence.  The first 4 bits hold
+// `Accuracy_Log - 5`; subsequent counts come from a variable-bit
+// state-machine that adjusts its read width as the running total
+// approaches the target table size.  Zero counts trigger a 2-bit RLE
+// jump until a < 3 group terminates the run.  Once the distribution
+// is exhausted the encoder pads the remaining bits in the trailing
+// byte; the FSE sequences bitstream resumes at the next byte boundary.
+
+type FwdBitReader {
+  FwdBitReader(
+    source: BitArray,
+    buffer: Int,
+    bits: Int,
+    overflow: Bool,
+    bits_consumed: Int,
+  )
+}
+
+fn new_fwd_reader(bytes: BitArray) -> FwdBitReader {
+  FwdBitReader(
+    source: bytes,
+    buffer: 0,
+    bits: 0,
+    overflow: False,
+    bits_consumed: 0,
+  )
+}
+
+fn fwd_refill(reader: FwdBitReader, needed: Int) -> FwdBitReader {
+  case reader.bits >= needed || reader.overflow {
+    True -> reader
+    False ->
+      case reader.source {
+        <<b, rest:bytes>> ->
+          fwd_refill(
+            FwdBitReader(
+              source: rest,
+              buffer: int.bitwise_or(
+                reader.buffer,
+                int.bitwise_shift_left(b, reader.bits),
+              ),
+              bits: reader.bits + 8,
+              overflow: False,
+              bits_consumed: reader.bits_consumed,
+            ),
+            needed,
+          )
+        _ -> FwdBitReader(..reader, overflow: True)
+      }
+  }
+}
+
+fn fwd_peek(reader: FwdBitReader, count: Int) -> #(Int, FwdBitReader) {
+  let reader = fwd_refill(reader, count)
+  let mask = int.bitwise_shift_left(1, count) - 1
+  #(int.bitwise_and(reader.buffer, mask), reader)
+}
+
+fn fwd_drop(reader: FwdBitReader, count: Int) -> FwdBitReader {
+  let reader = fwd_refill(reader, count)
+  FwdBitReader(
+    source: reader.source,
+    buffer: int.bitwise_shift_right(reader.buffer, count),
+    bits: reader.bits - count,
+    overflow: reader.overflow,
+    bits_consumed: reader.bits_consumed + count,
+  )
+}
+
+fn fwd_read(
+  reader: FwdBitReader,
+  count: Int,
+  label: String,
+) -> Result(#(Int, FwdBitReader), error.CodecError) {
+  let reader = fwd_refill(reader, count)
+  case reader.bits < count {
+    True -> Error(error.CodecInvalidData(message: "truncated zstd " <> label))
+    False -> {
+      let #(value, reader) = fwd_peek(reader, count)
+      Ok(#(value, fwd_drop(reader, count)))
+    }
+  }
+}
+
+fn read_fse_distribution(
+  bytes: BitArray,
+  max_accuracy_log: Int,
+  max_symbol: Int,
+  label: String,
+) -> Result(#(List(Int), Int, BitArray), error.CodecError) {
+  let reader = new_fwd_reader(bytes)
+  use #(accuracy_minus_5, reader) <- result.try(fwd_read(
+    reader,
+    4,
+    label <> " distribution accuracy_log",
+  ))
+  let accuracy_log = accuracy_minus_5 + 5
+  use <- bool.guard(
+    when: accuracy_log > max_accuracy_log,
+    return: Error(error.CodecInvalidData(
+      message: "zstd "
+      <> label
+      <> " FSE accuracy_log exceeds the alphabet's maximum",
+    )),
+  )
+  let table_size = int.bitwise_shift_left(1, accuracy_log)
+  use #(counts, reader) <- result.try(decode_fse_distribution(
+    reader,
+    accuracy_log,
+    table_size + 1,
+    table_size,
+    accuracy_log + 1,
+    False,
+    0,
+    max_symbol,
+    [],
+    label,
+  ))
+  // The trailing bits inside the current byte are padding; the next
+  // byte starts the section after the table description.
+  let bytes_consumed = { reader.bits_consumed + 7 } / 8
+  let total = bit_array.byte_size(bytes)
+  case bit_array.slice(bytes, bytes_consumed, total - bytes_consumed) {
+    Ok(rest) ->
+      Ok(#(pad_distribution(counts, max_symbol + 1), accuracy_log, rest))
+    Error(_) ->
+      Error(error.CodecInvalidData(
+        message: "truncated zstd " <> label <> " FSE distribution tail",
+      ))
+  }
+}
+
+fn decode_fse_distribution(
+  reader: FwdBitReader,
+  _accuracy_log: Int,
+  remaining: Int,
+  threshold: Int,
+  bit_count: Int,
+  previous_is_zero: Bool,
+  charnum: Int,
+  max_symbol: Int,
+  acc: List(Int),
+  label: String,
+) -> Result(#(List(Int), FwdBitReader), error.CodecError) {
+  case remaining > 1 && charnum <= max_symbol {
+    False -> Ok(#(list.reverse(acc), reader))
+    True ->
+      case previous_is_zero {
+        True -> {
+          use #(extra, reader) <- result.try(read_zero_rle(reader, label))
+          let acc = prepend_zeros(extra, acc)
+          decode_fse_distribution(
+            reader,
+            0,
+            remaining,
+            threshold,
+            bit_count,
+            False,
+            charnum + extra,
+            max_symbol,
+            acc,
+            label,
+          )
+        }
+        False -> {
+          let #(value, reader) = fwd_peek(reader, bit_count)
+          let #(count, bits_consumed) =
+            decode_count_bits(value, threshold, remaining, bit_count)
+          let reader = fwd_drop(reader, bits_consumed)
+          let probability = count - 1
+          let abs_prob = case probability < 0 {
+            True -> -probability
+            False -> probability
+          }
+          let remaining = remaining - abs_prob
+          let previous_is_zero = probability == 0
+          let #(threshold, bit_count) =
+            shrink_threshold(threshold, bit_count, remaining)
+          decode_fse_distribution(
+            reader,
+            0,
+            remaining,
+            threshold,
+            bit_count,
+            previous_is_zero,
+            charnum + 1,
+            max_symbol,
+            [probability, ..acc],
+            label,
+          )
+        }
+      }
+  }
+}
+
+/// Split out of `decode_fse_distribution` so the dominant case (short
+/// form) doesn't dominate the inner block's indentation budget.
+fn decode_count_bits(
+  value: Int,
+  threshold: Int,
+  remaining: Int,
+  bit_count: Int,
+) -> #(Int, Int) {
+  let max_val = 2 * threshold - 1 - remaining
+  case int.bitwise_and(value, threshold - 1) < max_val {
+    True -> #(int.bitwise_and(value, threshold - 1), bit_count - 1)
+    False -> {
+      let raw = int.bitwise_and(value, 2 * threshold - 1)
+      let adjusted = case raw >= threshold {
+        True -> raw - max_val
+        False -> raw
+      }
+      #(adjusted, bit_count)
+    }
+  }
+}
+
+fn read_zero_rle(
+  reader: FwdBitReader,
+  label: String,
+) -> Result(#(Int, FwdBitReader), error.CodecError) {
+  read_zero_rle_loop(reader, 0, label)
+}
+
+fn read_zero_rle_loop(
+  reader: FwdBitReader,
+  acc: Int,
+  label: String,
+) -> Result(#(Int, FwdBitReader), error.CodecError) {
+  use #(value, reader) <- result.try(fwd_read(
+    reader,
+    2,
+    label <> " FSE distribution zero-RLE flag",
+  ))
+  case value {
+    3 -> read_zero_rle_loop(reader, acc + 3, label)
+    n -> Ok(#(acc + n, reader))
+  }
+}
+
+fn shrink_threshold(
+  threshold: Int,
+  bit_count: Int,
+  remaining: Int,
+) -> #(Int, Int) {
+  case remaining < threshold {
+    True -> shrink_threshold(threshold / 2, bit_count - 1, remaining)
+    False -> #(threshold, bit_count)
+  }
+}
+
+fn prepend_zeros(count: Int, acc: List(Int)) -> List(Int) {
+  case count {
+    n if n <= 0 -> acc
+    _ -> prepend_zeros(count - 1, [0, ..acc])
+  }
+}
+
+fn pad_distribution(counts: List(Int), target: Int) -> List(Int) {
+  let current = list.length(counts)
+  case current >= target {
+    True -> counts
+    False -> list.append(counts, list.repeat(0, target - current))
+  }
 }
 
 fn read_state_init(
