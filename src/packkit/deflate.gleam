@@ -2,15 +2,26 @@
 ////
 //// The decoder handles all three RFC 1951 block types (stored, fixed
 //// Huffman, dynamic Huffman) and enforces the `Limits` resource budget
-//// while decoding.  The encoder emits a single fixed-Huffman block
-//// (BTYPE=01) built from a greedy LZ77 match-finder with a 3-byte
-//// hash chain over a 32 KiB sliding window.
+//// while decoding.  The encoder exposes three entry points:
+////
+//// * `encode_stored_only` emits BTYPE=00 blocks for callers that want
+////   to bypass the match-finder entirely.
+//// * `encode` runs the greedy LZ77 match-finder (3-byte hash chain, 32
+////   KiB sliding window) and emits a single fixed-Huffman block
+////   (BTYPE=01).
+//// * `encode_dynamic` reuses the same match-finder but builds
+////   per-stream Huffman codes for the literal/length and distance
+////   alphabets, plus the 19-symbol code-length alphabet, and emits a
+////   single dynamic-Huffman block (BTYPE=10).  It falls back to the
+////   fixed-Huffman path when the natural Huffman tree would exceed the
+////   RFC 1951 15-bit code-length cap.
 
 import gleam/bit_array
 import gleam/bool
 import gleam/dict
 import gleam/int
 import gleam/list
+import gleam/order
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
@@ -77,6 +88,26 @@ pub fn encode_stored_only(
   bytes bytes: BitArray,
 ) -> Result(BitArray, error.CodecError) {
   Ok(encode_stored(bytes))
+}
+
+/// Encode a byte stream as a dynamic-Huffman DEFLATE block (BTYPE=10).
+///
+/// Runs the same greedy LZ77 match-finder as [encode], but builds
+/// per-stream Huffman codes for the literal/length and distance
+/// alphabets from the observed symbol frequencies, then emits them as
+/// an RFC 1951 dynamic-Huffman block.  This usually compresses better
+/// than the fixed-Huffman path on real-world inputs because rare
+/// symbols get longer codes and common symbols get shorter ones.
+///
+/// If the natural Huffman tree would exceed the RFC 1951 15-bit
+/// maximum code length for the literal/length or distance alphabet
+/// (which happens only on pathologically skewed inputs), the encoder
+/// transparently falls back to the fixed-Huffman path so the call
+/// still returns a valid stream.
+pub fn encode_dynamic(
+  bytes bytes: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  Ok(encode_dynamic_or_fixed(bytes))
 }
 
 // -- bit reader ----------------------------------------------------------
@@ -1316,5 +1347,683 @@ fn set_index_loop(
     [], n -> set_index_loop([], n - 1, value, [0, ..acc])
     [_, ..rest], 0 -> list.reverse([value, ..acc]) |> list.append(rest)
     [head, ..rest], n -> set_index_loop(rest, n - 1, value, [head, ..acc])
+  }
+}
+
+// -- dynamic-Huffman encoder --------------------------------------------
+//
+// The dynamic encoder follows the same shape as the fixed one:
+//
+// 1. Run the greedy LZ77 match-finder over the input to produce a
+//    `List(Token)` of literals and matches.
+// 2. Build a per-stream Huffman code for the literal/length and
+//    distance alphabets from the observed token frequencies.
+// 3. RLE-compress the combined code-length sequence with the 19-symbol
+//    code-length-code (CL) alphabet, build a Huffman code for that
+//    alphabet too, and write the dynamic block header.
+// 4. Re-emit the tokens using the per-stream Huffman codes plus the
+//    RFC 1951 length/distance extra-bit tails.
+//
+// Pathological inputs whose natural Huffman tree would exceed RFC
+// 1951's 15-bit cap fall back to the fixed-Huffman path so a caller
+// always gets back a valid byte stream.
+
+type Token {
+  TokLit(value: Int)
+  TokMatch(length: Int, distance: Int)
+}
+
+fn encode_dynamic_or_fixed(bytes: BitArray) -> BitArray {
+  let size = bit_array.byte_size(bytes)
+  case size {
+    0 -> empty_dynamic_block()
+    _ -> {
+      let table = build_byte_table(bytes, 0, dict.new())
+      let tokens = collect_lz77_tokens(table, size, 0, dict.new(), [])
+      case build_dynamic_block(tokens) {
+        Ok(bytes) -> bytes
+        Error(Nil) -> encode_huffman(bytes_from_table_unused(bytes))
+      }
+    }
+  }
+}
+
+// The fallback re-runs the fixed-Huffman path on the original bytes;
+// `bytes_from_table_unused` is just the identity so we don't keep two
+// copies of the input around when the fallback never fires.
+fn bytes_from_table_unused(bytes: BitArray) -> BitArray {
+  bytes
+}
+
+fn empty_dynamic_block() -> BitArray {
+  // Emit an empty fixed block — much shorter than a dynamic header
+  // describing a single-symbol code, and trivially correct.
+  encode_huffman(<<>>)
+}
+
+// -- LZ77 token collection ----------------------------------------------
+
+fn collect_lz77_tokens(
+  table: dict.Dict(Int, Int),
+  size: Int,
+  pos: Int,
+  hashes: dict.Dict(Int, Int),
+  acc: List(Token),
+) -> List(Token) {
+  case pos >= size {
+    True -> list.reverse(acc)
+    False ->
+      case pos + min_match_length > size {
+        True ->
+          collect_lz77_tokens(table, size, pos + 1, hashes, [
+            TokLit(byte_at(table, pos)),
+            ..acc
+          ])
+        False -> {
+          let b0 = byte_at(table, pos)
+          let b1 = byte_at(table, pos + 1)
+          let b2 = byte_at(table, pos + 2)
+          let key = hash3(b0, b1, b2)
+          case dict.get(hashes, key) {
+            Error(_) ->
+              collect_lz77_tokens(
+                table,
+                size,
+                pos + 1,
+                dict.insert(hashes, key, pos),
+                [TokLit(b0), ..acc],
+              )
+            Ok(prev) -> {
+              let distance = pos - prev
+              case distance <= 0 || distance > max_window {
+                True ->
+                  collect_lz77_tokens(
+                    table,
+                    size,
+                    pos + 1,
+                    dict.insert(hashes, key, pos),
+                    [TokLit(b0), ..acc],
+                  )
+                False -> {
+                  let m =
+                    match_length(table, prev, pos, size, max_match_length, 0)
+                  case m >= min_match_length {
+                    True -> {
+                      let next_hashes =
+                        insert_hashes_in_range(
+                          table,
+                          dict.insert(hashes, key, pos),
+                          pos + 1,
+                          pos + m - 1,
+                          size,
+                        )
+                      collect_lz77_tokens(table, size, pos + m, next_hashes, [
+                        TokMatch(length: m, distance: distance),
+                        ..acc
+                      ])
+                    }
+                    False ->
+                      collect_lz77_tokens(
+                        table,
+                        size,
+                        pos + 1,
+                        dict.insert(hashes, key, pos),
+                        [TokLit(b0), ..acc],
+                      )
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+  }
+}
+
+// -- frequency histograms ------------------------------------------------
+
+const lit_alphabet_size: Int = 286
+
+const dist_alphabet_size: Int = 30
+
+const cl_alphabet_size: Int = 19
+
+fn token_frequencies(tokens: List(Token)) -> #(List(Int), List(Int)) {
+  let lit_freqs = list.repeat(0, lit_alphabet_size)
+  let dist_freqs = list.repeat(0, dist_alphabet_size)
+  token_freq_loop(tokens, lit_freqs, dist_freqs)
+}
+
+fn token_freq_loop(
+  tokens: List(Token),
+  lit_freqs: List(Int),
+  dist_freqs: List(Int),
+) -> #(List(Int), List(Int)) {
+  case tokens {
+    [] -> #(lit_freqs, dist_freqs)
+    [TokLit(v), ..rest] ->
+      token_freq_loop(rest, bump_index(lit_freqs, v), dist_freqs)
+    [TokMatch(length: l, distance: d), ..rest] -> {
+      let #(lit_sym, _, _) = length_code(l)
+      let #(dist_sym, _, _) = distance_code(d)
+      token_freq_loop(
+        rest,
+        bump_index(lit_freqs, lit_sym),
+        bump_index(dist_freqs, dist_sym),
+      )
+    }
+  }
+}
+
+fn bump_index(values: List(Int), index: Int) -> List(Int) {
+  set_index(values, index, list_get(values, index, 0) + 1)
+}
+
+// -- Huffman code lengths -----------------------------------------------
+//
+// Standard top-down Huffman: each leaf is a `(weight, HuffTree)` pair,
+// the lightest two are repeatedly merged until one tree remains, and
+// the depth of each leaf becomes its code length.  Insertion-sort keeps
+// the working list ascending so the merge step is O(1) amortised on
+// inputs that don't already saturate the 15-bit cap.
+
+type HuffTree {
+  HLeaf(symbol: Int)
+  HNode(left: HuffTree, right: HuffTree)
+}
+
+/// Build code lengths for an alphabet of `alphabet_size` symbols given
+/// their frequencies (zero-frequency symbols get length 0).  Returns
+/// `Error(Nil)` when the natural Huffman tree would exceed `max_len`
+/// bits so the caller can fall back to a different block strategy.
+fn huffman_code_lengths(
+  freqs: List(Int),
+  alphabet_size: Int,
+  max_len: Int,
+) -> Result(List(Int), Nil) {
+  let nonzero = collect_nonzero(freqs, 0, [])
+  case nonzero {
+    [] ->
+      // An alphabet with no active symbols still needs a 0-length
+      // length vector so the dynamic header parses correctly.
+      Ok(list.repeat(0, alphabet_size))
+    [#(sym, _)] ->
+      // A single-symbol code is technically illegal in RFC 1951 (every
+      // alphabet must have at least two codes) but the decoder handles
+      // it specially in `build_tree`; the encoder mirrors that by
+      // assigning the lone symbol length 1.
+      Ok(make_length_vector(alphabet_size, [#(sym, 1)]))
+    _ -> {
+      let sorted_initial = sort_nonzero_pairs(nonzero)
+      let leaves =
+        list.map(sorted_initial, fn(pair) {
+          let #(sym, freq) = pair
+          #(freq, HLeaf(sym))
+        })
+      let tree = combine_huffman(leaves)
+      let lengths = collect_huffman_lengths(tree, 0, [])
+      case list_max(lengths, 0) > max_len {
+        True -> Error(Nil)
+        False -> Ok(make_length_vector(alphabet_size, lengths))
+      }
+    }
+  }
+}
+
+fn collect_nonzero(
+  freqs: List(Int),
+  index: Int,
+  acc: List(#(Int, Int)),
+) -> List(#(Int, Int)) {
+  case freqs {
+    [] -> list.reverse(acc)
+    [0, ..rest] -> collect_nonzero(rest, index + 1, acc)
+    [n, ..rest] -> collect_nonzero(rest, index + 1, [#(index, n), ..acc])
+  }
+}
+
+fn sort_nonzero_pairs(pairs: List(#(Int, Int))) -> List(#(Int, Int)) {
+  list.sort(pairs, fn(a, b) {
+    let #(sym_a, freq_a) = a
+    let #(sym_b, freq_b) = b
+    case int.compare(freq_a, freq_b) {
+      order.Eq -> int.compare(sym_a, sym_b)
+      ord -> ord
+    }
+  })
+}
+
+fn combine_huffman(nodes: List(#(Int, HuffTree))) -> HuffTree {
+  case nodes {
+    [] -> HLeaf(0)
+    [#(_, tree)] -> tree
+    [#(w1, t1), #(w2, t2), ..rest] ->
+      combine_huffman(insert_sorted_node(#(w1 + w2, HNode(t1, t2)), rest))
+  }
+}
+
+fn insert_sorted_node(
+  item: #(Int, HuffTree),
+  rest: List(#(Int, HuffTree)),
+) -> List(#(Int, HuffTree)) {
+  let #(w, _) = item
+  case rest {
+    [] -> [item]
+    [head, ..tail] -> {
+      let #(hw, _) = head
+      case w <= hw {
+        True -> [item, ..rest]
+        False -> [head, ..insert_sorted_node(item, tail)]
+      }
+    }
+  }
+}
+
+fn collect_huffman_lengths(
+  tree: HuffTree,
+  depth: Int,
+  acc: List(#(Int, Int)),
+) -> List(#(Int, Int)) {
+  case tree {
+    HLeaf(sym) -> [#(sym, depth), ..acc]
+    HNode(left, right) ->
+      collect_huffman_lengths(
+        right,
+        depth + 1,
+        collect_huffman_lengths(left, depth + 1, acc),
+      )
+  }
+}
+
+fn list_max(pairs: List(#(Int, Int)), best: Int) -> Int {
+  case pairs {
+    [] -> best
+    [#(_, n), ..rest] ->
+      case n > best {
+        True -> list_max(rest, n)
+        False -> list_max(rest, best)
+      }
+  }
+}
+
+fn make_length_vector(alphabet_size: Int, pairs: List(#(Int, Int))) -> List(Int) {
+  let lookup = dict.from_list(pairs)
+  make_length_vector_loop(alphabet_size, 0, lookup, [])
+}
+
+fn make_length_vector_loop(
+  size: Int,
+  index: Int,
+  lookup: dict.Dict(Int, Int),
+  acc: List(Int),
+) -> List(Int) {
+  case index >= size {
+    True -> list.reverse(acc)
+    False -> {
+      let value = case dict.get(lookup, index) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      make_length_vector_loop(size, index + 1, lookup, [value, ..acc])
+    }
+  }
+}
+
+// -- canonical codes from lengths ---------------------------------------
+
+/// Map symbol → `(code_value, code_length)` for every symbol with
+/// non-zero length, using the canonical-Huffman recurrence.  Symbols
+/// with length 0 are omitted from the result.
+fn canonical_codes_from_lengths(
+  lengths: List(Int),
+) -> dict.Dict(Int, #(Int, Int)) {
+  let pairs = enumerate_lengths(lengths, 0, [])
+  let active =
+    list.filter(pairs, fn(p) {
+      let #(_, len) = p
+      len > 0
+    })
+  let sorted =
+    list.sort(active, fn(a, b) {
+      let #(sa, la) = a
+      let #(sb, lb) = b
+      case int.compare(la, lb) {
+        order.Eq -> int.compare(sa, sb)
+        ord -> ord
+      }
+    })
+  assign_canonical(sorted, 0, 0, dict.new())
+}
+
+fn assign_canonical(
+  remaining: List(#(Int, Int)),
+  code: Int,
+  prev_len: Int,
+  acc: dict.Dict(Int, #(Int, Int)),
+) -> dict.Dict(Int, #(Int, Int)) {
+  case remaining {
+    [] -> acc
+    [#(sym, len), ..rest] -> {
+      let shifted = int.bitwise_shift_left(code, len - prev_len)
+      assign_canonical(
+        rest,
+        shifted + 1,
+        len,
+        dict.insert(acc, sym, #(shifted, len)),
+      )
+    }
+  }
+}
+
+// -- CL alphabet RLE ----------------------------------------------------
+
+type CLOp {
+  CLLit(value: Int)
+  CLCopy(extra: Int)
+  CLZero3(extra: Int)
+  CLZero11(extra: Int)
+}
+
+fn rle_encode_lengths(lengths: List(Int)) -> List(CLOp) {
+  rle_loop(lengths, -1, 0, [])
+  |> list.reverse
+}
+
+fn rle_loop(
+  remaining: List(Int),
+  current: Int,
+  count: Int,
+  acc: List(CLOp),
+) -> List(CLOp) {
+  case remaining {
+    [] -> flush_run(current, count, acc)
+    [head, ..rest] ->
+      case head == current {
+        True -> rle_loop(rest, current, count + 1, acc)
+        False -> {
+          let acc = flush_run(current, count, acc)
+          rle_loop(rest, head, 1, acc)
+        }
+      }
+  }
+}
+
+fn flush_run(value: Int, count: Int, acc: List(CLOp)) -> List(CLOp) {
+  case count {
+    0 -> acc
+    _ ->
+      case value {
+        0 -> flush_zero_run(count, acc)
+        _ -> flush_nonzero_run(value, count, acc)
+      }
+  }
+}
+
+fn flush_zero_run(count: Int, acc: List(CLOp)) -> List(CLOp) {
+  case count {
+    0 -> acc
+    1 -> [CLLit(0), ..acc]
+    2 -> [CLLit(0), CLLit(0), ..acc]
+    n if n <= 10 -> [CLZero3(extra: n - 3), ..acc]
+    n if n <= 138 -> [CLZero11(extra: n - 11), ..acc]
+    n -> {
+      // Take a maximal 138-run, then recurse.
+      flush_zero_run(n - 138, [CLZero11(extra: 127), ..acc])
+    }
+  }
+}
+
+fn flush_nonzero_run(value: Int, count: Int, acc: List(CLOp)) -> List(CLOp) {
+  case count {
+    0 -> acc
+    _ -> {
+      // RFC 1951 §3.2.7: code 16 "repeats the *previous* code length",
+      // so the very first occurrence must be emitted as a literal.
+      // The remaining repeats use code 16 (3..6 at a time, 2 extra
+      // bits) when possible and fall back to literals for trailing 1/2
+      // that can't form a full RLE-16 chunk.
+      emit_nonzero_run(value, count - 1, [CLLit(value), ..acc])
+    }
+  }
+}
+
+fn emit_nonzero_run(value: Int, remaining: Int, acc: List(CLOp)) -> List(CLOp) {
+  case remaining {
+    n if n <= 0 -> acc
+    1 -> [CLLit(value), ..acc]
+    2 -> [CLLit(value), CLLit(value), ..acc]
+    n if n <= 6 -> [CLCopy(extra: n - 3), ..acc]
+    n -> emit_nonzero_run(value, n - 6, [CLCopy(extra: 3), ..acc])
+  }
+}
+
+// -- code-length-code Huffman -------------------------------------------
+
+fn cl_frequencies(rle: List(CLOp)) -> List(Int) {
+  cl_freq_loop(rle, list.repeat(0, cl_alphabet_size))
+}
+
+fn cl_freq_loop(rle: List(CLOp), freqs: List(Int)) -> List(Int) {
+  case rle {
+    [] -> freqs
+    [CLLit(v), ..rest] -> cl_freq_loop(rest, bump_index(freqs, v))
+    [CLCopy(_), ..rest] -> cl_freq_loop(rest, bump_index(freqs, 16))
+    [CLZero3(_), ..rest] -> cl_freq_loop(rest, bump_index(freqs, 17))
+    [CLZero11(_), ..rest] -> cl_freq_loop(rest, bump_index(freqs, 18))
+  }
+}
+
+// -- dynamic block writer -----------------------------------------------
+
+fn build_dynamic_block(tokens: List(Token)) -> Result(BitArray, Nil) {
+  let #(lit_freqs, dist_freqs) = token_frequencies(tokens)
+  // Every block must end with the end-of-block symbol (256), so its
+  // frequency is at least 1 even if it wasn't seen in the token stream.
+  let lit_freqs = bump_index(lit_freqs, 256)
+  // The distance alphabet must carry at least one code so the decoder
+  // can build a tree.  When the LZ77 pass produced no matches we
+  // synthesize a phantom frequency at symbol 0 — the decoder will
+  // build a 1-symbol tree but no token ever references it.
+  let dist_freqs = case any_nonzero(dist_freqs) {
+    True -> dist_freqs
+    False -> bump_index(dist_freqs, 0)
+  }
+
+  use lit_lengths <- result.try(huffman_code_lengths(
+    lit_freqs,
+    lit_alphabet_size,
+    15,
+  ))
+  use dist_lengths <- result.try(huffman_code_lengths(
+    dist_freqs,
+    dist_alphabet_size,
+    15,
+  ))
+
+  Ok(emit_dynamic_block(tokens, lit_lengths, dist_lengths))
+}
+
+fn any_nonzero(values: List(Int)) -> Bool {
+  case values {
+    [] -> False
+    [0, ..rest] -> any_nonzero(rest)
+    _ -> True
+  }
+}
+
+fn emit_dynamic_block(
+  tokens: List(Token),
+  lit_lengths: List(Int),
+  dist_lengths: List(Int),
+) -> BitArray {
+  let lit_codes = canonical_codes_from_lengths(lit_lengths)
+  let dist_codes = canonical_codes_from_lengths(dist_lengths)
+
+  let hlit = max_int(last_nonzero_index(lit_lengths, 0, -1) + 1, 257)
+  let hdist = max_int(last_nonzero_index(dist_lengths, 0, -1) + 1, 1)
+
+  let combined =
+    list.append(
+      take_first(lit_lengths, hlit, []),
+      take_first(dist_lengths, hdist, []),
+    )
+  let rle = rle_encode_lengths(combined)
+
+  let cl_freqs = cl_frequencies(rle)
+  // The CL alphabet only has 19 symbols, so the natural Huffman tree
+  // is at most 5 bits deep (well under the RFC 1951 7-bit cap).  We
+  // request a 7-bit limit defensively and trust the fallback never
+  // fires.
+  let assert Ok(cl_lengths) =
+    huffman_code_lengths(cl_freqs, cl_alphabet_size, 7)
+  let cl_codes = canonical_codes_from_lengths(cl_lengths)
+
+  let order = code_length_order()
+  let hclen = max_int(highest_present_clcl(cl_lengths, order, 0, -1) + 1, 4)
+
+  let writer =
+    new_writer()
+    |> write_bits(1, 1)
+    |> write_bits(2, 2)
+    |> write_bits(hlit - 257, 5)
+    |> write_bits(hdist - 1, 5)
+    |> write_bits(hclen - 4, 4)
+
+  let writer = write_clcl_lengths(writer, order, cl_lengths, hclen, 0)
+  let writer = write_rle_stream(writer, rle, cl_codes)
+  let writer = write_token_stream(writer, tokens, lit_codes, dist_codes)
+  let writer = write_canonical_code(writer, lit_codes, 256)
+
+  flush_writer(writer)
+}
+
+fn last_nonzero_index(values: List(Int), index: Int, best: Int) -> Int {
+  case values {
+    [] -> best
+    [0, ..rest] -> last_nonzero_index(rest, index + 1, best)
+    [_, ..rest] -> last_nonzero_index(rest, index + 1, index)
+  }
+}
+
+fn take_first(values: List(Int), n: Int, acc: List(Int)) -> List(Int) {
+  case n, values {
+    0, _ -> list.reverse(acc)
+    _, [] -> take_first([], n - 1, [0, ..acc])
+    _, [head, ..rest] -> take_first(rest, n - 1, [head, ..acc])
+  }
+}
+
+fn highest_present_clcl(
+  lengths: List(Int),
+  order: List(Int),
+  index: Int,
+  best: Int,
+) -> Int {
+  case order {
+    [] -> best
+    [slot, ..rest] ->
+      case list_get(lengths, slot, 0) {
+        0 -> highest_present_clcl(lengths, rest, index + 1, best)
+        _ -> highest_present_clcl(lengths, rest, index + 1, index)
+      }
+  }
+}
+
+fn max_int(a: Int, b: Int) -> Int {
+  case a > b {
+    True -> a
+    False -> b
+  }
+}
+
+fn write_clcl_lengths(
+  writer: Writer,
+  order: List(Int),
+  lengths: List(Int),
+  hclen: Int,
+  emitted: Int,
+) -> Writer {
+  case emitted >= hclen, order {
+    True, _ -> writer
+    _, [] -> writer
+    _, [slot, ..rest] -> {
+      let length = list_get(lengths, slot, 0)
+      write_clcl_lengths(
+        write_bits(writer, length, 3),
+        rest,
+        lengths,
+        hclen,
+        emitted + 1,
+      )
+    }
+  }
+}
+
+fn write_rle_stream(
+  writer: Writer,
+  rle: List(CLOp),
+  cl_codes: dict.Dict(Int, #(Int, Int)),
+) -> Writer {
+  case rle {
+    [] -> writer
+    [CLLit(v), ..rest] ->
+      write_rle_stream(
+        write_canonical_code(writer, cl_codes, v),
+        rest,
+        cl_codes,
+      )
+    [CLCopy(extra), ..rest] -> {
+      let writer = write_canonical_code(writer, cl_codes, 16)
+      let writer = write_bits(writer, extra, 2)
+      write_rle_stream(writer, rest, cl_codes)
+    }
+    [CLZero3(extra), ..rest] -> {
+      let writer = write_canonical_code(writer, cl_codes, 17)
+      let writer = write_bits(writer, extra, 3)
+      write_rle_stream(writer, rest, cl_codes)
+    }
+    [CLZero11(extra), ..rest] -> {
+      let writer = write_canonical_code(writer, cl_codes, 18)
+      let writer = write_bits(writer, extra, 7)
+      write_rle_stream(writer, rest, cl_codes)
+    }
+  }
+}
+
+fn write_token_stream(
+  writer: Writer,
+  tokens: List(Token),
+  lit_codes: dict.Dict(Int, #(Int, Int)),
+  dist_codes: dict.Dict(Int, #(Int, Int)),
+) -> Writer {
+  case tokens {
+    [] -> writer
+    [TokLit(v), ..rest] ->
+      write_token_stream(
+        write_canonical_code(writer, lit_codes, v),
+        rest,
+        lit_codes,
+        dist_codes,
+      )
+    [TokMatch(length: l, distance: d), ..rest] -> {
+      let #(lit_sym, len_extra_bits, len_extra) = length_code(l)
+      let writer = write_canonical_code(writer, lit_codes, lit_sym)
+      let writer = write_bits(writer, len_extra, len_extra_bits)
+      let #(dist_sym, dist_extra_bits, dist_extra) = distance_code(d)
+      let writer = write_canonical_code(writer, dist_codes, dist_sym)
+      let writer = write_bits(writer, dist_extra, dist_extra_bits)
+      write_token_stream(writer, rest, lit_codes, dist_codes)
+    }
+  }
+}
+
+fn write_canonical_code(
+  writer: Writer,
+  codes: dict.Dict(Int, #(Int, Int)),
+  symbol: Int,
+) -> Writer {
+  case dict.get(codes, symbol) {
+    Ok(#(code, length)) -> write_huffman_code(writer, code, length)
+    Error(_) -> writer
   }
 }

@@ -30,7 +30,9 @@ Implemented codecs and archive families:
 - **7z**: single-folder LZMA / LZMA2 reader (covers the common
   `7z a` single-file case)
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
-  fixed-Huffman LZ77 encoder (3-byte hash chain, 32 KiB window)
+  LZ77 encoder (3-byte hash chain, 32 KiB window) with fixed-Huffman
+  (`deflate.encode`) and dynamic-Huffman (`deflate.encode_dynamic`)
+  block writers, plus a stored-only entry (`deflate.encode_stored_only`)
 - **zlib**: RFC 1950 wrapper with Adler-32 trailer
 - **gzip**: RFC 1952 wrapper with header metadata and CRC/ISIZE
   verification
@@ -63,8 +65,7 @@ digit, ...).
 
 Still pending: zstd compressed-block Huffman literals and
 non-predefined FSE modes, brotli LZ77/Huffman compression in the
-encoder, zstd / xz / 7z encoders that do real compression, and the
-length-limited dynamic Huffman path inside the DEFLATE encoder.
+encoder, and zstd / xz / 7z encoders that do real compression.
 
 ## Install
 

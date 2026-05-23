@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Implemented the DEFLATE dynamic-Huffman encoder
+  (`deflate.encode_dynamic`).  It reuses the existing LZ77 match-
+  finder, builds per-stream Huffman codes for the literal/length and
+  distance alphabets from the observed token frequencies, then RLE-
+  compresses the combined code-length sequence with the 19-symbol
+  code-length alphabet and writes an RFC 1951 BTYPE=10 block.  On
+  inputs whose natural Huffman tree would exceed the 15-bit code-
+  length cap the encoder transparently falls back to the fixed-
+  Huffman path so callers always get back a valid stream.
+- Hardened 7z decoder limits: `seven_z.decode_with_limits` now
+  enforces `max_members` against the declared file count and
+  `max_output_bytes` against the declared unpack size before the
+  LZMA/LZMA2 range coder runs.  Previously only `max_input_bytes`
+  and `max_entry_depth` were checked, so a hostile archive could
+  force a multi-GB allocation by advertising a huge unpack size.
+- Lifted the convenience helpers `add_file` / `add_directory` /
+  `add_symlink` / `add_hardlink` (and `_checked` variants) into
+  `packkit/archive` so every format (tar / cpio / ar / zip / 7z) can
+  share them.  Previously only `packkit/tar` exposed these wrappers.
 - Fixed an LZW decoder width-promote off-by-one bug that injected a
   phantom `0` byte into round trips of the 256-byte sequence
   `[0..255]`.  The encoder pads to the 9-bit byte-block boundary
