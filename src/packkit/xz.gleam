@@ -24,9 +24,176 @@ pub fn codec() -> codecs.Codec {
   codecs.xz()
 }
 
-/// Encode `bytes` as an xz stream.  Not yet implemented.
-pub fn encode(bytes _bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  Error(error.CodecNotImplemented(feature: "xz.encode"))
+/// Encode `bytes` as an xz stream.  The encoder always emits a single
+/// block with an LZMA2 filter chain that contains only uncompressed
+/// chunks — every conforming xz decoder accepts the output, but the
+/// payload is preserved verbatim rather than compressed.  A
+/// compression-aware encoder (LZMA range coder) is intentionally future
+/// work.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+  let size = bit_array.byte_size(bytes)
+  let stream_header = encode_stream_header()
+  let lzma2_payload = encode_lzma2_uncompressed(bytes, size)
+  let block_header = encode_block_header(bit_array.byte_size(lzma2_payload))
+  let block_check = <<checksum.crc32(bytes):size(32)-little>>
+  let block_body = bit_array.concat([block_header, lzma2_payload])
+  let block_padding =
+    pad_zero_bytes(padding_to_align(bit_array.byte_size(block_body), 4))
+  let block_full = bit_array.concat([block_body, block_padding, block_check])
+  let unpadded =
+    bit_array.byte_size(block_header)
+    + bit_array.byte_size(lzma2_payload)
+    + bit_array.byte_size(block_check)
+  let index = encode_index(unpadded, size)
+  let footer = encode_stream_footer(bit_array.byte_size(index))
+  Ok(bit_array.concat([stream_header, block_full, index, footer]))
+}
+
+fn encode_stream_header() -> BitArray {
+  // Magic + Stream Flags + CRC32(flags).  Flags = 0x00 0x01 (CRC32 check).
+  let flags = <<0x00, 0x01>>
+  let crc = checksum.crc32(flags)
+  bit_array.concat([
+    <<0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00>>,
+    flags,
+    <<crc:size(32)-little>>,
+  ])
+}
+
+fn encode_block_header(compressed_size: Int) -> BitArray {
+  // Block_Flags = 0xC0: 1 filter, both sizes present.  Compressed size
+  // = `compressed_size`, uncompressed size = compressed_size (since
+  // every chunk is uncompressed).  Filter: LZMA2 (id 0x21) with a
+  // 1-byte properties value of 0x16 (matches what `xz -c` emits).
+  let comp_vi = encode_varint(compressed_size)
+  let uncomp_vi = encode_varint(compressed_size - 1 - 2 - 1)
+  // Header size is rounded up to a multiple of 4 and stored as
+  // `(size / 4) - 1` in the first byte.  We pad with zeros and append
+  // a CRC32 over the header.
+  let _ = uncomp_vi
+  let pre_pad =
+    bit_array.concat([
+      <<0xC0>>,
+      comp_vi,
+      encode_varint(payload_uncompressed_size(compressed_size)),
+      <<0x21, 0x01, 0x16>>,
+    ])
+  let body_len_no_size_byte = bit_array.byte_size(pre_pad) + 1
+  // header_size_minus_crc is body_len + 1 for the size byte itself.
+  // Total header size must be a multiple of 4.
+  let total_no_pad = body_len_no_size_byte + 4
+  let total_size = round_up_to_4(total_no_pad)
+  let header_size_byte = total_size / 4 - 1
+  let padding = pad_zero_bytes(total_size - total_no_pad)
+  let body_with_size =
+    bit_array.concat([<<header_size_byte>>, pre_pad, padding])
+  let crc = checksum.crc32(body_with_size)
+  bit_array.concat([body_with_size, <<crc:size(32)-little>>])
+}
+
+fn payload_uncompressed_size(compressed_size: Int) -> Int {
+  // Each uncompressed LZMA2 chunk has a 3-byte header (control + size)
+  // plus the body, and the stream is terminated by a 1-byte end marker.
+  // Knowing the compressed size, the uncompressed size is therefore
+  // `compressed_size - 3 - 1` per chunk (we emit a single chunk).
+  compressed_size - 3 - 1
+}
+
+fn encode_lzma2_uncompressed(bytes: BitArray, size: Int) -> BitArray {
+  case size {
+    0 -> <<0x00>>
+    _ -> emit_uncompressed_chunks(bytes, size, <<>>)
+  }
+}
+
+const lzma2_uncompressed_chunk_max: Int = 0x1_0000
+
+fn emit_uncompressed_chunks(
+  remaining: BitArray,
+  remaining_size: Int,
+  acc: BitArray,
+) -> BitArray {
+  case remaining_size {
+    0 -> bit_array.concat([acc, <<0x00>>])
+    n -> {
+      let chunk = case n > lzma2_uncompressed_chunk_max {
+        True -> lzma2_uncompressed_chunk_max
+        False -> n
+      }
+      let assert Ok(payload) = bit_array.slice(remaining, 0, chunk)
+      let assert Ok(rest) =
+        bit_array.slice(
+          remaining,
+          chunk,
+          bit_array.byte_size(remaining) - chunk,
+        )
+      let size_minus_1 = chunk - 1
+      let header = <<
+        0x01,
+        int.bitwise_and(int.bitwise_shift_right(size_minus_1, 8), 0xFF),
+        int.bitwise_and(size_minus_1, 0xFF),
+      >>
+      emit_uncompressed_chunks(
+        rest,
+        remaining_size - chunk,
+        bit_array.concat([acc, header, payload]),
+      )
+    }
+  }
+}
+
+fn encode_index(unpadded_size: Int, uncompressed_size: Int) -> BitArray {
+  let body =
+    bit_array.concat([
+      <<0x00, 0x01>>,
+      encode_varint(unpadded_size),
+      encode_varint(uncompressed_size),
+    ])
+  let body_with_padding =
+    bit_array.concat([
+      body,
+      pad_zero_bytes(padding_to_align(bit_array.byte_size(body), 4)),
+    ])
+  let crc = checksum.crc32(body_with_padding)
+  bit_array.concat([body_with_padding, <<crc:size(32)-little>>])
+}
+
+fn encode_stream_footer(index_size: Int) -> BitArray {
+  let backward = index_size / 4 - 1
+  let flags = <<0x00, 0x01>>
+  let crc = checksum.crc32(<<backward:size(32)-little, flags:bits>>)
+  bit_array.concat([
+    <<crc:size(32)-little, backward:size(32)-little>>,
+    flags,
+    <<0x59, 0x5A>>,
+  ])
+}
+
+fn encode_varint(value: Int) -> BitArray {
+  case value < 0x80 {
+    True -> <<value>>
+    False -> {
+      let byte = int.bitwise_or(int.bitwise_and(value, 0x7F), 0x80)
+      bit_array.concat([
+        <<byte>>,
+        encode_varint(int.bitwise_shift_right(value, 7)),
+      ])
+    }
+  }
+}
+
+fn pad_zero_bytes(count: Int) -> BitArray {
+  case count {
+    0 -> <<>>
+    _ -> bit_array.concat([<<0>>, pad_zero_bytes(count - 1)])
+  }
+}
+
+fn round_up_to_4(value: Int) -> Int {
+  case value % 4 {
+    0 -> value
+    n -> value + 4 - n
+  }
 }
 
 /// Decode an xz stream using default limits.
