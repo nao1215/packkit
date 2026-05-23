@@ -1,21 +1,22 @@
-//// Zstandard codec — partial pure-Gleam decoder.
+//// Zstandard codec — pure-Gleam decoder.
 ////
-//// The module parses the Zstandard frame envelope: the 4-byte magic,
-//// the variable-length frame header (descriptor + window descriptor
-//// + optional dictionary id + optional frame content size), and the
-//// trailing optional 4-byte content checksum.  Raw and RLE blocks
-//// are decoded end-to-end; the FSE/Huffman compressed block layer
-//// is intentionally deferred and returns
-//// `CodecNotImplemented(feature: "zstd compressed blocks (FSE + Huffman)")`
-//// so future work can swap in the entropy decoder without changing
-//// the public surface or the frame parser.
+//// The module parses the Zstandard frame envelope (magic, frame
+//// header descriptor, window descriptor, optional dictionary id,
+//// optional frame content size, optional trailing content checksum)
+//// and walks the block stream.  Raw and RLE blocks decode directly;
+//// compressed blocks (type 2) decode through the predefined FSE
+//// tables in `packkit/internal/fse` when the literals section is in
+//// Raw or RLE mode.  Huffman-compressed literals and non-predefined
+//// FSE compression modes still return `CodecNotImplemented` for now.
 
 import gleam/bit_array
 import gleam/bool
+import gleam/dict
 import gleam/int
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
+import packkit/internal/fse
 import packkit/limit
 
 const magic: Int = 0xFD2FB528
@@ -182,11 +183,541 @@ fn decode_one_block(
   case block_type {
     0 -> decode_raw_block(bytes, block_size)
     1 -> decode_rle_block(bytes, block_size)
-    2 ->
-      Error(error.CodecNotImplemented(
-        feature: "zstd compressed blocks (FSE + Huffman)",
-      ))
+    2 -> decode_compressed_block(bytes, block_size)
     _ -> Error(error.CodecInvalidData(message: "zstd reserved block type 3"))
+  }
+}
+
+// -- compressed block --------------------------------------------------
+
+fn decode_compressed_block(
+  bytes: BitArray,
+  block_size: Int,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  use payload <- result.try(slice_or_error(
+    bytes,
+    0,
+    block_size,
+    "zstd compressed block payload",
+  ))
+  let assert Ok(rest) =
+    bit_array.slice(bytes, block_size, bit_array.byte_size(bytes) - block_size)
+
+  use #(literals, after_literals) <- result.try(parse_literals_section(payload))
+  use plain <- result.try(parse_and_apply_sequences(after_literals, literals))
+  Ok(#(plain, rest))
+}
+
+// -- literals section --------------------------------------------------
+
+fn parse_literals_section(
+  bytes: BitArray,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  case bytes {
+    <<header_byte, _:bytes>> -> {
+      let literals_block_type = int.bitwise_and(header_byte, 0x3)
+      let size_format =
+        int.bitwise_and(int.bitwise_shift_right(header_byte, 2), 0x3)
+      case literals_block_type {
+        0 -> parse_raw_or_rle_literals(bytes, header_byte, size_format, False)
+        1 -> parse_raw_or_rle_literals(bytes, header_byte, size_format, True)
+        2 ->
+          Error(error.CodecNotImplemented(
+            feature: "zstd compressed (Huffman) literals",
+          ))
+        _ -> Error(error.CodecNotImplemented(feature: "zstd treeless literals"))
+      }
+    }
+    _ ->
+      Error(error.CodecInvalidData(message: "truncated zstd literals header"))
+  }
+}
+
+fn parse_raw_or_rle_literals(
+  bytes: BitArray,
+  header_byte: Int,
+  size_format: Int,
+  is_rle: Bool,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  case size_format {
+    0 | 2 -> {
+      // 1-byte header — size is bits 3..7 of the header byte.
+      let regenerated_size = int.bitwise_shift_right(header_byte, 3)
+      let assert Ok(after_header) =
+        bit_array.slice(bytes, 1, bit_array.byte_size(bytes) - 1)
+      finalize_literals(after_header, regenerated_size, is_rle)
+    }
+    1 -> {
+      // 2-byte header — size spans bits 4..7 of byte 0 (low) and all
+      // bits of byte 1 (high), little-endian wrt the spec.
+      case bytes {
+        <<_h, b1, _:bytes>> -> {
+          let regenerated_size =
+            int.bitwise_or(
+              int.bitwise_shift_right(header_byte, 4),
+              int.bitwise_shift_left(b1, 4),
+            )
+          let assert Ok(after_header) =
+            bit_array.slice(bytes, 2, bit_array.byte_size(bytes) - 2)
+          finalize_literals(after_header, regenerated_size, is_rle)
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd literals 2-byte header",
+          ))
+      }
+    }
+    _ ->
+      Error(error.CodecNotImplemented(
+        feature: "zstd literals 3-byte header (size_format 3 for compressed)",
+      ))
+  }
+}
+
+fn finalize_literals(
+  bytes: BitArray,
+  size: Int,
+  is_rle: Bool,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  case is_rle {
+    True ->
+      case bytes {
+        <<byte, rest:bytes>> -> Ok(#(zstd_repeat_byte(byte, size, <<>>), rest))
+        _ ->
+          Error(error.CodecInvalidData(message: "truncated zstd RLE literals"))
+      }
+    False -> {
+      use chunk <- result.try(slice_or_error(
+        bytes,
+        0,
+        size,
+        "zstd raw literals body",
+      ))
+      let assert Ok(rest) =
+        bit_array.slice(bytes, size, bit_array.byte_size(bytes) - size)
+      Ok(#(chunk, rest))
+    }
+  }
+}
+
+fn zstd_repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> zstd_repeat_byte(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
+// -- sequences section + sequence application -------------------------
+
+fn parse_and_apply_sequences(
+  bytes: BitArray,
+  literals: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  case bytes {
+    <<>> -> Ok(literals)
+    <<num_byte, _:bytes>> if num_byte == 0 -> Ok(literals)
+    <<num_byte, _:bytes>> if num_byte < 128 ->
+      parse_sequences(bytes, 1, num_byte, literals)
+    <<num_byte, b1, _:bytes>> if num_byte < 255 -> {
+      let n = { num_byte - 128 } * 256 + b1 + 128
+      parse_sequences(bytes, 2, n, literals)
+    }
+    <<255, b1, b2, _:bytes>> -> {
+      let n = b1 + b2 * 256 + 0x7F00
+      parse_sequences(bytes, 3, n, literals)
+    }
+    _ ->
+      Error(error.CodecInvalidData(message: "truncated zstd sequences header"))
+  }
+}
+
+fn parse_sequences(
+  bytes: BitArray,
+  count_size: Int,
+  num_sequences: Int,
+  literals: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  use after_count <- result.try(slice_after(
+    bytes,
+    count_size,
+    "zstd sequences count",
+  ))
+  case after_count {
+    <<modes, _:bytes>> -> {
+      let literal_lengths_mode =
+        int.bitwise_and(int.bitwise_shift_right(modes, 6), 0x3)
+      let offsets_mode = int.bitwise_and(int.bitwise_shift_right(modes, 4), 0x3)
+      let match_lengths_mode =
+        int.bitwise_and(int.bitwise_shift_right(modes, 2), 0x3)
+      let reserved = int.bitwise_and(modes, 0x3)
+      use <- bool.guard(
+        when: reserved != 0,
+        return: Error(error.CodecInvalidData(
+          message: "zstd sequences mode byte has reserved bits set",
+        )),
+      )
+      use <- bool.guard(
+        when: literal_lengths_mode != 0
+          || offsets_mode != 0
+          || match_lengths_mode != 0,
+        return: Error(error.CodecNotImplemented(
+          feature: "zstd non-predefined FSE compression modes",
+        )),
+      )
+      let assert Ok(bitstream) =
+        bit_array.slice(after_count, 1, bit_array.byte_size(after_count) - 1)
+      apply_sequences_with_predefined(num_sequences, bitstream, literals)
+    }
+    _ ->
+      Error(error.CodecInvalidData(
+        message: "truncated zstd sequences modes byte",
+      ))
+  }
+}
+
+fn apply_sequences_with_predefined(
+  num_sequences: Int,
+  bitstream: BitArray,
+  literals: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  let ll_table = fse.predefined_literal_length_table()
+  let ml_table = fse.predefined_match_length_table()
+  let of_table = fse.predefined_offset_table()
+  case fse.new_backward_reader(bitstream) {
+    Error(_) ->
+      Error(error.CodecInvalidData(
+        message: "zstd sequences bitstream is empty or missing marker",
+      ))
+    Ok(reader) -> {
+      // Read initial states: literal_length first, offset, then match_length
+      use #(ll_state, reader) <- result.try(read_state_init(
+        reader,
+        fse.predefined_literal_length_log(),
+        "literal_length",
+      ))
+      use #(of_state, reader) <- result.try(read_state_init(
+        reader,
+        fse.predefined_offset_log(),
+        "offset",
+      ))
+      use #(ml_state, reader) <- result.try(read_state_init(
+        reader,
+        fse.predefined_match_length_log(),
+        "match_length",
+      ))
+      let ctx =
+        SeqContext(
+          literals: literals,
+          literal_pos: 0,
+          output_rev: [],
+          rep0: 1,
+          rep1: 4,
+          rep2: 8,
+          ll_state: ll_state,
+          of_state: of_state,
+          ml_state: ml_state,
+          ll_table: ll_table,
+          of_table: of_table,
+          ml_table: ml_table,
+        )
+      use ctx <- result.try(decode_sequence_loop(num_sequences, ctx, reader))
+      Ok(append_remaining_literals(ctx))
+    }
+  }
+}
+
+type SeqContext {
+  SeqContext(
+    literals: BitArray,
+    literal_pos: Int,
+    output_rev: List(Int),
+    rep0: Int,
+    rep1: Int,
+    rep2: Int,
+    ll_state: Int,
+    of_state: Int,
+    ml_state: Int,
+    ll_table: dict.Dict(Int, fse.StateEntry),
+    of_table: dict.Dict(Int, fse.StateEntry),
+    ml_table: dict.Dict(Int, fse.StateEntry),
+  )
+}
+
+fn read_state_init(
+  reader: fse.BackwardReader,
+  bits: Int,
+  label: String,
+) -> Result(#(Int, fse.BackwardReader), error.CodecError) {
+  case fse.read_backward_bits(reader, bits) {
+    Ok(#(v, r)) -> Ok(#(v, r))
+    Error(_) ->
+      Error(error.CodecInvalidData(
+        message: "truncated zstd " <> label <> " initial state",
+      ))
+  }
+}
+
+fn decode_sequence_loop(
+  remaining: Int,
+  ctx: SeqContext,
+  reader: fse.BackwardReader,
+) -> Result(SeqContext, error.CodecError) {
+  case remaining {
+    0 -> Ok(ctx)
+    _ -> {
+      let ll_code = state_symbol(ctx.ll_table, ctx.ll_state)
+      let of_code = state_symbol(ctx.of_table, ctx.of_state)
+      let ml_code = state_symbol(ctx.ml_table, ctx.ml_state)
+
+      use #(offset_value, reader) <- result.try(read_bits_for(
+        reader,
+        of_code,
+        "offset extra",
+      ))
+      use #(match_extra, reader) <- result.try(read_bits_for(
+        reader,
+        fse.ml_extra_bits(ml_code),
+        "match-length extra",
+      ))
+      use #(lit_extra, reader) <- result.try(read_bits_for(
+        reader,
+        fse.ll_extra_bits(ll_code),
+        "literal-length extra",
+      ))
+
+      let literal_length = fse.ll_base(ll_code) + lit_extra
+      let match_length = fse.ml_base(ml_code) + match_extra
+      let raw_offset = int.bitwise_shift_left(1, of_code) + offset_value
+      let #(actual_offset, ctx_after_offset) =
+        resolve_offset(ctx, of_code, raw_offset, literal_length)
+
+      // Copy literals and match into output_rev.
+      use ctx_after_lit <- result.try(copy_literals(
+        ctx_after_offset,
+        literal_length,
+      ))
+      use ctx_after_match <- result.try(copy_match(
+        ctx_after_lit,
+        actual_offset,
+        match_length,
+      ))
+
+      // Update states if not the last sequence.
+      case remaining {
+        1 -> Ok(ctx_after_match)
+        _ -> {
+          use #(reader, ll_state) <- result.try(update_state(
+            reader,
+            ctx.ll_table,
+            ctx.ll_state,
+            "literal_length",
+          ))
+          use #(reader, ml_state) <- result.try(update_state(
+            reader,
+            ctx.ml_table,
+            ctx.ml_state,
+            "match_length",
+          ))
+          use #(reader, of_state) <- result.try(update_state(
+            reader,
+            ctx.of_table,
+            ctx.of_state,
+            "offset",
+          ))
+          decode_sequence_loop(
+            remaining - 1,
+            SeqContext(
+              ..ctx_after_match,
+              ll_state: ll_state,
+              ml_state: ml_state,
+              of_state: of_state,
+            ),
+            reader,
+          )
+        }
+      }
+    }
+  }
+}
+
+fn state_symbol(table: dict.Dict(Int, fse.StateEntry), state: Int) -> Int {
+  case dict.get(table, state) {
+    Ok(entry) -> entry.symbol
+    Error(_) -> 0
+  }
+}
+
+fn update_state(
+  reader: fse.BackwardReader,
+  table: dict.Dict(Int, fse.StateEntry),
+  state: Int,
+  label: String,
+) -> Result(#(fse.BackwardReader, Int), error.CodecError) {
+  let entry = case dict.get(table, state) {
+    Ok(e) -> e
+    Error(_) -> fse.StateEntry(symbol: 0, nb_bits: 0, baseline: 0)
+  }
+  case fse.read_backward_bits(reader, entry.nb_bits) {
+    Ok(#(extra, r)) -> Ok(#(r, entry.baseline + extra))
+    Error(_) ->
+      Error(error.CodecInvalidData(
+        message: "truncated zstd " <> label <> " state-update bits",
+      ))
+  }
+}
+
+fn read_bits_for(
+  reader: fse.BackwardReader,
+  count: Int,
+  label: String,
+) -> Result(#(Int, fse.BackwardReader), error.CodecError) {
+  case fse.read_backward_bits(reader, count) {
+    Ok(p) -> Ok(p)
+    Error(_) ->
+      Error(error.CodecInvalidData(message: "truncated zstd " <> label))
+  }
+}
+
+fn resolve_offset(
+  ctx: SeqContext,
+  of_code: Int,
+  raw_offset: Int,
+  literal_length: Int,
+) -> #(Int, SeqContext) {
+  case of_code {
+    0 ->
+      case literal_length {
+        0 -> {
+          let actual = ctx.rep1
+          #(actual, SeqContext(..ctx, rep0: ctx.rep1, rep1: ctx.rep0))
+        }
+        _ -> #(ctx.rep0, ctx)
+      }
+    _ -> {
+      let actual = raw_offset - 3
+      let new_offset = case literal_length {
+        0 -> actual + 1
+        _ -> actual
+      }
+      let final_offset = case new_offset {
+        n if n <= 0 -> 1
+        n -> n
+      }
+      #(
+        final_offset,
+        SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: final_offset),
+      )
+    }
+  }
+}
+
+fn copy_literals(
+  ctx: SeqContext,
+  count: Int,
+) -> Result(SeqContext, error.CodecError) {
+  case count {
+    0 -> Ok(ctx)
+    _ -> {
+      case bit_array.slice(ctx.literals, ctx.literal_pos, count) {
+        Ok(chunk) ->
+          Ok(
+            SeqContext(
+              ..ctx,
+              literal_pos: ctx.literal_pos + count,
+              output_rev: prepend_bytes(chunk, ctx.output_rev),
+            ),
+          )
+        Error(_) ->
+          Error(error.CodecInvalidData(
+            message: "zstd literal copy exceeds literals section",
+          ))
+      }
+    }
+  }
+}
+
+fn copy_match(
+  ctx: SeqContext,
+  offset: Int,
+  length: Int,
+) -> Result(SeqContext, error.CodecError) {
+  copy_match_loop(ctx, offset, length)
+}
+
+fn copy_match_loop(
+  ctx: SeqContext,
+  offset: Int,
+  remaining: Int,
+) -> Result(SeqContext, error.CodecError) {
+  case remaining {
+    0 -> Ok(ctx)
+    _ -> {
+      case nth_from_back(ctx.output_rev, offset - 1) {
+        Ok(byte) ->
+          copy_match_loop(
+            SeqContext(..ctx, output_rev: [byte, ..ctx.output_rev]),
+            offset,
+            remaining - 1,
+          )
+        Error(_) ->
+          Error(error.CodecInvalidData(
+            message: "zstd match offset exceeds emitted output",
+          ))
+      }
+    }
+  }
+}
+
+fn nth_from_back(values: List(Int), n: Int) -> Result(Int, Nil) {
+  case values, n {
+    [head, ..], 0 -> Ok(head)
+    [_, ..rest], _ -> nth_from_back(rest, n - 1)
+    [], _ -> Error(Nil)
+  }
+}
+
+fn prepend_bytes(chunk: BitArray, acc: List(Int)) -> List(Int) {
+  case chunk {
+    <<b, rest:bytes>> -> prepend_bytes(rest, [b, ..acc])
+    _ -> acc
+  }
+}
+
+fn append_remaining_literals(ctx: SeqContext) -> BitArray {
+  let remaining = bit_array.byte_size(ctx.literals) - ctx.literal_pos
+  let assert Ok(tail) =
+    bit_array.slice(ctx.literals, ctx.literal_pos, remaining)
+  let prefix = reverse_list_to_bit_array(ctx.output_rev, <<>>)
+  bit_array.concat([prefix, tail])
+}
+
+fn reverse_list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
+  case values {
+    [] -> acc
+    [head, ..rest] -> reverse_list_to_bit_array(rest, <<head, acc:bits>>)
+  }
+}
+
+fn slice_or_error(
+  bytes: BitArray,
+  offset: Int,
+  length: Int,
+  label: String,
+) -> Result(BitArray, error.CodecError) {
+  case bit_array.slice(bytes, offset, length) {
+    Ok(v) -> Ok(v)
+    Error(_) -> Error(error.CodecInvalidData(message: "truncated " <> label))
+  }
+}
+
+fn slice_after(
+  bytes: BitArray,
+  offset: Int,
+  label: String,
+) -> Result(BitArray, error.CodecError) {
+  case bit_array.slice(bytes, offset, bit_array.byte_size(bytes) - offset) {
+    Ok(v) -> Ok(v)
+    Error(_) -> Error(error.CodecInvalidData(message: "truncated " <> label))
   }
 }
 

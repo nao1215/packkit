@@ -408,6 +408,115 @@ fn bytes_to_reverse_list(bytes: BitArray, acc: List(Int)) -> List(Int) {
 
 // -- state-driven decode helper ----------------------------------------
 
+// -- zstd sequence code tables -----------------------------------------
+
+/// `LL_base[code]` — baseline literal-length added to the extra-bit
+/// value drawn from the bitstream after a literal-length code.
+pub fn ll_base(code: Int) -> Int {
+  case code {
+    n if n >= 0 && n <= 15 -> n
+    16 -> 16
+    17 -> 18
+    18 -> 20
+    19 -> 22
+    20 -> 24
+    21 -> 28
+    22 -> 32
+    23 -> 40
+    24 -> 48
+    25 -> 64
+    26 -> 128
+    27 -> 256
+    28 -> 512
+    29 -> 1024
+    30 -> 2048
+    31 -> 4096
+    32 -> 8192
+    33 -> 16_384
+    34 -> 32_768
+    35 -> 65_536
+    _ -> 0
+  }
+}
+
+/// `LL_bits[code]` — extra bits to read for a literal-length code.
+pub fn ll_extra_bits(code: Int) -> Int {
+  case code {
+    n if n >= 0 && n <= 15 -> 0
+    n if n >= 16 && n <= 19 -> 1
+    n if n >= 20 && n <= 22 -> 2
+    23 -> 3
+    24 -> 3
+    25 -> 4
+    26 -> 6
+    27 -> 7
+    28 -> 8
+    29 -> 9
+    30 -> 10
+    31 -> 11
+    32 -> 12
+    33 -> 13
+    34 -> 14
+    35 -> 15
+    _ -> 0
+  }
+}
+
+/// `ML_base[code]` — baseline match-length added to the extra-bit
+/// value.  Match lengths are stored relative to 3, so code 0 already
+/// gives length 3.
+pub fn ml_base(code: Int) -> Int {
+  case code {
+    n if n >= 0 && n <= 31 -> 3 + n
+    32 -> 35
+    33 -> 37
+    34 -> 39
+    35 -> 41
+    36 -> 43
+    37 -> 47
+    38 -> 51
+    39 -> 59
+    40 -> 67
+    41 -> 83
+    42 -> 99
+    43 -> 131
+    44 -> 259
+    45 -> 515
+    46 -> 1027
+    47 -> 2051
+    48 -> 4099
+    49 -> 8195
+    50 -> 16_387
+    51 -> 32_771
+    52 -> 65_539
+    _ -> 3
+  }
+}
+
+/// `ML_bits[code]` — extra bits to read for a match-length code.
+pub fn ml_extra_bits(code: Int) -> Int {
+  case code {
+    n if n >= 0 && n <= 31 -> 0
+    n if n >= 32 && n <= 35 -> 1
+    n if n >= 36 && n <= 37 -> 2
+    n if n >= 38 && n <= 39 -> 3
+    40 -> 4
+    41 -> 4
+    42 -> 5
+    43 -> 7
+    44 -> 8
+    45 -> 9
+    46 -> 10
+    47 -> 11
+    48 -> 12
+    49 -> 13
+    50 -> 14
+    51 -> 15
+    52 -> 16
+    _ -> 0
+  }
+}
+
 /// Look up the symbol associated with the current state, read
 /// `nb_bits` from the backward bitstream to compute the next state,
 /// and return both.  Used by every zstd sequence decode step.
