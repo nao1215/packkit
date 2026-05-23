@@ -25,6 +25,22 @@ pub fn encode_roundtrip_pangram_test() -> Nil {
   |> should.equal(payload)
 }
 
+pub fn encode_roundtrip_512_test() -> Nil {
+  // Use a 512-byte payload to exercise the 2-byte FCS path.
+  let payload = repeat_byte(0x41, 512, <<>>)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+}
+
+fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
 pub fn decode_raw_block_hi_test() -> Nil {
   // `printf 'hi' | zstd -c` — frame with one raw block + checksum.
   let fixture = <<

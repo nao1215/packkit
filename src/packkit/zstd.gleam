@@ -26,41 +26,106 @@ pub fn codec() -> codecs.Codec {
   codecs.zstd()
 }
 
-/// Encode `bytes` as a Zstandard frame.  The encoder always emits a
-/// single raw block (no compression, no checksum, FCS omitted) — the
-/// output is a valid Zstandard frame that any conforming decoder can
-/// read, but it preserves the original byte count rather than shrinking
-/// it.  A compression-aware encoder is intentionally future work.
+const max_block_size: Int = 0x20_000
+
+/// Encode `bytes` as a Zstandard frame.  The encoder always emits raw
+/// blocks (no compression, no checksum) — the output is a valid
+/// Zstandard frame that any conforming decoder can read, but it
+/// preserves the original byte count rather than shrinking it.  A
+/// compression-aware encoder is intentionally future work.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let size = bit_array.byte_size(bytes)
-  use <- bool.guard(
-    when: size > 0x1F_FFFF,
-    return: Error(error.CodecInvalidData(
-      message: "zstd raw-block encoder caps blocks at 2 MiB - 1; split externally",
-    )),
-  )
-  // Frame header descriptor:
-  //   - FCS_flag = 0
-  //   - Single_Segment_flag = 1 (no Window_Descriptor)
-  //   - reserved bit = 0
-  //   - Content_Checksum_flag = 0
-  //   - Dictionary_ID_flag = 0
-  // ⇒ descriptor = 0x20.  When Single_Segment_flag is 1 and FCS_flag
-  // is 0, the spec requires a 1-byte FCS, so we emit `size` there.
-  use <- bool.guard(
-    when: size > 0xFF,
-    return: Error(error.CodecNotImplemented(
-      feature: "zstd raw-block encoder for inputs above 255 bytes",
-    )),
-  )
-  let header = <<0x28, 0xB5, 0x2F, 0xFD, 0x20, size>>
-  let block_header_value = int.bitwise_or(int.bitwise_shift_left(size, 3), 0x01)
+  let header = build_zstd_frame_header(size)
+  let blocks = build_raw_blocks(bytes, size)
+  Ok(bit_array.concat([header, blocks]))
+}
+
+fn build_zstd_frame_header(size: Int) -> BitArray {
+  // Single_Segment_flag = 1, no Window_Descriptor, no Dictionary_ID,
+  // no Content_Checksum.  FCS encoding follows the size — 1 byte for
+  // < 256, 2 bytes (FCS_flag = 1) for the 256..65535 range, 4 bytes
+  // (FCS_flag = 2) for the 65536..(2^32)-1 range, otherwise 8 bytes
+  // (FCS_flag = 3).
+  case size {
+    n if n < 256 -> <<0x28, 0xB5, 0x2F, 0xFD, 0x20, n>>
+    n if n < 0x1_0000 -> <<
+      0x28,
+      0xB5,
+      0x2F,
+      0xFD,
+      0x60,
+      { n - 256 }:size(16)-little,
+    >>
+    n if n < 0x1_0000_0000 -> <<
+      0x28,
+      0xB5,
+      0x2F,
+      0xFD,
+      0xA0,
+      n:size(32)-little,
+    >>
+    n -> <<
+      0x28,
+      0xB5,
+      0x2F,
+      0xFD,
+      0xE0,
+      n:size(32)-little,
+      0:size(32)-little,
+    >>
+  }
+}
+
+fn build_raw_blocks(bytes: BitArray, total: Int) -> BitArray {
+  case total {
+    0 -> raw_block_header(0, True)
+    _ -> emit_raw_blocks_loop(bytes, total, <<>>)
+  }
+}
+
+fn emit_raw_blocks_loop(
+  remaining_bytes: BitArray,
+  remaining_size: Int,
+  acc: BitArray,
+) -> BitArray {
+  case remaining_size {
+    0 -> acc
+    n -> {
+      let chunk_size = case n > max_block_size {
+        True -> max_block_size
+        False -> n
+      }
+      let is_last = chunk_size == n
+      let assert Ok(chunk) = bit_array.slice(remaining_bytes, 0, chunk_size)
+      let assert Ok(rest) =
+        bit_array.slice(
+          remaining_bytes,
+          chunk_size,
+          bit_array.byte_size(remaining_bytes) - chunk_size,
+        )
+      let block_header = raw_block_header(chunk_size, is_last)
+      emit_raw_blocks_loop(
+        rest,
+        remaining_size - chunk_size,
+        bit_array.concat([acc, block_header, chunk]),
+      )
+    }
+  }
+}
+
+fn raw_block_header(block_size: Int, is_last: Bool) -> BitArray {
+  let last_bit = case is_last {
+    True -> 1
+    False -> 0
+  }
+  let block_header_value =
+    int.bitwise_or(int.bitwise_shift_left(block_size, 3), last_bit)
   let bh0 = int.bitwise_and(block_header_value, 0xFF)
   let bh1 =
     int.bitwise_and(int.bitwise_shift_right(block_header_value, 8), 0xFF)
   let bh2 =
     int.bitwise_and(int.bitwise_shift_right(block_header_value, 16), 0xFF)
-  Ok(bit_array.concat([header, <<bh0, bh1, bh2>>, bytes]))
+  <<bh0, bh1, bh2>>
 }
 
 /// Decode a Zstandard frame using default limits.
