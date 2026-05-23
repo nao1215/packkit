@@ -20,6 +20,7 @@ import packkit/recipe
 import packkit/seven_z
 import packkit/snappy
 import packkit/tar
+import packkit/xz
 import packkit/zip as zip_archive
 import packkit/zlib
 
@@ -66,6 +67,7 @@ pub fn compress(
     "snappy-frame" -> snappy.encode(bytes: bytes)
     "bzip2" -> bzip2.encode(bytes: bytes)
     "lzw" -> lzw.encode(bytes: bytes)
+    "xz" -> xz.encode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "compress " <> other))
   }
 }
@@ -86,6 +88,7 @@ pub fn decompress(
     "snappy-frame" -> snappy.decode(bytes: bytes)
     "bzip2" -> bzip2.decode(bytes: bytes)
     "lzw" -> lzw.decode(bytes: bytes)
+    "xz" -> xz.decode(bytes: bytes)
     other -> Error(error.CodecNotImplemented(feature: "decompress " <> other))
   }
 }

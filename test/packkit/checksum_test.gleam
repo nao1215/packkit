@@ -52,3 +52,13 @@ pub fn bzip2_crc32_check_value_test() -> Nil {
   checksum.bzip2_crc32(<<"hello":utf8>>)
   |> should.equal(0x1931653D)
 }
+
+pub fn crc32_xz_block_header_test() -> Nil {
+  // xz block header pre-CRC bytes from a `printf 'hi' | xz -c` fixture.
+  let header = <<
+    0x04, 0xC0, 0x06, 0x02, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+  >>
+  checksum.crc32(header)
+  |> should.equal(0x4CC2CB11)
+}
