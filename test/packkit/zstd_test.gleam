@@ -215,6 +215,30 @@ pub fn decode_compressed_repeating_long_match_test() -> Nil {
   |> should.equal(expected)
 }
 
+pub fn decode_repeat_mode_multi_block_roundtrip_test() -> Nil {
+  // 20 copies of "foo bar baz qux quux corge waldo fred plugh xyzzy"
+  // (49 bytes × 20 = 980 bytes) compressed with `zstd -3 -B256` so
+  // the encoder splits the payload across multiple compressed
+  // blocks and is free to flag subsequent-block sequence-symbol
+  // descriptions as `Repeat_Mode`.  Round-tripping byte-for-byte
+  // exercises the cross-block FSE-table threading the same way
+  // that `decode_compressed_block_pangram_test` exercises the
+  // single-block predefined-mode path.
+  let fixture = <<
+    0x28, 0xB5, 0x2F, 0xFD, 0x64, 0xD4, 0x02, 0xD5, 0x01, 0x00, 0x14, 0x03, 0x66,
+    0x6F, 0x6F, 0x20, 0x62, 0x61, 0x72, 0x20, 0x62, 0x61, 0x7A, 0x20, 0x71, 0x75,
+    0x78, 0x20, 0x71, 0x75, 0x75, 0x78, 0x20, 0x63, 0x6F, 0x72, 0x67, 0x65, 0x20,
+    0x77, 0x61, 0x6C, 0x64, 0x6F, 0x20, 0x66, 0x72, 0x65, 0x64, 0x20, 0x70, 0x6C,
+    0x75, 0x67, 0x68, 0x20, 0x78, 0x79, 0x7A, 0x7A, 0x79, 0x01, 0x00, 0x01, 0x9A,
+    0x56, 0x0A, 0x0A, 0xDC, 0xFB, 0xF3, 0x2C,
+  >>
+  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let expected =
+    repeat_text("foo bar baz qux quux corge waldo fred plugh xyzzy", 20)
+  plain
+  |> should.equal(expected)
+}
+
 pub fn decode_compressed_block_pangram_test() -> Nil {
   // "The quick brown fox jumps over the lazy dog. " followed by a
   // second copy without the trailing space (89 bytes total) as
