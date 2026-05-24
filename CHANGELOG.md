@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: zstd Huffman literal decoder produced
+  the wrong bytes for any compressed-literals block whose tree
+  had more than one code length (i.e. essentially every real
+  `zstd -3+` output of text or binary data with a skewed
+  byte distribution).  The canonical-code assignment in
+  `internal/huf.gleam` sorted by `(bits ASCENDING, symbol
+  ASCENDING)` — the OPPOSITE of zstd's convention, which puts
+  the LONGEST codes at the LOWEST table indices so the bit
+  pattern `00000…` decodes to the rarest symbol (see
+  `HUF_readDTableX1` in `doc/reference/zstd/lib/decompress/
+  huf_decompress.c`).  The decoder used to silently return
+  valid alphabet symbols in scrambled order with no error,
+  which is the worst possible decompression bug.  After the
+  fix every `zstd -3` text fixture in the regression suite
+  round-trips byte-for-byte (N=5..50 line pangrams, a
+  generated 80 KB skewed-distribution payload, and the
+  existing 300-byte alphabet-16 fixture).
 - Decoder now skips zstd `Skippable_Frame` (RFC 8478 §3.1.2)
   payloads — any frame whose magic falls in 0x184D2A50..0x184D2A5F
   is parsed for its 4-byte LE Frame_Size, the User_Data bytes

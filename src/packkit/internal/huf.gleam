@@ -158,13 +158,18 @@ fn build_lookup_table(
       }
     })
     |> list.reverse
-  // 2. Sort by (bits ascending, symbol ascending) — the canonical
-  //    Huffman ordering.
+  // 2. Sort by (bits DESCENDING, symbol ascending) — the zstd canonical
+  //    Huffman convention places LONGER codes at LOWER table indices
+  //    so the bit pattern "0000…0" decodes to the rarest (longest-code)
+  //    symbol.  See HUF_readDTableX1 in
+  //    doc/reference/zstd/lib/decompress/huf_decompress.c for the
+  //    reference implementation (loop over `w` from 1 up = longest
+  //    code length first).
   let sorted =
     list.sort(with_bits, fn(a, b) {
       let #(sym_a, bits_a) = a
       let #(sym_b, bits_b) = b
-      case int.compare(bits_a, bits_b) {
+      case int.compare(bits_b, bits_a) {
         order.Eq -> int.compare(sym_a, sym_b)
         other -> other
       }
