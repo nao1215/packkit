@@ -109,6 +109,17 @@ fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
   }
 }
 
+fn repeat_text(text: String, count: Int) -> BitArray {
+  repeat_text_loop(text, count, <<>>)
+}
+
+fn repeat_text_loop(text: String, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> repeat_text_loop(text, count - 1, <<acc:bits, text:utf8>>)
+  }
+}
+
 pub fn decode_raw_block_hi_test() -> Nil {
   // `printf 'hi' | zstd -c` — frame with one raw block + checksum.
   let fixture = <<
@@ -155,6 +166,36 @@ pub fn decode_compressed_block_alternating_test() -> Nil {
   let assert Ok(plain) = zstd.decode(bytes: fixture)
   plain
   |> should.equal(<<"ababababababababababab":utf8>>)
+}
+
+pub fn decode_compressed_repeating_short_match_test() -> Nil {
+  // 50 copies of "hello world " (600 bytes) → `zstd -3` packs the
+  // whole stream into one short literal block and a single
+  // sequence with a large match-length.  Useful regression
+  // coverage for the predefined ML mapping in the ml_base(40)+
+  // range that the predefined_match_length() fix unblocked.
+  let fixture = <<
+    0x28, 0xB5, 0x2F, 0xFD, 0x64, 0x58, 0x01, 0x9D, 0x00, 0x00, 0x60, 0x68, 0x65,
+    0x6C, 0x6C, 0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0x20, 0x01, 0x00, 0x49,
+    0x5E, 0x95, 0x24, 0xDE, 0x82, 0x7E, 0x8E,
+  >>
+  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let expected = repeat_text("hello world ", 50)
+  plain
+  |> should.equal(expected)
+}
+
+pub fn decode_compressed_repeating_long_match_test() -> Nil {
+  // 1000 copies of "abc" (3000 bytes) → `zstd -3` ends up with a
+  // huge match-length that lands in the ml_code 44+ region.
+  let fixture = <<
+    0x28, 0xB5, 0x2F, 0xFD, 0x64, 0xB8, 0x0A, 0x55, 0x00, 0x00, 0x18, 0x61, 0x62,
+    0x63, 0x01, 0x00, 0xB2, 0xD3, 0x77, 0x43, 0xC6, 0x03, 0x49, 0x84,
+  >>
+  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let expected = repeat_text("abc", 1000)
+  plain
+  |> should.equal(expected)
 }
 
 pub fn decode_compressed_block_pangram_test() -> Nil {
