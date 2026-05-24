@@ -230,6 +230,24 @@ fn decode_frames_loop(
   accumulated_size: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
+  // Skippable frames (RFC 8478 §3.1.2) have magic 0x184D2A5X for X
+  // in 0..F.  The 4-byte LE Frame_Size that follows tells us how
+  // many bytes of User_Data to skip.  The decoder must skip them
+  // and then look for the next frame.
+  case bytes {
+    <<m:little-unsigned-size(32), _:bytes>>
+      if m >= 0x184D2A50 && m <= 0x184D2A5F
+    -> skip_skippable_frame(bytes, acc, accumulated_size, limits)
+    _ -> decode_data_frame(bytes, acc, accumulated_size, limits)
+  }
+}
+
+fn decode_data_frame(
+  bytes: BitArray,
+  acc: BitArray,
+  accumulated_size: Int,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
   use #(checksum_flag, rest) <- result.try(parse_frame_header(bytes))
   use #(output, rest) <- result.try(decode_blocks(
     rest,
@@ -252,6 +270,46 @@ fn decode_frames_loop(
         _ -> decode_frames_loop(rest, acc, next_size, limits)
       }
     }
+  }
+}
+
+fn skip_skippable_frame(
+  bytes: BitArray,
+  acc: BitArray,
+  accumulated_size: Int,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
+  case bytes {
+    <<_magic:bytes-size(4), frame_size:little-unsigned-size(32), rest:bytes>> ->
+      case bit_array.byte_size(rest) >= frame_size {
+        False ->
+          Error(error.CodecInvalidData(
+            message: "zstd skippable frame body is shorter than the declared Frame_Size",
+          ))
+        True ->
+          case
+            bit_array.slice(
+              rest,
+              frame_size,
+              bit_array.byte_size(rest) - frame_size,
+            )
+          {
+            Ok(after_skip) ->
+              case bit_array.byte_size(after_skip) {
+                0 -> Ok(acc)
+                _ ->
+                  decode_frames_loop(after_skip, acc, accumulated_size, limits)
+              }
+            Error(_) ->
+              Error(error.CodecInvalidData(
+                message: "zstd skippable frame slice failed",
+              ))
+          }
+      }
+    _ ->
+      Error(error.CodecInvalidData(
+        message: "zstd skippable frame header is shorter than 8 bytes",
+      ))
   }
 }
 

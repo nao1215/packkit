@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Decoder now skips zstd `Skippable_Frame` (RFC 8478 §3.1.2)
+  payloads — any frame whose magic falls in 0x184D2A50..0x184D2A5F
+  is parsed for its 4-byte LE Frame_Size, the User_Data bytes
+  are discarded, and the next frame (or end-of-stream) is
+  consumed.  Streams that mix data frames and skippable frames
+  (e.g. zstd CLI's `--block-checksum` debug helpers, archives that
+  inline user metadata) now round-trip through `packkit.decompress`.
 - Implemented zstd sequence-symbol `Repeat_Mode` (mode 3) for all
   three alphabets (LL / OF / ML).  The block loop now carries a
   per-frame `SeqTablesState` alongside the existing Huffman tree

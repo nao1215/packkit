@@ -239,6 +239,34 @@ pub fn decode_repeat_mode_multi_block_roundtrip_test() -> Nil {
   |> should.equal(expected)
 }
 
+pub fn decode_skippable_frame_is_silently_skipped_test() -> Nil {
+  // RFC 8478 §3.1.2 — Skippable_Frame_Magic_Number = 0x184D2A5X for
+  // X in 0..F.  A decoder must skip the user payload and continue
+  // with the next frame (or end-of-stream).
+  //
+  //   skippable magic 0x184D2A50 + Frame_Size = 4 +
+  //   user data ("test")
+  // then a real data frame for "hello".
+  let skippable_user = <<"test":utf8>>
+  let skippable = <<
+    0x50, 0x2A, 0x4D, 0x18, 0x04, 0x00, 0x00, 0x00, skippable_user:bits,
+  >>
+  let assert Ok(data_frame) = zstd.encode(bytes: <<"hello":utf8>>)
+  let stream = bit_array.concat([skippable, data_frame])
+  let assert Ok(plain) = zstd.decode(bytes: stream)
+  plain
+  |> should.equal(<<"hello":utf8>>)
+}
+
+pub fn decode_skippable_frame_alone_is_empty_output_test() -> Nil {
+  // A stream that consists of a single skippable frame should
+  // decode to zero bytes, not panic and not error.
+  let stream = <<0x50, 0x2A, 0x4D, 0x18, 0x03, 0x00, 0x00, 0x00, "xyz":utf8>>
+  let assert Ok(plain) = zstd.decode(bytes: stream)
+  plain
+  |> should.equal(<<>>)
+}
+
 pub fn decode_compressed_block_pangram_test() -> Nil {
   // "The quick brown fox jumps over the lazy dog. " followed by a
   // second copy without the trailing space (89 bytes total) as
