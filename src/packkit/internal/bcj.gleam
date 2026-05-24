@@ -436,6 +436,275 @@ fn armthumb_apply(
   )
 }
 
+/// Decode a SPARC BCJ-encoded byte sequence.  SPARC's
+/// branch-with-link instructions sit on 4-byte boundaries and
+/// match either `40 [00..3F] ...` (CALL with positive offset
+/// candidate) or `7F [C0..FF] ...` (CALL with negative offset
+/// candidate); the rewritten 30-bit displacement is sign-
+/// extended back from its 22-bit truncated form during decode.
+pub fn sparc_decode(
+  bytes bytes: BitArray,
+  start_offset start_offset: Int,
+) -> BitArray {
+  let total = bit_array.byte_size(bytes)
+  let aligned = total - { total % 4 }
+  case aligned {
+    0 -> bytes
+    _ ->
+      case
+        bit_array.slice(bytes, 0, aligned),
+        bit_array.slice(bytes, aligned, total - aligned)
+      {
+        Ok(head), Ok(tail) -> {
+          let body = sparc_decode_words(head, start_offset, 0, <<>>)
+          bit_array.concat([body, tail])
+        }
+        _, _ -> bytes
+      }
+  }
+}
+
+fn sparc_decode_words(
+  bytes: BitArray,
+  start_offset: Int,
+  word_index: Int,
+  acc: BitArray,
+) -> BitArray {
+  case bytes {
+    <<b0, b1, b2, b3, rest:bytes>> ->
+      case is_sparc_call(b0, b1) {
+        True -> sparc_apply(b0, b1, b2, b3, rest, start_offset, word_index, acc)
+        False ->
+          sparc_decode_words(
+            rest,
+            start_offset,
+            word_index + 1,
+            bit_array.concat([acc, <<b0, b1, b2, b3>>]),
+          )
+      }
+    _ -> acc
+  }
+}
+
+fn is_sparc_call(b0: Int, b1: Int) -> Bool {
+  { b0 == 0x40 && int.bitwise_and(b1, 0xC0) == 0x00 }
+  || { b0 == 0x7F && int.bitwise_and(b1, 0xC0) == 0xC0 }
+}
+
+fn sparc_apply(
+  b0: Int,
+  b1: Int,
+  b2: Int,
+  b3: Int,
+  rest: BitArray,
+  start_offset: Int,
+  word_index: Int,
+  acc: BitArray,
+) -> BitArray {
+  let src =
+    int.bitwise_or(
+      int.bitwise_or(
+        int.bitwise_shift_left(b0, 24),
+        int.bitwise_shift_left(b1, 16),
+      ),
+      int.bitwise_or(int.bitwise_shift_left(b2, 8), b3),
+    )
+    |> int.bitwise_shift_left(2)
+    |> int.bitwise_and(mask32)
+  let dest =
+    int.bitwise_and(
+      src - { start_offset + word_index * 4 } + 0x1_0000_0000,
+      mask32,
+    )
+    |> int.bitwise_shift_right(2)
+  // Reference: `(((0 - ((dest >> 22) & 1)) << 22) & 0x3FFFFFFF)
+  //              | (dest & 0x3FFFFF) | 0x40000000`.
+  // The first term replicates the sign bit (bit 22) across the
+  // upper part of the 30-bit field.
+  let sign_bit = int.bitwise_and(int.bitwise_shift_right(dest, 22), 1)
+  let sign_word = case sign_bit {
+    0 -> 0
+    _ -> 0x1_0000_0000 - 1
+  }
+  let sign_ext =
+    int.bitwise_and(int.bitwise_shift_left(sign_word, 22), 0x3FFFFFFF)
+    |> int.bitwise_and(mask32)
+  let combined =
+    int.bitwise_or(
+      int.bitwise_or(sign_ext, int.bitwise_and(dest, 0x3FFFFF)),
+      0x40000000,
+    )
+  let new_b0 = int.bitwise_and(int.bitwise_shift_right(combined, 24), 0xFF)
+  let new_b1 = int.bitwise_and(int.bitwise_shift_right(combined, 16), 0xFF)
+  let new_b2 = int.bitwise_and(int.bitwise_shift_right(combined, 8), 0xFF)
+  let new_b3 = int.bitwise_and(combined, 0xFF)
+  sparc_decode_words(
+    rest,
+    start_offset,
+    word_index + 1,
+    bit_array.concat([acc, <<new_b0, new_b1, new_b2, new_b3>>]),
+  )
+}
+
+/// Decode an ARM64 BCJ-encoded byte sequence.  Two ARM64
+/// instruction classes are rewritten by the BCJ filter:
+///
+/// * `BL` (top 6 bits = 0x25): full 26-bit immediate is
+///   converted (±128 MiB range).
+/// * `ADRP` (top 8 bits match 0x9F mask == 0x90): 21-bit
+///   immediate is converted, but only when the encoded value
+///   stays inside ±512 MiB to reduce false positives.
+///
+/// All instructions are 32-bit little-endian on 4-byte
+/// boundaries.
+pub fn arm64_decode(
+  bytes bytes: BitArray,
+  start_offset start_offset: Int,
+) -> BitArray {
+  let total = bit_array.byte_size(bytes)
+  let aligned = total - { total % 4 }
+  case aligned {
+    0 -> bytes
+    _ ->
+      case
+        bit_array.slice(bytes, 0, aligned),
+        bit_array.slice(bytes, aligned, total - aligned)
+      {
+        Ok(head), Ok(tail) -> {
+          let body = arm64_decode_words(head, start_offset, 0, <<>>)
+          bit_array.concat([body, tail])
+        }
+        _, _ -> bytes
+      }
+  }
+}
+
+fn arm64_decode_words(
+  bytes: BitArray,
+  start_offset: Int,
+  word_index: Int,
+  acc: BitArray,
+) -> BitArray {
+  case bytes {
+    <<b0, b1, b2, b3, rest:bytes>> -> {
+      let instr =
+        int.bitwise_or(
+          int.bitwise_or(
+            int.bitwise_shift_left(b3, 24),
+            int.bitwise_shift_left(b2, 16),
+          ),
+          int.bitwise_or(int.bitwise_shift_left(b1, 8), b0),
+        )
+      let pc = start_offset + word_index * 4
+      case classify_arm64_instr(instr) {
+        Arm64Bl -> {
+          let new_instr = arm64_bl_decode(instr, pc)
+          arm64_decode_words(
+            rest,
+            start_offset,
+            word_index + 1,
+            bit_array.concat([acc, write_le32(new_instr)]),
+          )
+        }
+        Arm64Adrp ->
+          case arm64_adrp_decode(instr, pc) {
+            Ok(new_instr) ->
+              arm64_decode_words(
+                rest,
+                start_offset,
+                word_index + 1,
+                bit_array.concat([acc, write_le32(new_instr)]),
+              )
+            Error(Nil) ->
+              arm64_decode_words(
+                rest,
+                start_offset,
+                word_index + 1,
+                bit_array.concat([acc, <<b0, b1, b2, b3>>]),
+              )
+          }
+        Arm64Other ->
+          arm64_decode_words(
+            rest,
+            start_offset,
+            word_index + 1,
+            bit_array.concat([acc, <<b0, b1, b2, b3>>]),
+          )
+      }
+    }
+    _ -> acc
+  }
+}
+
+type Arm64Kind {
+  Arm64Bl
+  Arm64Adrp
+  Arm64Other
+}
+
+fn classify_arm64_instr(instr: Int) -> Arm64Kind {
+  case int.bitwise_shift_right(instr, 26) {
+    0x25 -> Arm64Bl
+    _ ->
+      case int.bitwise_and(instr, 0x9F000000) == 0x90000000 {
+        True -> Arm64Adrp
+        False -> Arm64Other
+      }
+  }
+}
+
+fn arm64_bl_decode(instr: Int, pc: Int) -> Int {
+  // BL decode: new_instr = 0x94000000 | ((src + (-pc>>2)) & 0x03FFFFFF)
+  let pc_words = int.bitwise_shift_right(pc, 2)
+  let neg_pc = int.bitwise_and(0x1_0000_0000 - pc_words, mask32)
+  int.bitwise_or(0x94000000, int.bitwise_and(instr + neg_pc, 0x03FFFFFF))
+  |> int.bitwise_and(mask32)
+}
+
+fn arm64_adrp_decode(instr: Int, pc: Int) -> Result(Int, Nil) {
+  let src =
+    int.bitwise_or(
+      int.bitwise_and(int.bitwise_shift_right(instr, 29), 3),
+      int.bitwise_and(int.bitwise_shift_right(instr, 3), 0x001FFFFC),
+    )
+  // Range check: reject conversion when the encoded value falls
+  // outside the ±512 MiB window.  Matches the reference's
+  // `(src + 0x00020000) & 0x001C0000` non-zero test.
+  case int.bitwise_and(src + 0x00020000, 0x001C0000) {
+    0 -> Ok(arm64_adrp_apply(instr, src, pc))
+    _ -> Error(Nil)
+  }
+}
+
+fn arm64_adrp_apply(instr: Int, src: Int, pc: Int) -> Int {
+  let pc_pages = int.bitwise_shift_right(pc, 12)
+  let neg_pc = int.bitwise_and(0x1_0000_0000 - pc_pages, mask32)
+  let dest = int.bitwise_and(src + neg_pc, mask32)
+  let base = int.bitwise_and(instr, 0x9000001F)
+  let high_immlo = int.bitwise_shift_left(int.bitwise_and(dest, 3), 29)
+  let mid_immhi = int.bitwise_shift_left(int.bitwise_and(dest, 0x0003FFFC), 3)
+  let sign_replica =
+    int.bitwise_and(
+      0x1_0000_0000 - int.bitwise_and(dest, 0x00020000),
+      0x00E00000,
+    )
+  int.bitwise_or(
+    int.bitwise_or(base, high_immlo),
+    int.bitwise_or(mid_immhi, sign_replica),
+  )
+  |> int.bitwise_and(mask32)
+}
+
+fn write_le32(value: Int) -> BitArray {
+  let masked = int.bitwise_and(value, mask32)
+  <<
+    int.bitwise_and(masked, 0xFF),
+    int.bitwise_and(int.bitwise_shift_right(masked, 8), 0xFF),
+    int.bitwise_and(int.bitwise_shift_right(masked, 16), 0xFF),
+    int.bitwise_and(int.bitwise_shift_right(masked, 24), 0xFF),
+  >>
+}
+
 /// Decode an ARM (A32) BCJ-encoded byte sequence.  ARM BCJ looks
 /// for `BL` (branch-with-link) instructions on 4-byte boundaries:
 /// the high byte is `0xEB` and the low 24 bits are the

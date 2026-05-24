@@ -593,6 +593,8 @@ fn validate_pre_filters(
     [#(0x05, _), ..rest] -> validate_pre_filters(rest)
     [#(0x07, _), ..rest] -> validate_pre_filters(rest)
     [#(0x08, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x09, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x0A, _), ..rest] -> validate_pre_filters(rest)
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(
         feature: "xz pre-processor filter id " <> int.to_string(id),
@@ -639,6 +641,14 @@ fn apply_pre_filters_loop(
     [#(0x08, _), ..rest] -> {
       // ARM-Thumb (T32) BCJ filter.
       apply_pre_filters_loop(bcj.armthumb_decode(bytes, 0), rest)
+    }
+    [#(0x09, _), ..rest] -> {
+      // SPARC BCJ filter.
+      apply_pre_filters_loop(bcj.sparc_decode(bytes, 0), rest)
+    }
+    [#(0x0A, _), ..rest] -> {
+      // ARM64 (AArch64) BCJ filter — handles BL + ADRP rewrites.
+      apply_pre_filters_loop(bcj.arm64_decode(bytes, 0), rest)
     }
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(

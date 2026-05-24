@@ -2,13 +2,20 @@
 
 ## Unreleased
 
+- Added the SPARC (filter id 0x09) and ARM64 / AArch64 (filter
+  id 0x0A) BCJ pre-processor filters to the xz multi-filter
+  chain.  SPARC decodes the 22-bit `CALL` displacement with
+  proper sign extension; ARM64 handles both `BL` (top 6 bits
+  0x25) and `ADRP` (mask `0x9F000000 == 0x90000000`), including
+  ADRP's ±512 MiB range check.  Both decoders are verified
+  byte-for-byte against `xz --sparc` / `xz --arm64` reference
+  output.  Remaining filter IDs (IA-64 0x06, RISC-V 0x0B) still
+  surface as `CodecNotImplemented` carrying the filter id.
 - Added the PowerPC (filter id 0x05) and ARM-Thumb (filter id
   0x08) BCJ pre-processor filters to the xz multi-filter chain.
   Both decoders are verified against `xz --powerpc` /
   `xz --armthumb` reference output and round-trip the
-  encoded-target sequence byte-for-byte.  Remaining filter IDs
-  (IA-64 0x06, SPARC 0x09, ARM64 0x0A, RISC-V 0x0B) still surface
-  as `CodecNotImplemented` carrying the filter id.
+  encoded-target sequence byte-for-byte.
 - Completed zstd `Compressed_Literals_Block` decoding (RFC 8478
   §4.2.1).  Building on the direct-weight tree foundation from
   the previous commit, the decoder now handles:
