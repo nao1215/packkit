@@ -4,8 +4,11 @@
 //// directories, symbolic links, and hard links.  The encoder rejects
 //// names longer than the USTAR `prefix`/`name` split allows with a
 //// typed archive error.  The decoder additionally consumes GNU
-//// `LongName`/`LongLink` extension entries (typeflags `L` and `K`)
-//// and skips PAX extended attribute headers (`x` and `g`).
+//// `LongName`/`LongLink` extension entries (typeflags `L` and `K`),
+//// PAX extended attribute headers (`x` and `g`) — extracting the
+//// `path` / `linkpath` records so files emitted by
+//// `tar --format=pax` keep their full path past the USTAR 100-char
+//// limit — and skips the other PAX attribute keys.
 
 import gleam/bit_array
 import gleam/bool
@@ -244,10 +247,19 @@ fn dispatch_typeflag(
         PendingOverride(..pending, linkname: long_link),
       )
     }
-    // PAX extended attribute headers ('x' = local, 'g' = global) —
-    // we don't currently parse the key=value records, but skipping
-    // them keeps decode marching forward.
-    0x78 | 0x67 -> decode_loop_with_pending(rest, acc, count, limits, pending)
+    // PAX extended attribute headers ('x' = local, 'g' = global).
+    // Each header body is a sequence of "<length> <key>=<value>\n"
+    // records (POSIX 1003.1).  We parse the "path" and "linkpath"
+    // keys — the others (mtime, atime, size, charset, …) don't
+    // change which bytes get emitted so they're still skipped.
+    // 'g' attributes are supposed to apply across entries; for now
+    // we only carry them through to the immediately-following
+    // entry just like 'x'.
+    0x78 | 0x67 -> {
+      use pax_body <- result.try(read_pax_body(bytes, block_size, header.size))
+      let pending = apply_pax_records(pending, pax_body)
+      decode_loop_with_pending(rest, acc, count, limits, pending)
+    }
     _ -> {
       let merged_header = apply_pending(header, pending)
       use _ <- result.try(check_member_limit(count + 1, limits))
@@ -277,6 +289,76 @@ fn apply_pending(header: ParsedHeader, pending: PendingOverride) -> ParsedHeader
     l -> l
   }
   ParsedHeader(..header, name: name, linkname: linkname)
+}
+
+/// Read the body of a PAX 'x' / 'g' extended-attribute header.
+/// Returns the raw bytes; the caller is responsible for parsing
+/// the "<length> <key>=<value>\n" records inside.
+fn read_pax_body(
+  bytes: BitArray,
+  start: Int,
+  size: Int,
+) -> Result(BitArray, error.ArchiveError) {
+  case bit_array.slice(bytes, start, size) {
+    Ok(chunk) -> Ok(chunk)
+    Error(_) ->
+      Error(error.ArchiveInvalid(message: "truncated tar PAX extended header"))
+  }
+}
+
+/// Walk a PAX extended-header body and lift the keys we know how
+/// to use ("path" overrides the next entry's name, "linkpath"
+/// overrides the next entry's linkname).  Records with other keys
+/// are silently dropped — they don't change which bytes the entry
+/// holds, only how POSIX-aware tools display its metadata.
+fn apply_pax_records(
+  pending: PendingOverride,
+  body: BitArray,
+) -> PendingOverride {
+  case bit_array.to_string(body) {
+    Ok(text) -> apply_pax_records_loop(pending, text)
+    Error(_) -> pending
+  }
+}
+
+fn apply_pax_records_loop(
+  pending: PendingOverride,
+  text: String,
+) -> PendingOverride {
+  case extract_pax_record(text) {
+    Error(_) -> pending
+    Ok(#(key, value, rest)) -> {
+      let pending = case key {
+        "path" -> PendingOverride(..pending, name: value)
+        "linkpath" -> PendingOverride(..pending, linkname: value)
+        _ -> pending
+      }
+      apply_pax_records_loop(pending, rest)
+    }
+  }
+}
+
+/// Parse one "<length> <key>=<value>\n" PAX record off the front
+/// of `text` and return (key, value, remaining_text).
+fn extract_pax_record(text: String) -> Result(#(String, String, String), Nil) {
+  use #(length_str, after_space) <- result.try(string.split_once(text, " "))
+  use length <- result.try(int.parse(length_str))
+  // The length is total bytes including the leading digits, the
+  // space, and the trailing \n.  We can recover the inner part
+  // as `length - (len(length_str) + 1) - 1` characters because
+  // length covers <length_str><space><key=value><\n>.
+  let head_size = string.length(length_str) + 1
+  let inner_size = length - head_size - 1
+  use <- bool.guard(when: inner_size < 0, return: Error(Nil))
+  case string.slice(after_space, 0, inner_size) {
+    "" -> Error(Nil)
+    body -> {
+      use #(key, value) <- result.try(string.split_once(body, "="))
+      let rest =
+        string.slice(after_space, inner_size + 1, string.length(after_space))
+      Ok(#(key, value, rest))
+    }
+  }
 }
 
 fn read_string_body(

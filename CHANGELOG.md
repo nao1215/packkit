@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: tar decoder now parses PAX extended-
+  header records.  Previously the decoder skipped the `x` / `g`
+  bodies entirely, so files emitted by `tar --format=pax`
+  (the default on POSIX) with names longer than the USTAR 100-
+  character limit silently truncated to the leading 100 bytes
+  visible in the regular header.  The new
+  `apply_pax_records` walks the `<length> <key>=<value>\n`
+  records and lifts `path` / `linkpath` into the
+  `PendingOverride` thread that already handles GNU
+  `LongName` / `LongLink`.  Other PAX keys (mtime, atime,
+  size, charset, …) are still skipped because they don't
+  change which bytes the entry holds.
 - **Fix (correctness)**: zstd Raw / RLE literals block now accepts
   `size_format = 3` (3-byte header, 20-bit regenerated_size, used
   by `zstd` for raw-literal blocks larger than 4 KiB).  The
