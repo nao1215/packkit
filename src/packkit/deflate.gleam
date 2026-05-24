@@ -1896,7 +1896,7 @@ fn build_dynamic_block(tokens: List(Token)) -> Result(BitArray, Nil) {
     15,
   ))
 
-  Ok(emit_dynamic_block(tokens, lit_lengths, dist_lengths))
+  emit_dynamic_block(tokens, lit_lengths, dist_lengths)
 }
 
 fn any_nonzero(values: List(Int)) -> Bool {
@@ -1911,7 +1911,7 @@ fn emit_dynamic_block(
   tokens: List(Token),
   lit_lengths: List(Int),
   dist_lengths: List(Int),
-) -> BitArray {
+) -> Result(BitArray, Nil) {
   let lit_codes = canonical_codes_from_lengths(lit_lengths)
   let dist_codes = canonical_codes_from_lengths(dist_lengths)
 
@@ -1926,12 +1926,17 @@ fn emit_dynamic_block(
   let rle = rle_encode_lengths(combined)
 
   let cl_freqs = cl_frequencies(rle)
-  // The CL alphabet only has 19 symbols, so the natural Huffman tree
-  // is at most 5 bits deep (well under the RFC 1951 7-bit cap).  We
-  // request a 7-bit limit defensively and trust the fallback never
-  // fires.
-  let assert Ok(cl_lengths) =
-    huffman_code_lengths(cl_freqs, cl_alphabet_size, 7)
+  // The CL alphabet has 19 symbols, so the natural Huffman tree is
+  // at most 5 bits deep in theory — but a pathological RLE token
+  // distribution from a randomly-skewed payload can push the tree
+  // past 7 bits and back-propagation can fail.  Return Error so the
+  // outer `encode_dynamic_or_fixed` falls back to fixed-Huffman
+  // instead of panicking.
+  use cl_lengths <- result.try(huffman_code_lengths(
+    cl_freqs,
+    cl_alphabet_size,
+    7,
+  ))
   let cl_codes = canonical_codes_from_lengths(cl_lengths)
 
   let order = code_length_order()
@@ -1950,7 +1955,7 @@ fn emit_dynamic_block(
   let writer = write_token_stream(writer, tokens, lit_codes, dist_codes)
   let writer = write_canonical_code(writer, lit_codes, 256)
 
-  flush_writer(writer)
+  Ok(flush_writer(writer))
 }
 
 fn last_nonzero_index(values: List(Int), index: Int, best: Int) -> Int {
