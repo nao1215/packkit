@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added the PowerPC (filter id 0x05) and ARM-Thumb (filter id
+  0x08) BCJ pre-processor filters to the xz multi-filter chain.
+  Both decoders are verified against `xz --powerpc` /
+  `xz --armthumb` reference output and round-trip the
+  encoded-target sequence byte-for-byte.  Remaining filter IDs
+  (IA-64 0x06, SPARC 0x09, ARM64 0x0A, RISC-V 0x0B) still surface
+  as `CodecNotImplemented` carrying the filter id.
 - Completed zstd `Compressed_Literals_Block` decoding (RFC 8478
   §4.2.1).  Building on the direct-weight tree foundation from
   the previous commit, the decoder now handles:

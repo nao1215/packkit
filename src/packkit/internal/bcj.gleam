@@ -227,6 +227,215 @@ fn mask_to_bit_number(value: Int) -> Int {
   }
 }
 
+/// Decode a PowerPC (big-endian) BCJ-encoded byte sequence.
+/// PowerPC BCJ looks for the branch instruction `0x48` (with
+/// link bit set) on 4-byte boundaries and converts the encoder's
+/// absolute target back to a word-relative offset.
+pub fn powerpc_decode(
+  bytes bytes: BitArray,
+  start_offset start_offset: Int,
+) -> BitArray {
+  let total = bit_array.byte_size(bytes)
+  let aligned = total - { total % 4 }
+  case aligned {
+    0 -> bytes
+    _ ->
+      case
+        bit_array.slice(bytes, 0, aligned),
+        bit_array.slice(bytes, aligned, total - aligned)
+      {
+        Ok(head), Ok(tail) -> {
+          let body = powerpc_decode_words(head, start_offset, 0, <<>>)
+          bit_array.concat([body, tail])
+        }
+        _, _ -> bytes
+      }
+  }
+}
+
+fn powerpc_decode_words(
+  bytes: BitArray,
+  start_offset: Int,
+  word_index: Int,
+  acc: BitArray,
+) -> BitArray {
+  case bytes {
+    // PowerPC branch+link: 0x48000001 with sign-extended 24-bit
+    // displacement.  High byte's top 6 bits = 0x12 (== 0x48 >> 2),
+    // low byte's bottom 2 bits = 0b01 (Abs=0, Link=1).  The
+    // bitwise checks aren't valid in a `case` guard so we
+    // dispatch through a helper.
+    <<b0, b1, b2, b3, rest:bytes>> ->
+      case is_powerpc_branch_link(b0, b3) {
+        False ->
+          powerpc_decode_words(
+            rest,
+            start_offset,
+            word_index + 1,
+            bit_array.concat([acc, <<b0, b1, b2, b3>>]),
+          )
+        True ->
+          powerpc_apply(b0, b1, b2, b3, rest, start_offset, word_index, acc)
+      }
+    _ -> acc
+  }
+}
+
+fn is_powerpc_branch_link(b0: Int, b3: Int) -> Bool {
+  int.bitwise_shift_right(b0, 2) == 0x12 && int.bitwise_and(b3, 3) == 1
+}
+
+fn powerpc_apply(
+  b0: Int,
+  b1: Int,
+  b2: Int,
+  b3: Int,
+  rest: BitArray,
+  start_offset: Int,
+  word_index: Int,
+  acc: BitArray,
+) -> BitArray {
+  let src =
+    int.bitwise_or(
+      int.bitwise_or(
+        int.bitwise_shift_left(int.bitwise_and(b0, 3), 24),
+        int.bitwise_shift_left(b1, 16),
+      ),
+      int.bitwise_or(
+        int.bitwise_shift_left(b2, 8),
+        // b3 with the bottom 2 bits cleared (~3 == 0xFC).
+        int.bitwise_and(b3, 0xFC),
+      ),
+    )
+  let dest =
+    int.bitwise_and(
+      src - { start_offset + word_index * 4 } + 0x1_0000_0000,
+      mask32,
+    )
+  let new_b0 =
+    int.bitwise_or(
+      0x48,
+      int.bitwise_and(int.bitwise_shift_right(dest, 24), 0x03),
+    )
+  let new_b1 = int.bitwise_and(int.bitwise_shift_right(dest, 16), 0xFF)
+  let new_b2 = int.bitwise_and(int.bitwise_shift_right(dest, 8), 0xFF)
+  let new_b3 =
+    int.bitwise_or(int.bitwise_and(b3, 0x03), int.bitwise_and(dest, 0xFC))
+  powerpc_decode_words(
+    rest,
+    start_offset,
+    word_index + 1,
+    bit_array.concat([acc, <<new_b0, new_b1, new_b2, new_b3>>]),
+  )
+}
+
+/// Decode an ARM-Thumb (T32) BCJ-encoded byte sequence.  Thumb-2
+/// `BL` / `BLX` instructions span two 16-bit half-words; the
+/// encoder rewrites the relative branch target to absolute byte
+/// addresses and the decoder reverses that.
+pub fn armthumb_decode(
+  bytes bytes: BitArray,
+  start_offset start_offset: Int,
+) -> BitArray {
+  let total = bit_array.byte_size(bytes)
+  case total < 4 {
+    True -> bytes
+    False -> armthumb_decode_loop(bytes, start_offset, 0, total - 4, <<>>)
+  }
+}
+
+fn armthumb_decode_loop(
+  remaining: BitArray,
+  start_offset: Int,
+  pos: Int,
+  limit: Int,
+  acc: BitArray,
+) -> BitArray {
+  case pos > limit {
+    True -> bit_array.concat([acc, remaining])
+    False ->
+      case remaining {
+        <<b0, b1, b2, b3, rest:bytes>> ->
+          case is_armthumb_bl(b1, b3) {
+            True ->
+              armthumb_apply(
+                b0,
+                b1,
+                b2,
+                b3,
+                rest,
+                start_offset,
+                pos,
+                limit,
+                acc,
+              )
+            False ->
+              // No match — advance only by 2 bytes.  Emit b0 + b1
+              // to the output, then continue scanning from b2.
+              armthumb_decode_loop(
+                bit_array.concat([<<b2, b3>>, rest]),
+                start_offset,
+                pos + 2,
+                limit,
+                bit_array.concat([acc, <<b0, b1>>]),
+              )
+          }
+        _ -> bit_array.concat([acc, remaining])
+      }
+  }
+}
+
+fn is_armthumb_bl(b1: Int, b3: Int) -> Bool {
+  int.bitwise_and(b1, 0xF8) == 0xF0 && int.bitwise_and(b3, 0xF8) == 0xF8
+}
+
+fn armthumb_apply(
+  b0: Int,
+  b1: Int,
+  b2: Int,
+  b3: Int,
+  rest: BitArray,
+  start_offset: Int,
+  pos: Int,
+  limit: Int,
+  acc: BitArray,
+) -> BitArray {
+  let src =
+    int.bitwise_or(
+      int.bitwise_or(
+        int.bitwise_shift_left(int.bitwise_and(b1, 7), 19),
+        int.bitwise_shift_left(b0, 11),
+      ),
+      int.bitwise_or(int.bitwise_shift_left(int.bitwise_and(b3, 7), 8), b2),
+    )
+  let src_bytes = int.bitwise_shift_left(src, 1)
+  let dest =
+    int.bitwise_and(
+      src_bytes - { start_offset + pos + 4 } + 0x1_0000_0000,
+      mask32,
+    )
+    |> int.bitwise_shift_right(1)
+  let new_b1 =
+    int.bitwise_or(
+      0xF0,
+      int.bitwise_and(int.bitwise_shift_right(dest, 19), 0x07),
+    )
+  let new_b0 = int.bitwise_and(int.bitwise_shift_right(dest, 11), 0xFF)
+  let new_b3 =
+    int.bitwise_or(
+      0xF8,
+      int.bitwise_and(int.bitwise_shift_right(dest, 8), 0x07),
+    )
+  let new_b2 = int.bitwise_and(dest, 0xFF)
+  armthumb_decode_loop(
+    rest,
+    start_offset,
+    pos + 4,
+    limit,
+    bit_array.concat([acc, <<new_b0, new_b1, new_b2, new_b3>>]),
+  )
+}
+
 /// Decode an ARM (A32) BCJ-encoded byte sequence.  ARM BCJ looks
 /// for `BL` (branch-with-link) instructions on 4-byte boundaries:
 /// the high byte is `0xEB` and the low 24 bits are the

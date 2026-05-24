@@ -590,7 +590,9 @@ fn validate_pre_filters(
     [] -> Ok(Nil)
     [#(0x03, _), ..rest] -> validate_pre_filters(rest)
     [#(0x04, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x05, _), ..rest] -> validate_pre_filters(rest)
     [#(0x07, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x08, _), ..rest] -> validate_pre_filters(rest)
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(
         feature: "xz pre-processor filter id " <> int.to_string(id),
@@ -625,10 +627,18 @@ fn apply_pre_filters_loop(
       // every block boundary so the decoder does the same.
       apply_pre_filters_loop(bcj.x86_decode(bytes, 0), rest)
     }
+    [#(0x05, _), ..rest] -> {
+      // PowerPC (big-endian) BCJ filter.
+      apply_pre_filters_loop(bcj.powerpc_decode(bytes, 0), rest)
+    }
     [#(0x07, _), ..rest] -> {
       // ARM A32 BCJ filter — same `now_pos = 0` block-reset
       // convention as the x86 filter.
       apply_pre_filters_loop(bcj.arm_decode(bytes, 0), rest)
+    }
+    [#(0x08, _), ..rest] -> {
+      // ARM-Thumb (T32) BCJ filter.
+      apply_pre_filters_loop(bcj.armthumb_decode(bytes, 0), rest)
     }
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(
