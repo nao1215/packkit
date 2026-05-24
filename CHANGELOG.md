@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Extended the xz decoder to support multi-filter chains whose
+  final filter is LZMA2 and whose earlier filters are
+  recognisable pre-processors.  The delta filter (id 0x03) is
+  the first pre-processor wired up; after LZMA2 decode the
+  pre-filter chain is applied in REVERSE order so the bytes
+  surfaced to the caller match the encoder's input.  Unknown
+  pre-processor IDs (BCJ x86/ARM/PowerPC/...) still surface as
+  typed `CodecNotImplemented` errors carrying the filter id.
 - Extended the 7z decoder with per-file substream awareness.  The
   parser previously skipped `SubStreamsInfo` entirely, so any 7z
   archive containing more than one file inside a single folder

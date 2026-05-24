@@ -365,19 +365,16 @@ fn decode_block(
           use #(flags, comp_size, uncomp_size, filters, _padding) <- result.try(
             parse_block_header(header_chunk, header_size),
           )
-          use <- bool.guard(
-            when: list.length(filters) != 1,
-            return: Error(error.CodecNotImplemented(
-              feature: "xz blocks with multi-filter chains",
-            )),
-          )
-          let assert [#(filter_id, props)] = filters
-          use <- bool.guard(
-            when: filter_id != 0x21,
-            return: Error(error.CodecNotImplemented(
-              feature: "xz filter id " <> int.to_string(filter_id),
-            )),
-          )
+          // Multi-filter chains are supported when:
+          //   - the final filter is LZMA2 (the spec requires the
+          //     last filter to be the compression filter),
+          //   - every earlier filter is a recognised pre-processor.
+          // After LZMA2 decode the pre-processors are applied to
+          // the output in REVERSE order, since each pre-processor's
+          // encode pass ran before LZMA2 saw the bytes.
+          use #(lzma2_props, pre_filters) <- result.try(split_filter_chain(
+            filters,
+          ))
           let _ = flags
           // Slice the compressed data immediately after the header.
           let payload_offset = header_size
@@ -391,7 +388,11 @@ fn decode_block(
             payload_size,
             "xz block data",
           ))
-          use plain <- result.try(decode_lzma2(payload, props, limits))
+          use lzma_out <- result.try(decode_lzma2(payload, lzma2_props, limits))
+          use plain <- result.try(apply_pre_filters_reverse(
+            lzma_out,
+            pre_filters,
+          ))
           use <- bool.guard(
             when: case uncomp_size {
               UncompressedKnown(v) -> bit_array.byte_size(plain) != v
@@ -545,6 +546,139 @@ fn parse_filters(
       }
       parse_filters(rest, remaining - 1, [#(filter_id, props_int), ..acc])
     }
+  }
+}
+
+// -- filter chain -------------------------------------------------------
+
+/// XZ blocks always terminate with the compression filter (LZMA2,
+/// id 0x21).  Any earlier filters in the chain are pre-processors
+/// that ran before LZMA2 saw the bytes; the decoder must apply
+/// their inverse to LZMA2's output in REVERSE chain order.  Split
+/// the parsed filter list into "LZMA2 properties" and "the
+/// pre-filter chain (already in encode-order)".
+fn split_filter_chain(
+  filters: List(#(Int, Int)),
+) -> Result(#(Int, List(#(Int, Int))), error.CodecError) {
+  case filters {
+    [] -> Error(error.CodecInvalidData(message: "xz block has no filters"))
+    _ -> {
+      // The last filter must be LZMA2.
+      let reversed = list.reverse(filters)
+      case reversed {
+        [] -> Error(error.CodecInvalidData(message: "xz block has no filters"))
+        [#(id, _), ..] if id != 0x21 ->
+          Error(error.CodecNotImplemented(
+            feature: "xz blocks whose final filter is not LZMA2",
+          ))
+        [#(_, props), ..pre_reversed] -> {
+          // Validate every earlier filter is one we can apply.
+          let pre_filters = list.reverse(pre_reversed)
+          use _ <- result.try(validate_pre_filters(pre_filters))
+          Ok(#(props, pre_filters))
+        }
+      }
+    }
+  }
+}
+
+fn validate_pre_filters(
+  filters: List(#(Int, Int)),
+) -> Result(Nil, error.CodecError) {
+  case filters {
+    [] -> Ok(Nil)
+    [#(0x03, _), ..rest] -> validate_pre_filters(rest)
+    [#(id, _), ..] ->
+      Error(error.CodecNotImplemented(
+        feature: "xz pre-processor filter id " <> int.to_string(id),
+      ))
+  }
+}
+
+/// Apply every pre-filter in REVERSE order so the bytes seen by
+/// the user match the encoder's input.  Delta is the only
+/// pre-processor we currently invert.
+fn apply_pre_filters_reverse(
+  bytes: BitArray,
+  filters: List(#(Int, Int)),
+) -> Result(BitArray, error.CodecError) {
+  apply_pre_filters_loop(bytes, list.reverse(filters))
+}
+
+fn apply_pre_filters_loop(
+  bytes: BitArray,
+  reversed_filters: List(#(Int, Int)),
+) -> Result(BitArray, error.CodecError) {
+  case reversed_filters {
+    [] -> Ok(bytes)
+    [#(0x03, props), ..rest] -> {
+      // Delta filter property byte stores `distance - 1` so
+      // distances 1..256 fit in one byte.
+      let distance = props + 1
+      apply_pre_filters_loop(delta_decode(bytes, distance), rest)
+    }
+    [#(id, _), ..] ->
+      Error(error.CodecNotImplemented(
+        feature: "xz pre-processor filter id " <> int.to_string(id),
+      ))
+  }
+}
+
+/// Delta decode: output[i] = input[i] + output[i - distance] mod 256.
+/// For the first `distance` bytes there's no predecessor so they
+/// pass through unchanged.
+fn delta_decode(bytes: BitArray, distance: Int) -> BitArray {
+  let bytes_list = bit_array_to_byte_list(bytes, [])
+  let decoded = delta_decode_loop(bytes_list, distance, [], 0)
+  byte_list_to_bit_array(decoded, <<>>)
+}
+
+fn delta_decode_loop(
+  remaining: List(Int),
+  distance: Int,
+  acc_reversed: List(Int),
+  count: Int,
+) -> List(Int) {
+  case remaining {
+    [] -> list.reverse(acc_reversed)
+    [b, ..rest] -> {
+      let prev = case count >= distance {
+        True -> nth_from_end(acc_reversed, distance - 1)
+        False -> 0
+      }
+      let decoded_byte = int.bitwise_and(b + prev, 0xFF)
+      delta_decode_loop(
+        rest,
+        distance,
+        [decoded_byte, ..acc_reversed],
+        count + 1,
+      )
+    }
+  }
+}
+
+fn nth_from_end(reversed_list: List(Int), index: Int) -> Int {
+  // `reversed_list` is the output so far in newest-first order;
+  // index 0 is the latest decoded byte, index `distance-1` is the
+  // byte at offset `distance` behind the cursor.
+  case reversed_list, index {
+    [], _ -> 0
+    [head, ..], 0 -> head
+    [_, ..rest], _ -> nth_from_end(rest, index - 1)
+  }
+}
+
+fn bit_array_to_byte_list(bytes: BitArray, acc: List(Int)) -> List(Int) {
+  case bytes {
+    <<b, rest:bytes>> -> bit_array_to_byte_list(rest, [b, ..acc])
+    _ -> list.reverse(acc)
+  }
+}
+
+fn byte_list_to_bit_array(bytes: List(Int), acc: BitArray) -> BitArray {
+  case bytes {
+    [] -> acc
+    [b, ..rest] -> byte_list_to_bit_array(rest, <<acc:bits, b>>)
   }
 }
 
