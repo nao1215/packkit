@@ -204,3 +204,64 @@ pub fn decode_multi_member_enforces_max_output_bytes_test() -> Nil {
     _ -> should.fail()
   }
 }
+
+pub fn fextra_roundtrip_single_subfield_test() -> Nil {
+  // BGZF (bgzipped block format) embeds the block size in an
+  // FEXTRA subfield with SI1='B' (0x42), SI2='C' (0x43).  The
+  // encoder must accept and round-trip such metadata.
+  let bgzf_subfield =
+    gzip.Subfield(id_1: 0x42, id_2: 0x43, data: <<0x00, 0x10>>)
+  let header =
+    gzip.default_header()
+    |> gzip.with_extra(subfields: [bgzf_subfield])
+  let payload = <<"bgzf-test-payload":utf8>>
+
+  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(decoded) = gzip.decode(bytes: bytes)
+  decoded.payload
+  |> should.equal(payload)
+  gzip.extra(decoded.header)
+  |> should.equal([bgzf_subfield])
+}
+
+pub fn fextra_roundtrip_multiple_subfields_test() -> Nil {
+  let s1 = gzip.Subfield(id_1: 0x42, id_2: 0x43, data: <<0xCA, 0xFE>>)
+  let s2 = gzip.Subfield(id_1: 0x52, id_2: 0x72, data: <<"hello":utf8>>)
+  let header =
+    gzip.default_header()
+    |> gzip.with_extra(subfields: [s1, s2])
+  let payload = <<"multi-subfield":utf8>>
+
+  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(decoded) = gzip.decode(bytes: bytes)
+  decoded.payload
+  |> should.equal(payload)
+  gzip.extra(decoded.header)
+  |> should.equal([s1, s2])
+}
+
+pub fn fextra_roundtrip_with_name_and_comment_test() -> Nil {
+  // Exercise the encoder path where every optional flag fires.
+  let subfield = gzip.Subfield(id_1: 0x41, id_2: 0x70, data: <<>>)
+  let header =
+    gzip.default_header()
+    |> gzip.with_extra(subfields: [subfield])
+    |> gzip.with_name(name: "data.txt")
+    |> gzip.with_comment(comment: "all fields populated")
+  let payload = <<"all-fields":utf8>>
+  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(decoded) = gzip.decode(bytes: bytes)
+  decoded.payload
+  |> should.equal(payload)
+  gzip.name(decoded.header)
+  |> should.equal(Some("data.txt"))
+  gzip.comment(decoded.header)
+  |> should.equal(Some("all fields populated"))
+  gzip.extra(decoded.header)
+  |> should.equal([subfield])
+}
+
+pub fn fextra_default_header_has_empty_extra_test() -> Nil {
+  gzip.extra(gzip.default_header())
+  |> should.equal([])
+}

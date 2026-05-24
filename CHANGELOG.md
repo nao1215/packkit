@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added `gzip.Subfield` and `gzip.with_extra` / `gzip.extra` so
+  gzip's FEXTRA region (RFC 1952 §2.3.1.1) can now be set at
+  encode time and recovered at decode time.  The decoder
+  previously skipped FEXTRA on the floor, which made formats
+  built on top of FEXTRA (BGZF's `BC` block-size subfield, the
+  `RA` random-access index, ...) impossible to round-trip
+  through packkit.  Encode validates the per-subfield 16-bit
+  LEN, the per-region 16-bit XLEN, and the per-byte ID range,
+  surfacing typed `HeaderExtraSubfieldTooLong`,
+  `HeaderExtraTotalTooLong`, and `HeaderExtraSubfieldIdOutOfRange`
+  errors via `with_extra_checked` rather than silently truncating
+  inside `encode`.
 - Added `recipe.tar_lzw` plus the `.tar.Z` / `.taz`
   filename detection.  The lzw codec was already available
   on its own but the tar recipe was missing.

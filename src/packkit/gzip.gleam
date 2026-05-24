@@ -42,7 +42,20 @@ pub opaque type Header {
     name: Option(String),
     comment: Option(String),
     modified_at_unix: Option(Int),
+    extra: List(Subfield),
   )
+}
+
+/// One FEXTRA subfield (RFC 1952 §2.3.1.1).  `id_1` and `id_2` are
+/// the two ASCII bytes that name the subfield (per the spec they
+/// SHOULD be a recognised registry entry but the format does not
+/// enforce that); `data` is the subfield body (up to 65 535 bytes).
+///
+/// Each subfield is encoded as `<id_1, id_2, LEN(LE 16), data>`,
+/// and the full FEXTRA region begins with the 16-bit little-endian
+/// total length of all subfields concatenated.
+pub type Subfield {
+  Subfield(id_1: Int, id_2: Int, data: BitArray)
 }
 
 /// Incremental decoder state.  Buffers the input chunks and runs the
@@ -72,7 +85,7 @@ pub fn codec() -> codecs.Codec {
 
 /// Default gzip header with no optional fields populated.
 pub fn default_header() -> Header {
-  Header(name: None, comment: None, modified_at_unix: None)
+  Header(name: None, comment: None, modified_at_unix: None, extra: [])
 }
 
 /// Attach an optional filename.
@@ -102,6 +115,15 @@ pub type HeaderError {
   /// (`0..2^32-1`).  Surfaced here rather than silently wrapping at
   /// `encode` time.
   HeaderModifiedAtOutOfRange(value: Int)
+  /// A single FEXTRA subfield must fit gzip's 16-bit LEN field; the
+  /// entire FEXTRA region must also fit gzip's 16-bit XLEN field.
+  /// Either overflow surfaces here at `with_extra_checked` time
+  /// rather than silently truncating the data inside `encode`.
+  HeaderExtraSubfieldTooLong(actual: Int)
+  HeaderExtraTotalTooLong(actual: Int)
+  /// FEXTRA subfield IDs are two bytes; values outside `0..255`
+  /// cannot be packed into a single byte each.
+  HeaderExtraSubfieldIdOutOfRange(id_1: Int, id_2: Int)
 }
 
 /// Attach an optional filename after validating that it does not
@@ -174,6 +196,74 @@ pub fn modified_at_unix(header: Header) -> Option(Int) {
   header.modified_at_unix
 }
 
+/// Read the FEXTRA subfields.  Empty when the gzip header carries
+/// no FEXTRA region.
+pub fn extra(header: Header) -> List(Subfield) {
+  header.extra
+}
+
+/// Attach a list of FEXTRA subfields.  Out-of-range IDs or
+/// overlong bodies panic; use [with_extra_checked] when the caller
+/// has not pre-validated the values.
+pub fn with_extra(header: Header, subfields subfields: List(Subfield)) -> Header {
+  case with_extra_checked(header, subfields: subfields) {
+    Ok(h) -> h
+    Error(HeaderExtraSubfieldIdOutOfRange(_, _)) ->
+      panic as "packkit/gzip.with_extra: subfield id bytes must each be in 0..255"
+    Error(HeaderExtraSubfieldTooLong(_)) ->
+      panic as "packkit/gzip.with_extra: each subfield body must be at most 65535 bytes"
+    Error(HeaderExtraTotalTooLong(_)) ->
+      panic as "packkit/gzip.with_extra: total FEXTRA region must be at most 65535 bytes"
+    Error(_) -> panic as "packkit/gzip.with_extra: unexpected validation error"
+  }
+}
+
+/// Attach a list of FEXTRA subfields after validating that every
+/// subfield ID byte fits the 8-bit slot, every subfield body fits
+/// gzip's 16-bit LEN, and the catenated total fits the 16-bit
+/// XLEN.  Returns a typed `HeaderError` on any of those overflows.
+pub fn with_extra_checked(
+  header: Header,
+  subfields subfields: List(Subfield),
+) -> Result(Header, HeaderError) {
+  use _ <- result.try(validate_extra_subfield_ids(subfields))
+  use total <- result.try(measure_extra_subfields(subfields, 0))
+  use <- bool.guard(
+    when: total > 0xFFFF,
+    return: Error(HeaderExtraTotalTooLong(actual: total)),
+  )
+  Ok(Header(..header, extra: subfields))
+}
+
+fn validate_extra_subfield_ids(
+  subfields: List(Subfield),
+) -> Result(Nil, HeaderError) {
+  case subfields {
+    [] -> Ok(Nil)
+    [Subfield(id_1: id_1, id_2: id_2, data: _), ..rest] ->
+      case id_1 < 0 || id_1 > 0xFF || id_2 < 0 || id_2 > 0xFF {
+        True -> Error(HeaderExtraSubfieldIdOutOfRange(id_1: id_1, id_2: id_2))
+        False -> validate_extra_subfield_ids(rest)
+      }
+  }
+}
+
+fn measure_extra_subfields(
+  subfields: List(Subfield),
+  acc: Int,
+) -> Result(Int, HeaderError) {
+  case subfields {
+    [] -> Ok(acc)
+    [Subfield(id_1: _, id_2: _, data: data), ..rest] -> {
+      let len = bit_array.byte_size(data)
+      case len > 0xFFFF {
+        True -> Error(HeaderExtraSubfieldTooLong(actual: len))
+        False -> measure_extra_subfields(rest, acc + 4 + len)
+      }
+    }
+  }
+}
+
 /// Encode `bytes` as a gzip stream using `header`.
 pub fn encode(
   bytes bytes: BitArray,
@@ -186,6 +276,10 @@ pub fn encode(
     None -> 0
   }
 
+  let flag_extra = case header.extra {
+    [] -> 0
+    _ -> fextra_flag
+  }
   let flag_name = case header.name {
     Some(_) -> fname_flag
     None -> 0
@@ -194,7 +288,7 @@ pub fn encode(
     Some(_) -> fcomment_flag
     None -> 0
   }
-  let flg = int.bitwise_or(flag_name, flag_comment)
+  let flg = int.bitwise_or(int.bitwise_or(flag_extra, flag_name), flag_comment)
 
   let header_bytes = <<
     magic_byte_1,
@@ -205,6 +299,8 @@ pub fn encode(
     0,
     os_unknown,
   >>
+
+  let extra_block = encode_extra_block(header.extra)
 
   let name_block = case header.name {
     Some(value) -> bit_array.concat([bit_array.from_string(value), <<0>>])
@@ -221,12 +317,35 @@ pub fn encode(
   Ok(
     bit_array.concat([
       header_bytes,
+      extra_block,
       name_block,
       comment_block,
       deflated,
       trailer,
     ]),
   )
+}
+
+fn encode_extra_block(subfields: List(Subfield)) -> BitArray {
+  case subfields {
+    [] -> <<>>
+    _ -> {
+      let body = encode_extra_subfields(subfields, <<>>)
+      let xlen = bit_array.byte_size(body)
+      bit_array.concat([<<xlen:size(16)-little>>, body])
+    }
+  }
+}
+
+fn encode_extra_subfields(subfields: List(Subfield), acc: BitArray) -> BitArray {
+  case subfields {
+    [] -> acc
+    [Subfield(id_1: id_1, id_2: id_2, data: data), ..rest] -> {
+      let len = bit_array.byte_size(data)
+      let chunk = bit_array.concat([<<id_1, id_2, len:size(16)-little>>, data])
+      encode_extra_subfields(rest, bit_array.concat([acc, chunk]))
+    }
+  }
 }
 
 fn trailer_bytes(plain: BitArray) -> BitArray {
@@ -378,7 +497,7 @@ fn decode_header_and_payload(
   acc: Header,
   limits: limit.Limits,
 ) -> Result(#(Decoded, BitArray), error.CodecError) {
-  use #(bytes, _) <- result.try(maybe_skip_extra(bytes, flg))
+  use #(bytes, extra_value) <- result.try(maybe_read_extra(bytes, flg))
   use #(bytes, name_value) <- result.try(maybe_read_string(
     bytes,
     flg,
@@ -395,6 +514,7 @@ fn decode_header_and_payload(
     acc
     |> apply_optional_name(name_value)
     |> apply_optional_comment(comment_value)
+    |> apply_extra(extra_value)
 
   let _ = int.bitwise_and(flg, ftext_flag)
 
@@ -439,12 +559,19 @@ fn apply_optional_comment(header: Header, value: Option(String)) -> Header {
   }
 }
 
-fn maybe_skip_extra(
+fn apply_extra(header: Header, subfields: List(Subfield)) -> Header {
+  case subfields {
+    [] -> header
+    _ -> Header(..header, extra: subfields)
+  }
+}
+
+fn maybe_read_extra(
   bytes: BitArray,
   flg: Int,
-) -> Result(#(BitArray, Nil), error.CodecError) {
+) -> Result(#(BitArray, List(Subfield)), error.CodecError) {
   case int.bitwise_and(flg, fextra_flag) {
-    0 -> Ok(#(bytes, Nil))
+    0 -> Ok(#(bytes, []))
     _ ->
       case bytes {
         <<xlen:size(16)-little, rest:bytes>> ->
@@ -454,13 +581,49 @@ fn maybe_skip_extra(
                 message: "gzip extra field truncated",
               ))
             False -> {
+              let assert Ok(extra_bytes) = bit_array.slice(rest, 0, xlen)
               let assert Ok(after) =
                 bit_array.slice(rest, xlen, bit_array.byte_size(rest) - xlen)
-              Ok(#(after, Nil))
+              use subfields <- result.try(
+                parse_extra_subfields(extra_bytes, []),
+              )
+              Ok(#(after, list.reverse(subfields)))
             }
           }
         _ ->
           Error(error.CodecInvalidData(message: "gzip extra header truncated"))
+      }
+  }
+}
+
+fn parse_extra_subfields(
+  bytes: BitArray,
+  acc: List(Subfield),
+) -> Result(List(Subfield), error.CodecError) {
+  case bit_array.byte_size(bytes) {
+    0 -> Ok(acc)
+    _ ->
+      case bytes {
+        <<id_1, id_2, len:size(16)-little, rest:bytes>> ->
+          case bit_array.byte_size(rest) < len {
+            True ->
+              Error(error.CodecInvalidData(
+                message: "gzip extra subfield body truncated",
+              ))
+            False -> {
+              let assert Ok(data) = bit_array.slice(rest, 0, len)
+              let assert Ok(remaining) =
+                bit_array.slice(rest, len, bit_array.byte_size(rest) - len)
+              parse_extra_subfields(remaining, [
+                Subfield(id_1: id_1, id_2: id_2, data: data),
+                ..acc
+              ])
+            }
+          }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "gzip extra subfield header truncated",
+          ))
       }
   }
 }
