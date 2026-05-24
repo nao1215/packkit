@@ -279,12 +279,12 @@ pub fn decode_four_streams(
           // fourth covers the remainder.
           let per_stream = { regenerated_size + 3 } / 4
           let stream4_size = regenerated_size - per_stream * 3
-          decode_split_streams(
-            tree,
-            streams,
-            #(size1, size2, size3, size4),
-            #(per_stream, per_stream, per_stream, stream4_size),
-          )
+          decode_split_streams(tree, streams, #(size1, size2, size3, size4), #(
+            per_stream,
+            per_stream,
+            per_stream,
+            stream4_size,
+          ))
         }
         _ -> Error(HufTruncated(message: "huf: 4-stream header malformed"))
       }
@@ -390,10 +390,7 @@ fn decode_fse_weight_pairs(
 }
 
 fn finish_or_continue_weight_pair(
-  decode_outcome: Result(
-    #(Int, Int, fse.BackwardReader),
-    fse.FseError,
-  ),
+  decode_outcome: Result(#(Int, Int, fse.BackwardReader), fse.FseError),
   table: dict.Dict(Int, fse.StateEntry),
   state_a: Int,
   state_b: Int,
@@ -627,7 +624,10 @@ fn shrink_threshold(
   bit_count: Int,
   remaining: Int,
 ) -> #(Int, Int) {
-  use <- bool.guard(when: remaining >= threshold, return: #(threshold, bit_count))
+  use <- bool.guard(when: remaining >= threshold, return: #(
+    threshold,
+    bit_count,
+  ))
   use <- bool.guard(when: threshold <= 1, return: #(threshold, bit_count))
   shrink_threshold(threshold / 2, bit_count - 1, remaining)
 }
