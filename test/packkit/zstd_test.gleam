@@ -102,6 +102,23 @@ pub fn encode_roundtrip_512_test() -> Nil {
   |> should.equal(payload)
 }
 
+pub fn encode_uses_rle_block_for_uniform_runs_test() -> Nil {
+  // 1000 identical bytes should compress to roughly 11 bytes
+  // (magic + FHD + FCS + 3-byte block header + 1 RLE payload byte
+  // = 11) once the encoder picks RLE_Block instead of Raw_Block.
+  // Verifies both the new encoder branch and the round-trip.
+  let payload = repeat_byte(0x41, 1000, <<>>)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+  // The encoder should shrink the payload significantly; assert
+  // it fits in 32 bytes to lock in the RLE behaviour.
+  let encoded_size = bit_array.byte_size(encoded)
+  { encoded_size < 32 }
+  |> should.equal(True)
+}
+
 fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
   case count {
     0 -> acc

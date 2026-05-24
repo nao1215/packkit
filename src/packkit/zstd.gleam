@@ -40,11 +40,13 @@ pub fn codec() -> codecs.Codec {
 
 const max_block_size: Int = 0x20_000
 
-/// Encode `bytes` as a Zstandard frame.  The encoder always emits raw
-/// blocks (no compression, no checksum) — the output is a valid
-/// Zstandard frame that any conforming decoder can read, but it
-/// preserves the original byte count rather than shrinking it.  A
-/// compression-aware encoder is intentionally future work.
+/// Encode `bytes` as a Zstandard frame.  The encoder picks the
+/// cheapest of `Raw_Block` and `RLE_Block` per chunk — a chunk that
+/// repeats a single byte collapses to a 1-byte RLE payload — so
+/// inputs like `repeat('A', N)` compress, but mixed input still
+/// passes through as raw bytes.  No LZ77 or Huffman compression yet,
+/// no content checksum.  Output is a valid Zstandard frame any
+/// conforming decoder can read.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let size = bit_array.byte_size(bytes)
   use header <- result.try(frame_header_for_size(size))
@@ -115,7 +117,7 @@ pub fn frame_header_for_size(size: Int) -> Result(BitArray, error.CodecError) {
 
 fn build_raw_blocks(bytes: BitArray, total: Int) -> BitArray {
   case total {
-    0 -> raw_block_header(0, True)
+    0 -> block_header(0, 0, True)
     _ -> emit_raw_blocks_loop(bytes, total, <<>>)
   }
 }
@@ -140,23 +142,54 @@ fn emit_raw_blocks_loop(
           chunk_size,
           bit_array.byte_size(remaining_bytes) - chunk_size,
         )
-      let block_header = raw_block_header(chunk_size, is_last)
+      // Pick RLE when the whole chunk is one repeating byte and the
+      // run is long enough that the 1-byte RLE payload beats N raw
+      // bytes (always true for chunk_size >= 2).
+      let chunk_block = case chunk_size >= 2, peek_uniform_byte(chunk) {
+        True, Ok(byte) ->
+          bit_array.concat([block_header(chunk_size, 1, is_last), <<byte>>])
+        _, _ -> bit_array.concat([block_header(chunk_size, 0, is_last), chunk])
+      }
       emit_raw_blocks_loop(
         rest,
         remaining_size - chunk_size,
-        bit_array.concat([acc, block_header, chunk]),
+        bit_array.concat([acc, chunk_block]),
       )
     }
   }
 }
 
-fn raw_block_header(block_size: Int, is_last: Bool) -> BitArray {
+/// Returns the single byte the whole chunk repeats, or Error if the
+/// chunk has more than one distinct value.
+fn peek_uniform_byte(bytes: BitArray) -> Result(Int, Nil) {
+  case bytes {
+    <<first, rest:bytes>> -> uniform_byte_loop(first, rest)
+    _ -> Error(Nil)
+  }
+}
+
+fn uniform_byte_loop(byte: Int, rest: BitArray) -> Result(Int, Nil) {
+  case rest {
+    <<>> -> Ok(byte)
+    <<b, more:bytes>> if b == byte -> uniform_byte_loop(byte, more)
+    _ -> Error(Nil)
+  }
+}
+
+fn block_header(block_size: Int, block_type: Int, is_last: Bool) -> BitArray {
   let last_bit = case is_last {
     True -> 1
     False -> 0
   }
+  // header layout: [block_size:21][block_type:2][last:1]
   let block_header_value =
-    int.bitwise_or(int.bitwise_shift_left(block_size, 3), last_bit)
+    int.bitwise_or(
+      int.bitwise_or(
+        int.bitwise_shift_left(block_size, 3),
+        int.bitwise_shift_left(block_type, 1),
+      ),
+      last_bit,
+    )
   let bh0 = int.bitwise_and(block_header_value, 0xFF)
   let bh1 =
     int.bitwise_and(int.bitwise_shift_right(block_header_value, 8), 0xFF)
