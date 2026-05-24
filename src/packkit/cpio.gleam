@@ -22,6 +22,8 @@ const header_size: Int = 110
 
 const magic_newc: String = "070701"
 
+const magic_crc: String = "070702"
+
 const trailer_name: String = "TRAILER!!!"
 
 const align: Int = 4
@@ -162,9 +164,14 @@ type ParsedHeader {
 fn parse_header(block: BitArray) -> Result(ParsedHeader, error.ArchiveError) {
   use magic_bits <- result.try(slice_or_error(block, 0, 6))
   use magic <- result.try(bytes_to_string(magic_bits))
+  // newc (070701) and crc (070702) share the same on-disk layout;
+  // the only difference is that crc carries a 32-bit CRC of the
+  // file body in the `checksum` field that newc leaves as zero.
+  // We don't verify the body checksum, so accepting both magics
+  // here lets `cpio -H crc` archives round-trip end-to-end.
   use <- bool.guard(
-    when: magic != magic_newc,
-    return: Error(error.ArchiveInvalid(message: "not a newc cpio magic")),
+    when: magic != magic_newc && magic != magic_crc,
+    return: Error(error.ArchiveInvalid(message: "not a newc/crc cpio magic")),
   )
 
   use mode <- result.try(read_hex_field(block, 14))

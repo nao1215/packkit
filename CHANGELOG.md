@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: cpio decoder now also accepts the `crc`
+  format (magic `070702`).  newc (`070701`) and crc share the same
+  on-disk layout; only the optional 32-bit body checksum differs.
+  The previous "not a newc cpio magic" error would block
+  `cpio -H crc` archives entirely.  The decoder still treats the
+  checksum field as opaque (no verification yet), but
+  `cpio -H crc` round-trips end-to-end now.
 - **Fix (correctness)**: tar decoder now parses PAX extended-
   header records.  Previously the decoder skipped the `x` / `g`
   bodies entirely, so files emitted by `tar --format=pax`
