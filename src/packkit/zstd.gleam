@@ -1709,14 +1709,22 @@ fn resolve_offset(
     2 ->
       case literal_length {
         0 -> {
+          // LL == 0, offset_value 2 ⇒ repCode 2 (see
+          // ZSTD_updateRep): rep[2] = rep[1], rep[1] = rep[0],
+          // rep[0] = old rep[2].  IMPORTANT: read all three fields
+          // off `ctx` BEFORE constructing the new record (a chained
+          // update inside one SeqContext literal would otherwise
+          // observe its own freshly-written fields and corrupt the
+          // history).
           let actual = ctx.rep2
           #(
             actual,
-            SeqContext(..ctx, rep2: ctx.rep0, rep1: ctx.rep0, rep0: actual)
-              |> rotate_rep(actual),
+            SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: actual),
           )
         }
         _ -> {
+          // LL > 0, offset_value 2 ⇒ repCode 1: rep[1] = rep[0],
+          // rep[0] = old rep[1].  rep[2] is unchanged.
           let actual = ctx.rep1
           #(actual, SeqContext(..ctx, rep0: ctx.rep1, rep1: ctx.rep0))
         }
@@ -1749,13 +1757,6 @@ fn resolve_offset(
       #(actual, SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: actual))
     }
   }
-}
-
-/// After picking rep[2] via the "raw_offset=2, LL=0" path we still
-/// need the canonical rep-list rotation: new rep0 = old rep2,
-/// new rep1 = old rep0, new rep2 = old rep1.
-fn rotate_rep(ctx: SeqContext, new_rep0: Int) -> SeqContext {
-  SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: new_rep0)
 }
 
 fn copy_literals(

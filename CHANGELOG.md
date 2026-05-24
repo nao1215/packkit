@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: zstd `resolve_offset` raw_offset=2,
+  LL=0 case (offset_value 2 with zero literals_length, i.e.
+  reference repCode 2) wrote a corrupted repeated-offset
+  history.  The code chained three rep-field updates inside
+  one `SeqContext` record literal and a follow-up `rotate_rep`
+  helper, and the rotate observed its own freshly-written
+  fields — net effect: `rep[1]` ended up equal to the new
+  `rep[0]` and `rep[2]` was the old `rep[0]` instead of old
+  `rep[1]`.  Visible symptom was matched-text corruption at
+  high `zstd` levels (-13 and above), e.g. `zstd -15 src/zstd.gleam`
+  mismatched at byte 37977 with a "rep code triggered a wrong
+  copy" pattern.  After the fix every `zstd -1..-19` level
+  decodes byte-for-byte for every fixture in the regression
+  suite — the repository's own README / CHANGELOG / source
+  files round-trip across the full level range.
 - **Fix (correctness)**: zstd multi-block frames now thread the
   running per-frame output and the repeated-offset triple
   (rep0, rep1, rep2) across block boundaries.  Previously each
