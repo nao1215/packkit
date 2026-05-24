@@ -299,7 +299,13 @@ fn decode_first_member_and_continue(
   case bit_array.byte_size(rest) {
     0 -> Ok(decoded)
     _ -> {
-      use additional <- result.try(decode_remaining_members(rest, <<>>, limits))
+      let initial_size = bit_array.byte_size(decoded.payload)
+      use additional <- result.try(decode_remaining_members(
+        rest,
+        <<>>,
+        initial_size,
+        limits,
+      ))
       Ok(
         Decoded(
           ..decoded,
@@ -313,17 +319,28 @@ fn decode_first_member_and_continue(
 fn decode_remaining_members(
   bytes: BitArray,
   acc: BitArray,
+  accumulated_size: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   case bit_array.byte_size(bytes) {
     0 -> Ok(acc)
     _ -> {
       use #(decoded, rest) <- result.try(decode_one_member(bytes, limits))
-      decode_remaining_members(
-        rest,
-        bit_array.concat([acc, decoded.payload]),
-        limits,
-      )
+      let next_size = accumulated_size + bit_array.byte_size(decoded.payload)
+      case next_size > limit.max_output_bytes(limits) {
+        True ->
+          Error(error.CodecLimitExceeded(
+            limit: "max_output_bytes",
+            actual: next_size,
+          ))
+        False ->
+          decode_remaining_members(
+            rest,
+            bit_array.concat([acc, decoded.payload]),
+            next_size,
+            limits,
+          )
+      }
     }
   }
 }

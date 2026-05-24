@@ -181,3 +181,26 @@ pub fn decode_multi_member_via_payload_helper_test() -> Nil {
   plain
   |> should.equal(<<"xy":utf8>>)
 }
+
+pub fn decode_multi_member_enforces_max_output_bytes_test() -> Nil {
+  // Each member's deflate stream individually fits inside
+  // `max_output_bytes`, but the catenation of N members can grow
+  // up to N × max_output_bytes if the per-member check is the
+  // only guard.  The decoder must reject as soon as the
+  // accumulated payload exceeds the limit so that adversarial
+  // multi-member archives cannot OOM the host.
+  let payload = <<"twenty-byte-payload!":utf8>>
+  // 20 bytes per member; 3 members = 60 bytes total.
+  let assert Ok(member) =
+    gzip.encode(bytes: payload, header: gzip.default_header())
+  let combined = bit_array.concat([member, member, member])
+  // Limit allows up to 40 output bytes, so member 1 fits, member
+  // 2 pushes the running total to 40, member 3 should overflow.
+  let restrictive_limits =
+    limit.default()
+    |> limit.with_max_output_bytes(bytes: 40)
+  case gzip.decode_with_limits(bytes: combined, limits: restrictive_limits) {
+    Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+}

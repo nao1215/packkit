@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Made `gzip.decode_with_limits` enforce `max_output_bytes` across
+  the whole multi-member stream, not just per member.  The
+  per-member deflate decoder already capped each member at the
+  limit, but a stream of N members could still grow the catenated
+  payload to N × max_output_bytes; the new check folds the limit
+  into the running total so adversarial multi-member archives are
+  rejected as soon as the threshold is exceeded.
+- Made the `zstd` literals-section header parser cover all four
+  size_format variants of `Compressed_Literals_Block` and
+  `Treeless_Literals_Block` (3-, 4-, and 5-byte headers).  The
+  `CodecNotImplemented` diagnostic now carries the parsed
+  `regenerated_size`, `compressed_size`, and stream count (1 or 4)
+  so users can see exactly which configuration their `.zst` file
+  uses, and the parser is wired up so the eventual Huffman
+  literal decoder can plug into a stable foundation.
 - Added `lz4.encode_with_content_size` and a small pure-Gleam
   `internal/xxh32` module that computes the LZ4 frame header
   checksum byte.  The new encoder sets the FLG content-size flag
