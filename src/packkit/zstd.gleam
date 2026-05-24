@@ -26,6 +26,7 @@ import gleam/result
 import packkit/codec as codecs
 import packkit/error
 import packkit/internal/fse
+import packkit/internal/huf
 import packkit/limit
 
 const magic: Int = 0xFD2FB528
@@ -432,30 +433,76 @@ fn parse_compressed_literals(
     header_byte,
     size_format,
   ))
-  // We surface the parsed metadata in the error message so callers
-  // can see exactly which configuration tripped the not-implemented
-  // path.  This is intentionally specific: once Huffman literal
-  // decoding ships, this branch goes away in favour of the real
-  // decoder, but until then the message is the only diagnostic
-  // available to users debugging real-world `.zst` fixtures.
-  let kind = case treeless {
-    True -> "treeless"
-    False -> "Huffman-compressed"
+  case treeless {
+    True ->
+      Error(error.CodecNotImplemented(
+        feature: "zstd treeless literals (prior-tree reuse not supported)",
+      ))
+    False -> decode_huffman_literals_block(bytes, header)
   }
-  let regen = int_to_decimal(header.regenerated_size)
-  let comp = int_to_decimal(header.compressed_size)
-  let streams = int_to_decimal(header.streams)
-  Error(error.CodecNotImplemented(
-    feature: "zstd "
-    <> kind
-    <> " literals (regenerated_size="
-    <> regen
-    <> ", compressed_size="
-    <> comp
-    <> ", streams="
-    <> streams
-    <> ")",
+}
+
+fn decode_huffman_literals_block(
+  bytes: BitArray,
+  header: CompressedLiteralsHeader,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  // Slice the literals section payload out of the surrounding block
+  // so the Huffman tree parser stops at the right boundary.
+  let section_total = header.header_bytes + header.compressed_size
+  use section <- result.try(slice_or_error(
+    bytes,
+    0,
+    section_total,
+    "zstd compressed literals section body",
   ))
+  let assert Ok(after_section) =
+    bit_array.slice(
+      bytes,
+      section_total,
+      bit_array.byte_size(bytes) - section_total,
+    )
+
+  let assert Ok(tree_bytes) =
+    bit_array.slice(
+      section,
+      header.header_bytes,
+      section_total - header.header_bytes,
+    )
+  case huf.read_tree(tree_bytes) {
+    Error(reason) -> Error(huf_error_to_codec(reason))
+    Ok(#(tree, tree_consumed)) -> {
+      let bitstream_size = header.compressed_size - tree_consumed
+      use bitstream_bytes <- result.try(slice_or_error(
+        section,
+        header.header_bytes + tree_consumed,
+        bitstream_size,
+        "zstd Huffman literal bitstream",
+      ))
+      use literals <- result.try(case header.streams {
+        1 ->
+          huf.decode_stream(tree, bitstream_bytes, header.regenerated_size)
+          |> result.map_error(huf_error_to_codec)
+        _ ->
+          huf.decode_four_streams(
+            tree,
+            bitstream_bytes,
+            header.regenerated_size,
+          )
+          |> result.map_error(huf_error_to_codec)
+      })
+      Ok(#(literals, after_section))
+    }
+  }
+}
+
+fn huf_error_to_codec(err: huf.HufError) -> error.CodecError {
+  case err {
+    huf.HufTruncated(message) -> error.CodecInvalidData(message: message)
+    huf.HufInvalidWeights(message) -> error.CodecInvalidData(message: message)
+    huf.HufBitstreamError(_) ->
+      error.CodecInvalidData(message: "zstd Huffman bitstream truncated")
+    huf.HufUnsupported(feature) -> error.CodecNotImplemented(feature: feature)
+  }
 }
 
 fn parse_compressed_literals_header(
@@ -581,35 +628,6 @@ fn parse_compressed_literals_header(
             message: "truncated zstd compressed-literals 5-byte header",
           ))
       }
-  }
-}
-
-fn int_to_decimal(value: Int) -> String {
-  case value {
-    0 -> "0"
-    _ -> int_to_decimal_loop(value, "")
-  }
-}
-
-fn int_to_decimal_loop(value: Int, acc: String) -> String {
-  case value {
-    0 -> acc
-    _ -> {
-      let digit = value - { value / 10 } * 10
-      let ch = case digit {
-        0 -> "0"
-        1 -> "1"
-        2 -> "2"
-        3 -> "3"
-        4 -> "4"
-        5 -> "5"
-        6 -> "6"
-        7 -> "7"
-        8 -> "8"
-        _ -> "9"
-      }
-      int_to_decimal_loop(value / 10, ch <> acc)
-    }
   }
 }
 

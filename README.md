@@ -66,10 +66,13 @@ Implemented codecs and archive families:
   LZMA range coder in `packkit/internal/lzma`); multi-stream files
   with 4-byte-aligned stream padding decode end-to-end
 - **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
-  with Raw / RLE literals, predefined / RLE / FSE-compressed
-  sequence modes, and multi-frame stream decoding (concatenated
-  zstd frames such as `cat a.zst b.zst`); Huffman literals are
-  still pending
+  with Raw / RLE literals, **Huffman-compressed literals** (both
+  direct-weight and FSE-weight tree descriptions; both 1-stream
+  and 4-stream jump-table forms), predefined / RLE /
+  FSE-compressed sequence modes, and multi-frame stream
+  decoding (concatenated zstd frames such as `cat a.zst b.zst`).
+  Treeless-literal blocks (reuse the prior block's Huffman tree)
+  are still pending because they require cross-block tree state
 - **brotli**: full RFC 7932 decoder (uncompressed + compressed
   metablocks, static dictionary, context maps, block switching).
   Encoder emits uncompressed metablocks only — the stream is a

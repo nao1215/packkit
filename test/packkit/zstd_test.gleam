@@ -197,63 +197,32 @@ pub fn decode_rejects_missing_magic_test() -> Nil {
   )
 }
 
-pub fn compressed_literals_header_surfaces_metadata_test() -> Nil {
-  // Hand-crafted zstd frame whose only compressed block uses a
-  // Huffman-compressed literals section.  We don't have a Huffman
-  // decoder yet, but the literals-section header parser must
-  // surface the parsed regenerated_size / compressed_size / streams
-  // so users can see exactly which configuration tripped the
-  // not-implemented path.
-  //
-  // Literals_Section_Header bytes for size_format=1 (3-byte header,
-  // 4 streams, 10-bit sizes):
-  //   regen=257  ( = 0b0100000001 )
-  //   comp =258  ( = 0b0100000010 )
-  // Encoded little-endian-by-bit-field:
-  //   header_byte = type(2) | size_format(1)<<2 | regen_low4<<4
-  //               = 2 | 4 | (1 << 4) = 0x16
-  //   b1 = regen_high6 | comp_low2<<6
-  //      = 0b010000 | (0b10 << 6) = 0x90
-  //   b2 = comp_high8 = 0b01000000 = 0x40
-  let literals_header = <<0x16, 0x90, 0x40>>
-  // The frame just needs to reach `decode_compressed_block`; the
-  // block payload is the literals header followed by a fake
-  // Huffman tree byte so the slice fits, but we never actually
-  // parse that — the failure is surfaced from the header parser.
-  let block_payload = bit_array.concat([literals_header, <<0x00>>])
+pub fn treeless_literals_block_still_surfaces_typed_error_test() -> Nil {
+  // Treeless literals blocks (block_type = 3) need a previous
+  // Huffman tree to reuse, which we don't carry across blocks
+  // yet.  The decoder must surface that gap as a typed
+  // CodecNotImplemented carrying the "treeless" wording.
+  // The exact encoded shape doesn't matter for this assertion;
+  // it only matters that the block_type field is 3.  Build a
+  // minimal compressed block with literals_section_header byte
+  // = (block_type 3 | size_format 0 << 2) = 0x03 then garbage.
+  let block_payload = <<0x03, 0x00, 0x00, 0x00>>
   let block_size = bit_array.byte_size(block_payload)
   let block_header_int = 1 + 4 + { block_size * 8 }
-  // last=1, block_type=2 (compressed), block_size in high 21 bits.
   let block_header = <<block_header_int:size(24)-little>>
   let frame =
     bit_array.concat([
-      <<0x28, 0xB5, 0x2F, 0xFD>>,
-      // Frame_Header_Descriptor: dictionary_id_flag=0,
-      // content_checksum_flag=0, single_segment=1, fcs_flag_size=0
-      <<0x20>>,
-      // FCS for single_segment with fcs_flag_size=0 → 1 byte.
-      <<0x01>>,
+      <<0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01>>,
       block_header,
       block_payload,
     ])
 
   case zstd.decode(bytes: frame) {
-    Error(error.CodecNotImplemented(feature: feature)) -> {
-      // The diagnostic must include the parsed metadata so users
-      // can see what configuration their `.zst` file uses.
-      case string.contains(does: feature, contain: "regenerated_size=257") {
+    Error(error.CodecNotImplemented(feature: feature)) ->
+      case string.contains(does: feature, contain: "treeless") {
         True -> Nil
         False -> should.fail()
       }
-      case string.contains(does: feature, contain: "compressed_size=258") {
-        True -> Nil
-        False -> should.fail()
-      }
-      case string.contains(does: feature, contain: "streams=4") {
-        True -> Nil
-        False -> should.fail()
-      }
-    }
     _ -> should.fail()
   }
 }
@@ -269,4 +238,40 @@ pub fn decode_multi_frame_concatenated_test() -> Nil {
   let assert Ok(plain) = zstd.decode(bytes: combined)
   plain
   |> should.equal(<<"first-frame-payload-second-frame-payload":utf8>>)
+}
+
+pub fn decode_real_zstd_huffman_literals_fixture_test() -> Nil {
+  // 300-byte payload of random characters from a 16-symbol
+  // alphabet generated with:
+  //   python3 -c "import random; random.seed(99); chars=list('abcdefghijklmnop'); \
+  //     import sys; sys.stdout.buffer.write(''.join(random.choices(chars, k=300)).encode())" \
+  //     | zstd -1 -c
+  // The compressed block uses FSE-weight Huffman literals + 4
+  // streams (size_format=1, the common case for real `zstd -3`+
+  // output).  Asserting the decoder returns the exact 300 byte
+  // payload validates both the FSE weight reader and the
+  // 4-stream jump-table walker.
+  let fixture = <<
+    0x28, 0xB5, 0x2F, 0xFD, 0x64, 0x2C, 0x00, 0x75, 0x05, 0x00, 0xC6, 0x92, 0x2A,
+    0x0B, 0xD0, 0x0F, 0x24, 0x49, 0x92, 0x24, 0xC9, 0x07, 0x00, 0x28, 0x0F, 0x26,
+    0x00, 0x26, 0x00, 0x26, 0x00, 0x22, 0x61, 0xB9, 0xD9, 0xE2, 0x5B, 0x6C, 0x34,
+    0xC0, 0x83, 0x05, 0x14, 0x16, 0x7D, 0x00, 0xFA, 0x9F, 0x2C, 0x3E, 0xF5, 0xE9,
+    0x87, 0x3F, 0x40, 0x76, 0x8C, 0x5F, 0xAD, 0xA2, 0x56, 0x3E, 0x69, 0xF7, 0xA8,
+    0x46, 0x3C, 0x32, 0x16, 0xD5, 0xD3, 0xAB, 0x2A, 0x3A, 0xBF, 0x5A, 0x6E, 0xA7,
+    0x9F, 0x4A, 0xA9, 0xE6, 0xE4, 0xC8, 0xED, 0x48, 0x7F, 0xC1, 0x34, 0xCA, 0xB3,
+    0x4D, 0xAA, 0x74, 0xB6, 0xEE, 0x51, 0x66, 0x6D, 0x03, 0x49, 0x21, 0x1D, 0xCD,
+    0x8C, 0x23, 0x12, 0x05, 0x90, 0x62, 0xA9, 0x98, 0x5B, 0x57, 0x70, 0x13, 0x72,
+    0xEE, 0xE7, 0x6D, 0x9E, 0x44, 0xF2, 0xB6, 0x7D, 0x22, 0x27, 0xC6, 0xCF, 0x94,
+    0x8F, 0x65, 0x9F, 0x14, 0x30, 0xCC, 0x9A, 0x78, 0xBB, 0x73, 0x2C, 0xAB, 0x04,
+    0x18, 0x16, 0xD0, 0x55, 0x95, 0x15, 0x16, 0xC4, 0xFE, 0x42, 0x06, 0x55, 0xDC,
+    0xDE, 0xD1, 0x7C, 0xC3, 0xA1, 0x06, 0xFB, 0x17, 0x32, 0x5A, 0x50, 0xC9, 0xB9,
+    0x2D, 0xCA, 0x21, 0xBD, 0x1A, 0xAD, 0x8B, 0x83, 0x45, 0x12, 0x6C, 0x7B, 0xC2,
+    0x13, 0x00, 0xE8, 0x6F, 0xD7, 0x2B,
+  >>
+  let expected = <<
+    "gdcdmegkiphgjdofgkcknfpimhgeadpihojpfdocmjppkaahnbgbeafidmadegmflocnjljgbccccdimmnbncbejadgnggfboolghekkenldmkdembhpeionmioeogkjekjpkhgofklpdkckklndnfgbiaeklcmhdllhijkmmdabejpgfipjempmgchcchnlgpceejognohoohcbdhafhfljikjgcjaafdmchlgmbcefidilknbklncbmkcnljmjfafkdcbhplagkbmdhmnbnonmffagecpomebgbfjfffna":utf8,
+  >>
+  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  plain
+  |> should.equal(expected)
 }
