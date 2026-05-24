@@ -924,7 +924,13 @@ fn parse_and_apply_sequences(
     <<num_byte, _:bytes>> if num_byte < 128 ->
       parse_sequences(bytes, 1, num_byte, literals, prev_tables)
     <<num_byte, b1, _:bytes>> if num_byte < 255 -> {
-      let n = { num_byte - 128 } * 256 + b1 + 128
+      // RFC 8478 §3.1.1.3.2.1 / zstd_compression_format.md:
+      //   Number_of_Sequences = ((byte0 - 0x80) << 8) + byte1
+      // The 2-byte form FULLY OVERLAPS the 1-byte form (no extra
+      // 0x80 offset on top), so a prior `+ 128` was double-counting
+      // and produced ~2x the sequence count for any compressed
+      // block that emitted more than 127 sequences.
+      let n = { num_byte - 128 } * 256 + b1
       parse_sequences(bytes, 2, n, literals, prev_tables)
     }
     <<255, b1, b2, _:bytes>> -> {
