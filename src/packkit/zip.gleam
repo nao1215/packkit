@@ -346,6 +346,7 @@ pub fn decode_with_limits(
     [],
     eocd.total_entries,
     bytes,
+    0,
     limits,
   ))
 
@@ -788,6 +789,7 @@ fn parse_central_directory(
   acc: List(entry.Entry),
   remaining: Int,
   full: BitArray,
+  accumulated_body_bytes: Int,
   limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
   case remaining {
@@ -886,6 +888,24 @@ fn parse_central_directory(
         limits,
       ))
 
+      // Adversarial archives can pack many independently-bounded
+      // deflate streams whose catenated decompressed bodies exceed
+      // `max_output_bytes`.  The per-entry deflate decoder caps
+      // each body individually; the running total here folds every
+      // entry's body size into the same limit so a zip bomb built
+      // from many entries fails as soon as the cumulative output
+      // size crosses the threshold instead of after all entries
+      // have been materialised.
+      let next_total =
+        accumulated_body_bytes + bit_array.byte_size(entry.body(entry_value))
+      use <- bool.guard(
+        when: next_total > limit.max_output_bytes(limits),
+        return: Error(error.ArchiveLimitExceeded(
+          limit: "max_output_bytes",
+          actual: next_total,
+        )),
+      )
+
       let record_size = 46 + name_length + extra_length + comment_length
       let next_bits = case
         bit_array.slice(
@@ -903,6 +923,7 @@ fn parse_central_directory(
         [entry_value, ..acc],
         remaining - 1,
         full,
+        next_total,
         limits,
       )
     }

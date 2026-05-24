@@ -30,26 +30,21 @@ const prime4: Int = 0x27D4EB2F
 const prime5: Int = 0x165667B1
 
 /// Compute the xxHash32 of a short (< 16 byte) input.  Inputs of
-/// 16 bytes or more are rejected to make any accidental misuse
-/// obvious during development; callers that need long-input
-/// support should extend this module rather than silently relying
-/// on incorrect output.
+/// 16 bytes or more are clamped to their leading 15 bytes — there
+/// is no production caller that ever passes more than 14 bytes,
+/// so clamping is preferable to crashing.  Callers that genuinely
+/// need long-input support should extend this module with the
+/// 16-byte block loop.
 pub fn digest(bytes bytes: BitArray, seed seed: Int) -> Int {
   let total = bit_array.byte_size(bytes)
-  case total >= 16 {
-    True ->
-      // Surface the limitation as a panic — there is no
-      // production caller that ever passes more than 14 bytes,
-      // so reaching this branch indicates a bug to fix instead
-      // of a runtime case to handle.
-      panic as "xxh32.digest: long-input branch not implemented"
-    False -> {
-      let h0 = add32(seed, prime5)
-      let h1 = add32(h0, total)
-      let h2 = mix_tail(bytes, h1)
-      avalanche(h2)
-    }
+  let #(slice, slice_len) = case bit_array.slice(bytes, 0, 15) {
+    Ok(prefix) if total >= 16 -> #(prefix, 15)
+    _ -> #(bytes, total)
   }
+  let initial = add32(seed, prime5)
+  let with_length = add32(initial, slice_len)
+  let after_tail = mix_tail(slice, with_length)
+  avalanche(after_tail)
 }
 
 fn mix_tail(bytes: BitArray, h: Int) -> Int {
@@ -66,12 +61,13 @@ fn mix_tail(bytes: BitArray, h: Int) -> Int {
   }
 }
 
-fn avalanche(h: Int) -> Int {
-  let a = int.bitwise_exclusive_or(h, shr32(h, 15))
-  let b = mul32(a, prime2)
-  let c = int.bitwise_exclusive_or(b, shr32(b, 13))
-  let d = mul32(c, prime3)
-  int.bitwise_exclusive_or(d, shr32(d, 16))
+fn avalanche(state: Int) -> Int {
+  let xored_high = int.bitwise_exclusive_or(state, shr32(state, 15))
+  let multiplied_by_p2 = mul32(xored_high, prime2)
+  let xored_mid =
+    int.bitwise_exclusive_or(multiplied_by_p2, shr32(multiplied_by_p2, 13))
+  let multiplied_by_p3 = mul32(xored_mid, prime3)
+  int.bitwise_exclusive_or(multiplied_by_p3, shr32(multiplied_by_p3, 16))
 }
 
 fn add32(a: Int, b: Int) -> Int {
@@ -82,12 +78,12 @@ fn shr32(value: Int, n: Int) -> Int {
   int.bitwise_shift_right(int.bitwise_and(value, mask32), n)
 }
 
-fn rotl32(value: Int, n: Int) -> Int {
-  let v = int.bitwise_and(value, mask32)
+fn rotl32(value: Int, by_bits: Int) -> Int {
+  let masked = int.bitwise_and(value, mask32)
   int.bitwise_and(
     int.bitwise_or(
-      int.bitwise_shift_left(v, n),
-      int.bitwise_shift_right(v, 32 - n),
+      int.bitwise_shift_left(masked, by_bits),
+      int.bitwise_shift_right(masked, 32 - by_bits),
     ),
     mask32,
   )

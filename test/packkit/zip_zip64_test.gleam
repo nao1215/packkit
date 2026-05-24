@@ -4,11 +4,13 @@
 //// payload to exercise the sentinel paths.
 
 import gleam/bit_array
+@target(erlang)
 import gleam/list
 import gleeunit/should
 import packkit/archive
 import packkit/checksum
 import packkit/entry
+@target(erlang)
 import packkit/limit
 import packkit/zip
 
@@ -237,6 +239,7 @@ fn search_at(haystack: BitArray, needle: BitArray, pos: Int, end: Int) -> Bool {
   }
 }
 
+@target(erlang)
 fn int_to_string(n: Int) -> String {
   // Cheap base-10 conversion without pulling another import.
   case n {
@@ -245,6 +248,7 @@ fn int_to_string(n: Int) -> String {
   }
 }
 
+@target(erlang)
 fn int_to_string_loop(n: Int, acc: String) -> String {
   case n {
     0 -> acc
