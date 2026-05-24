@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added `recipe.cpio_bzip2`, `recipe.cpio_xz`, and
+  `recipe.cpio_zstd`, plus matching filename detection for
+  `.cpio.bz2`, `.cpio.xz`, and `.cpio.zst`.  The cpio container
+  was previously only paired with gzip in the recipe and
+  detection layers, even though all three other codec recipes
+  are common enough in Linux package ecosystems (RPM `.cpio.gz`
+  vs `.cpio.xz`).
 - Extended `detect.from_bytes` with two more signatures.  Zstd
   skippable frames (magic range `0x184D2A50`..`0x184D2A5F`,
   used by wrappers that embed metadata between real zstd frames)

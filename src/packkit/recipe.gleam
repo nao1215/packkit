@@ -83,6 +83,21 @@ pub fn cpio_gzip() -> Recipe {
   archive_with(format: archive.cpio_newc(), wrapped_by: codec.gzip())
 }
 
+/// `cpio.bz2` recipe — cpio body, bzip2-compressed envelope.
+pub fn cpio_bzip2() -> Recipe {
+  archive_with(format: archive.cpio_newc(), wrapped_by: codec.bzip2())
+}
+
+/// `cpio.xz` recipe — cpio body, xz-compressed envelope.
+pub fn cpio_xz() -> Recipe {
+  archive_with(format: archive.cpio_newc(), wrapped_by: codec.xz())
+}
+
+/// `cpio.zst` recipe — cpio body, zstd-compressed envelope.
+pub fn cpio_zstd() -> Recipe {
+  archive_with(format: archive.cpio_newc(), wrapped_by: codec.zstd())
+}
+
 /// Read the archive format the recipe was constructed with.
 pub fn archive_format(recipe: Recipe) -> archive.ArchiveFormat {
   recipe.format

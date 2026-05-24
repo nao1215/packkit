@@ -60,6 +60,15 @@ fn filename_rules() -> List(#(List(String), fn() -> Detected)) {
     #([".cpio.gz"], fn() {
       detected_recipe(recipe.cpio_gzip(), extension: "cpio.gz")
     }),
+    #([".cpio.bz2"], fn() {
+      detected_recipe(recipe.cpio_bzip2(), extension: "cpio.bz2")
+    }),
+    #([".cpio.xz"], fn() {
+      detected_recipe(recipe.cpio_xz(), extension: "cpio.xz")
+    }),
+    #([".cpio.zst"], fn() {
+      detected_recipe(recipe.cpio_zstd(), extension: "cpio.zst")
+    }),
     // Archive families.
     #([".tar"], fn() { detected_archive(archive.tar(), extension: "tar") }),
     #([".zip"], fn() { detected_archive(archive.zip(), extension: "zip") }),
