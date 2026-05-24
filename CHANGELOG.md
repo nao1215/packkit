@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added `packkit/internal/huf`, a foundational Huffman literal
+  decoder for Zstandard's `Compressed_Literals_Block` (RFC 8478
+  §4.2.1).  Covers the direct-weight tree description
+  (`header_byte >= 128`) and the single-bitstream form: parses
+  the packed 4-bit weights, derives the implied last weight from
+  the balance equation, builds a canonical Huffman lookup table,
+  and decodes the backward MSB-first bitstream.  The
+  FSE-compressed weight form and the 4-stream jump-table form
+  are next steps; the table builder and bitstream walker stay
+  intact for both.
 - Extended the xz decoder to support multi-filter chains whose
   final filter is LZMA2 and whose earlier filters are
   recognisable pre-processors.  The delta filter (id 0x03), the
