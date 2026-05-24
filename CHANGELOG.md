@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added the IA-64 / Itanium (filter id 0x06) and RISC-V (filter
+  id 0x0B) BCJ pre-processor filters to the xz multi-filter
+  chain.  IA-64 walks 16-byte bundles, indexes a branch table by
+  the 5-bit template selector, and rewrites the 21-bit
+  IP-relative immediate in any of the three 41-bit slots that
+  the template marks as branch-bearing.  RISC-V handles
+  `JAL x1/x5` (opcode 0xEF) and the `AUIPC + inst2` pair forms
+  the encoder produces — including the bijective "fake"
+  conversion path for `AUIPC rd == x0 / x2` that keeps the
+  filter safe to apply on arbitrary data.  Both decoders are
+  verified byte-for-byte against `xz --ia64` / `xz --riscv`
+  reference output, completing the BCJ filter set xz supports.
 - Added the SPARC (filter id 0x09) and ARM64 / AArch64 (filter
   id 0x0A) BCJ pre-processor filters to the xz multi-filter
   chain.  SPARC decodes the 22-bit `CALL` displacement with

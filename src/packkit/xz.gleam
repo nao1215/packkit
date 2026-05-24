@@ -591,10 +591,12 @@ fn validate_pre_filters(
     [#(0x03, _), ..rest] -> validate_pre_filters(rest)
     [#(0x04, _), ..rest] -> validate_pre_filters(rest)
     [#(0x05, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x06, _), ..rest] -> validate_pre_filters(rest)
     [#(0x07, _), ..rest] -> validate_pre_filters(rest)
     [#(0x08, _), ..rest] -> validate_pre_filters(rest)
     [#(0x09, _), ..rest] -> validate_pre_filters(rest)
     [#(0x0A, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x0B, _), ..rest] -> validate_pre_filters(rest)
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(
         feature: "xz pre-processor filter id " <> int.to_string(id),
@@ -649,6 +651,15 @@ fn apply_pre_filters_loop(
     [#(0x0A, _), ..rest] -> {
       // ARM64 (AArch64) BCJ filter — handles BL + ADRP rewrites.
       apply_pre_filters_loop(bcj.arm64_decode(bytes, 0), rest)
+    }
+    [#(0x06, _), ..rest] -> {
+      // IA-64 (Itanium) BCJ filter — three 41-bit slots per
+      // 16-byte bundle, branch slots selected by the template.
+      apply_pre_filters_loop(bcj.ia64_decode(bytes, 0), rest)
+    }
+    [#(0x0B, _), ..rest] -> {
+      // RISC-V BCJ filter — JAL + AUIPC pair rewrites.
+      apply_pre_filters_loop(bcj.riscv_decode(bytes, 0), rest)
     }
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(

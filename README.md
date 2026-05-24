@@ -64,7 +64,10 @@ Implemented codecs and archive families:
 - **xz**: stream header / block header / index / footer + LZMA2 with
   both uncompressed and LZMA-compressed chunks (via the pure-Gleam
   LZMA range coder in `packkit/internal/lzma`); multi-stream files
-  with 4-byte-aligned stream padding decode end-to-end
+  with 4-byte-aligned stream padding decode end-to-end.  Multi-filter
+  chains terminating in LZMA2 are honoured with delta + the full
+  BCJ pre-processor family (x86, PowerPC, IA-64, ARM, ARM-Thumb,
+  SPARC, ARM64, RISC-V) inverted in reverse chain order
 - **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
   with Raw / RLE literals, **Huffman-compressed literals** (both
   direct-weight and FSE-weight tree descriptions; both 1-stream
