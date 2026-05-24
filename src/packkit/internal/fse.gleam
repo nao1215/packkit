@@ -23,11 +23,13 @@ pub fn predefined_literal_length() -> List(Int) {
 }
 
 /// Predefined Match_Length distribution at accuracy_log 6.
+/// Matches `ML_defaultNorm` in the zstd reference (lib/common/zstd_internal.h):
+/// the seven highest codes (46..52) are less-probable placeholders, not five.
 pub fn predefined_match_length() -> List(Int) {
   [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1,
-    -1, -1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
+    -1, -1, -1,
   ]
 }
 

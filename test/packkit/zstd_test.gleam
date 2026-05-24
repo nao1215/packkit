@@ -157,16 +157,16 @@ pub fn decode_compressed_block_alternating_test() -> Nil {
   |> should.equal(<<"ababababababababababab":utf8>>)
 }
 
-pub fn decode_compressed_block_pangram_pending_test() -> Nil {
-  // Two copies of "The quick brown fox jumps over the lazy dog. "
-  // (90 bytes) compressed by `zstd -c`.  The decoder agrees with
-  // libzstd / a Python reference on the predefined FSE tables and
-  // on the initial state values (LL=37, OF=10, ML=38), yet the
-  // resulting (ll_code=23, ml_code=38, of_code=5) implies more
-  // sequence-extra bits than the bitstream carries.  zstd must
-  // therefore use a different state-transition tail for this
-  // particular stream — captured as a follow-up once we wire FSE
-  // state updates between successive sequences.
+pub fn decode_compressed_block_pangram_test() -> Nil {
+  // "The quick brown fox jumps over the lazy dog. " followed by a
+  // second copy without the trailing space (89 bytes total) as
+  // emitted by `zstd -c`.  Previously this surfaced as a typed
+  // CodecInvalidData because the predefined ML distribution was
+  // wrong by two cells (-1 placeholders for codes 46 and 47 were
+  // missing) which shifted every state→code mapping past code 36
+  // by one.  With the ML_defaultNorm fix pulled into
+  // [internal/fse.gleam](src/packkit/internal/fse.gleam),
+  // the decoder reproduces the original pangram byte-for-byte.
   let fixture = <<
     0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x58, 0xAD, 0x01, 0x00, 0xD4, 0x02, 0x54, 0x68,
     0x65, 0x20, 0x71, 0x75, 0x69, 0x63, 0x6B, 0x20, 0x62, 0x72, 0x6F, 0x77, 0x6E,
@@ -175,19 +175,11 @@ pub fn decode_compressed_block_pangram_pending_test() -> Nil {
     0x6F, 0x67, 0x2E, 0x20, 0x01, 0x00, 0x0D, 0x9A, 0xAA, 0x0C, 0x9D, 0xB4, 0xCD,
     0x6C,
   >>
-  case zstd.decode(bytes: fixture) {
-    Error(error.CodecInvalidData(_)) -> Nil
-    Error(other) ->
-      should.equal(
-        Error(other),
-        Error(error.CodecInvalidData(message: "<pangram follow-up>")),
-      )
-    Ok(_) ->
-      should.equal(
-        Ok(Nil),
-        Error(error.CodecInvalidData(message: "<pangram follow-up>")),
-      )
-  }
+  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  plain
+  |> should.equal(<<
+    "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.":utf8,
+  >>)
 }
 
 pub fn decode_rejects_missing_magic_test() -> Nil {

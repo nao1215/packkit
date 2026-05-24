@@ -40,13 +40,16 @@ pub fn offset_table_size_test() -> Nil {
 }
 
 pub fn predefined_ml_state_38_symbol_test() -> Nil {
-  // Reference zstd places symbol 38 at cell 38 of the predefined
-  // match-length state table.  If this stops matching, every
+  // Reference zstd's ML_defaultDTable places match-length code 36 at
+  // state 38 (with baseVal 43, the base for ML_code 36 per RFC 8478).
+  // Verified against the static table in
+  // doc/reference/zstd/lib/decompress/zstd_decompress_block.c
+  // (ZSTD_seqSymbol ML_defaultDTable).  If this stops matching, every
   // sequences decode will diverge.
   let table = fse.predefined_match_length_table()
   let assert Ok(entry) = dict.get(table, 38)
   entry.symbol
-  |> should.equal(38)
+  |> should.equal(36)
 }
 
 pub fn predefined_ll_state_37_symbol_test() -> Nil {

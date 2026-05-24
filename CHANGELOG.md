@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Fixed the zstd predefined Match_Length distribution that
+  `internal/fse.gleam` was using.  The reference
+  `ML_defaultNorm` (lib/common/zstd_internal.h) marks **seven**
+  symbols (codes 46..52) as less-probable placeholders; the
+  packkit table had only the last five.  That two-cell shortfall
+  pushed every state→code mapping past code 36 by one, so any
+  sequence whose decoded ml_code lived in the affected range
+  surfaced as a typed `truncated zstd match-length extra` even
+  though the bitstream itself was well-formed.  With the fix the
+  previously-pending pangram fixture round-trips byte-for-byte
+  and a `decode_compressed_block_pangram_test` replaces the old
+  "expects an error" marker test.
 - Completed zstd `Treeless_Literals_Block` decoding.  The block
   loop now threads an `Option(huf.Tree)` forward; compressed
   literals blocks publish their parsed tree, and treeless
