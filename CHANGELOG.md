@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: zstd Raw / RLE literals block now accepts
+  `size_format = 3` (3-byte header, 20-bit regenerated_size, used
+  by `zstd` for raw-literal blocks larger than 4 KiB).  The
+  decoder previously rejected this with a typed
+  `CodecNotImplemented`, which broke any file that happened to
+  emit a large raw-literals block (mixed binary + text payloads
+  at `zstd -1..-19` hit this in ~17 % of fuzz iterations).
 - **Fix (correctness)**: zstd `resolve_offset` raw_offset=2,
   LL=0 case (offset_value 2 with zero literals_length, i.e.
   reference repCode 2) wrote a corrupted repeated-offset

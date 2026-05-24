@@ -882,15 +882,14 @@ fn parse_raw_or_rle_literals(
 ) -> Result(#(BitArray, BitArray), error.CodecError) {
   case size_format {
     0 | 2 -> {
-      // 1-byte header — size is bits 3..7 of the header byte.
+      // 1-byte header — size is bits 3..7 of the header byte (5 bits).
       let regenerated_size = int.bitwise_shift_right(header_byte, 3)
       let assert Ok(after_header) =
         bit_array.slice(bytes, 1, bit_array.byte_size(bytes) - 1)
       finalize_literals(after_header, regenerated_size, is_rle)
     }
     1 -> {
-      // 2-byte header — size spans bits 4..7 of byte 0 (low) and all
-      // bits of byte 1 (high), little-endian wrt the spec.
+      // 2-byte header — bits 4..7 of byte 0 + all of byte 1 (12 bits).
       case bytes {
         <<_h, b1, _:bytes>> -> {
           let regenerated_size =
@@ -908,10 +907,29 @@ fn parse_raw_or_rle_literals(
           ))
       }
     }
-    _ ->
-      Error(error.CodecNotImplemented(
-        feature: "zstd literals 3-byte header (size_format 3 for compressed)",
-      ))
+    _ -> {
+      // size_format = 3: 3-byte header, 20-bit regen_size:
+      //   bits 4..7 of byte 0 + all of byte 1 + all of byte 2.
+      case bytes {
+        <<_h, b1, b2, _:bytes>> -> {
+          let regenerated_size =
+            int.bitwise_or(
+              int.bitwise_shift_right(header_byte, 4),
+              int.bitwise_or(
+                int.bitwise_shift_left(b1, 4),
+                int.bitwise_shift_left(b2, 12),
+              ),
+            )
+          let assert Ok(after_header) =
+            bit_array.slice(bytes, 3, bit_array.byte_size(bytes) - 3)
+          finalize_literals(after_header, regenerated_size, is_rle)
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd literals 3-byte header",
+          ))
+      }
+    }
   }
 }
 
