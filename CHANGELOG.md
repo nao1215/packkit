@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Extended the 7z decoder with per-file substream awareness.  The
+  parser previously skipped `SubStreamsInfo` entirely, so any 7z
+  archive containing more than one file inside a single folder
+  decoded as a single concatenated body assigned to the first
+  filename.  The new parser captures the per-substream sizes from
+  `kSize` (NID 0x09), derives the final size from the folder's
+  total, and threads the list through `build_entries_loop` so
+  every file gets exactly its own byte slice.  Single-file
+  archives without a `SubStreamsInfo` block keep their previous
+  "all remaining bytes" fallback so the existing fixtures are
+  unaffected.
 - Extended the ZIP decoder to dispatch on three more
   compression methods: 12 (bzip2), 93 (zstd), and 95 (xz).  Each
   method routes through the corresponding packkit codec's

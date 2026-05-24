@@ -3,10 +3,14 @@
 //// The reader handles the common case produced by `7z a` on a small
 //// payload: a single packed stream wrapped in a single folder that
 //// uses one coder, either raw LZMA (`0x03 0x01 0x01`) or LZMA2
-//// (`0x21`).  Multi-coder folders, BCJ filters, encryption, and the
-//// encoded-header form (`NID 0x17`) are intentionally rejected with
-//// typed `ArchiveNotImplemented` errors so the reader is easy to
-//// extend incrementally.
+//// (`0x21`).  Multiple files packed into that folder are supported
+//// when the archive carries a `SubStreamsInfo` block — the parser
+//// reads the per-substream sizes from `kSize` (0x09), derives the
+//// final size from the folder's total, and splits the decoded
+//// stream accordingly.  Multi-coder folders, BCJ filters, multiple
+//// folders, encryption, and most encoded-header variants are
+//// intentionally rejected with typed `ArchiveNotImplemented`
+//// errors so the reader is easy to extend incrementally.
 
 import gleam/bit_array
 import gleam/bool
@@ -162,7 +166,7 @@ fn decode_encoded_header(
       Error(error.ArchiveInvalid(
         message: "7z encoded next header has no StreamsInfo",
       ))
-    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes) -> {
+    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, _) -> {
       let pack_offset = signature_size + pack_pos
       let pack_size = sum_list(pack_sizes, 0)
       use packed <- result.try(slice_required(
@@ -219,6 +223,7 @@ type ParsedHeader {
     pack_sizes: List(Int),
     folder: ParsedFolder,
     unpack_sizes: List(Int),
+    substream_sizes: List(Int),
     file_names: List(String),
     empty_streams: List(Bool),
   )
@@ -261,6 +266,7 @@ type HeaderStreams {
     pack_sizes: List(Int),
     folder: ParsedFolder,
     unpack_sizes: List(Int),
+    substream_sizes: List(Int),
   )
 }
 
@@ -302,7 +308,7 @@ fn finalize_parsed_header(
   parser: HeaderParser,
 ) -> Result(ParsedHeader, error.ArchiveError) {
   case parser.streams, parser.files {
-    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes),
+    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
       HeaderFilesParsed(names, empty_streams)
     ->
       Ok(ParsedHeader(
@@ -310,10 +316,11 @@ fn finalize_parsed_header(
         pack_sizes: pack_sizes,
         folder: folder,
         unpack_sizes: unpack_sizes,
+        substream_sizes: sub,
         file_names: names,
         empty_streams: empty_streams,
       ))
-    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes),
+    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
       HeaderFilesNone
     ->
       Ok(
@@ -322,6 +329,7 @@ fn finalize_parsed_header(
           pack_sizes: pack_sizes,
           folder: folder,
           unpack_sizes: unpack_sizes,
+          substream_sizes: sub,
           file_names: [],
           empty_streams: [],
         ),
@@ -342,6 +350,7 @@ fn parse_main_streams_info(
       pack_sizes: [],
       folder: None,
       unpack_sizes: [],
+      substream_sizes: [],
       have_pack: False,
       have_unpack: False,
     )
@@ -354,6 +363,7 @@ type StreamsParser {
     pack_sizes: List(Int),
     folder: OptionalFolder,
     unpack_sizes: List(Int),
+    substream_sizes: List(Int),
     have_pack: Bool,
     have_unpack: Bool,
   )
@@ -380,6 +390,7 @@ fn parse_streams_loop(
                   pack_sizes: state.pack_sizes,
                   folder: folder,
                   unpack_sizes: state.unpack_sizes,
+                  substream_sizes: state.substream_sizes,
                 ),
                 rest,
               ))
@@ -415,8 +426,13 @@ fn parse_streams_loop(
           )
         }
         n if n == nid_sub_streams_info -> {
-          use rest <- result.try(skip_sub_streams_info(rest, 1))
-          parse_streams_loop(rest, state)
+          use #(_per_folder, substream_sizes, rest) <- result.try(
+            parse_sub_streams_info(rest, 1, state.unpack_sizes),
+          )
+          parse_streams_loop(
+            rest,
+            StreamsParser(..state, substream_sizes: substream_sizes),
+          )
         }
         _ ->
           Error(error.ArchiveInvalid(
@@ -886,47 +902,97 @@ fn drop_bytes(
 // SubStreamsInfo parser — each NID has a specific data layout, so the
 // generic "read NID, read varint, skip" trick used by other generic
 // skippers does NOT apply here.
-fn skip_sub_streams_info(
+//
+// For a single-folder archive (the only shape we currently decode):
+//   - `num_substreams_per_folder` is a single-element list giving the
+//     file count packed into that folder.
+//   - `substream_sizes` lists the per-file unpack sizes.  The 7z spec
+//     transmits only the first N-1 explicitly; the last is derived
+//     from the folder's total unpack size minus the explicit sum.
+//   - When NID 0x0D (kNumUnPackStream) is absent, every folder
+//     carries exactly one substream and `substream_sizes` is empty
+//     (callers fall back to the folder-level unpack size).
+fn parse_sub_streams_info(
   bytes: BitArray,
   num_folders: Int,
-) -> Result(BitArray, error.ArchiveError) {
-  sub_streams_loop(bytes, num_folders, 0)
+  folder_unpack_sizes: List(Int),
+) -> Result(#(List(Int), List(Int), BitArray), error.ArchiveError) {
+  let initial = SubStreamsAcc(per_folder: [], explicit_sizes: [])
+  use #(acc, rest) <- result.try(sub_streams_loop_collect(
+    bytes,
+    num_folders,
+    initial,
+  ))
+  let per_folder = case acc.per_folder {
+    [] -> repeat_one_per_folder(num_folders, [])
+    values -> values
+  }
+  let total_substreams = sum_list(per_folder, 0)
+  let sizes =
+    derive_substream_sizes(
+      per_folder,
+      folder_unpack_sizes,
+      acc.explicit_sizes,
+      [],
+    )
+  case list.length(sizes) == total_substreams {
+    True -> Ok(#(per_folder, sizes, rest))
+    False ->
+      Error(error.ArchiveInvalid(
+        message: "7z SubStreamsInfo: derived substream count mismatch",
+      ))
+  }
 }
 
-fn sub_streams_loop(
+type SubStreamsAcc {
+  SubStreamsAcc(per_folder: List(Int), explicit_sizes: List(Int))
+}
+
+fn sub_streams_loop_collect(
   bytes: BitArray,
   num_folders: Int,
-  num_substreams_total: Int,
-) -> Result(BitArray, error.ArchiveError) {
+  acc: SubStreamsAcc,
+) -> Result(#(SubStreamsAcc, BitArray), error.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
-        n if n == nid_end -> Ok(rest)
+        n if n == nid_end -> Ok(#(acc, rest))
         0x0D -> {
-          // kNumUnPackStream: one varint per folder
+          // kNumUnPackStream: one varint per folder.
           use #(counts, rest) <- result.try(read_numbers(rest, num_folders))
-          let total = sum_list(counts, 0)
-          sub_streams_loop(rest, num_folders, total)
+          sub_streams_loop_collect(
+            rest,
+            num_folders,
+            SubStreamsAcc(..acc, per_folder: counts),
+          )
         }
         n if n == nid_size -> {
-          let count = case num_substreams_total {
-            0 -> 0
-            _ -> num_substreams_total - num_folders
+          // kSize: for each folder, (substream_count - 1) varints.
+          // When kNumUnPackStream was absent every folder has exactly
+          // one substream and kSize carries no values.
+          let per_folder = case acc.per_folder {
+            [] -> repeat_one_per_folder(num_folders, [])
+            values -> values
           }
-          let safe_count = case count > 0 {
-            True -> count
+          let explicit_count = sum_list(per_folder, 0) - list.length(per_folder)
+          let safe_count = case explicit_count > 0 {
+            True -> explicit_count
             False -> 0
           }
-          use #(_, rest) <- result.try(read_numbers(rest, safe_count))
-          sub_streams_loop(rest, num_folders, num_substreams_total)
+          use #(sizes, rest) <- result.try(read_numbers(rest, safe_count))
+          sub_streams_loop_collect(
+            rest,
+            num_folders,
+            SubStreamsAcc(..acc, explicit_sizes: sizes),
+          )
         }
         n if n == nid_crc -> {
-          let count = case num_substreams_total {
-            0 -> num_folders
-            _ -> num_substreams_total
+          let total = case acc.per_folder {
+            [] -> num_folders
+            values -> sum_list(values, 0)
           }
-          use rest <- result.try(skip_crc_block(rest, count))
-          sub_streams_loop(rest, num_folders, num_substreams_total)
+          use rest <- result.try(skip_crc_block(rest, total))
+          sub_streams_loop_collect(rest, num_folders, acc)
         }
         _ ->
           Error(error.ArchiveInvalid(
@@ -934,6 +1000,54 @@ fn sub_streams_loop(
           ))
       }
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z SubStreamsInfo"))
+  }
+}
+
+fn repeat_one_per_folder(n: Int, acc: List(Int)) -> List(Int) {
+  case n {
+    0 -> acc
+    _ -> repeat_one_per_folder(n - 1, [1, ..acc])
+  }
+}
+
+fn derive_substream_sizes(
+  per_folder: List(Int),
+  folder_unpack_sizes: List(Int),
+  remaining_explicit: List(Int),
+  acc: List(Int),
+) -> List(Int) {
+  case per_folder, folder_unpack_sizes {
+    [], _ | _, [] -> list.reverse(acc)
+    [count, ..rest_counts], [folder_total, ..rest_folder_totals] -> {
+      // The first (count - 1) substream sizes are explicit; the last
+      // is derived so the folder's total matches.
+      let explicit_for_folder = case count {
+        0 -> 0
+        _ -> count - 1
+      }
+      let #(explicit, remaining) =
+        list_take(remaining_explicit, explicit_for_folder, [])
+      let explicit_sum = sum_list(explicit, 0)
+      let derived = folder_total - explicit_sum
+      let folder_sizes = case count {
+        0 -> []
+        _ -> list.append(explicit, [derived])
+      }
+      derive_substream_sizes(
+        rest_counts,
+        rest_folder_totals,
+        remaining,
+        list.append(list.reverse(folder_sizes), acc),
+      )
+    }
+  }
+}
+
+fn list_take(values: List(a), n: Int, acc: List(a)) -> #(List(a), List(a)) {
+  case values, n {
+    _, 0 -> #(list.reverse(acc), values)
+    [], _ -> #(list.reverse(acc), [])
+    [head, ..rest], _ -> list_take(rest, n - 1, [head, ..acc])
   }
 }
 
@@ -1194,6 +1308,7 @@ fn build_archive_entries(
     plain,
     parsed.file_names,
     parsed.empty_streams,
+    parsed.substream_sizes,
     0,
     [],
     limits,
@@ -1207,6 +1322,7 @@ fn build_entries_loop(
   plain: BitArray,
   names: List(String),
   empties: List(Bool),
+  sizes: List(Int),
   consumed: Int,
   acc: List(entry.Entry),
   limits: limit.Limits,
@@ -1222,43 +1338,68 @@ fn build_entries_loop(
               plain,
               rest_names,
               rest_empties,
+              sizes,
               consumed,
               new_acc,
               limits,
             )
           })
-        False -> {
-          let remaining = bit_array.byte_size(plain) - consumed
-          let assert Ok(body) = bit_array.slice(plain, consumed, remaining)
-          add_file(name, body, acc, limits)
-          |> result.try(fn(new_acc) {
-            build_entries_loop(
-              plain,
-              rest_names,
-              rest_empties,
-              consumed + remaining,
-              new_acc,
-              limits,
-            )
-          })
-        }
+        False ->
+          consume_one_file_body(
+            plain,
+            name,
+            rest_names,
+            rest_empties,
+            sizes,
+            consumed,
+            acc,
+            limits,
+          )
       }
-    [name, ..rest_names], [] -> {
-      let remaining = bit_array.byte_size(plain) - consumed
-      let assert Ok(body) = bit_array.slice(plain, consumed, remaining)
-      add_file(name, body, acc, limits)
-      |> result.try(fn(new_acc) {
-        build_entries_loop(
-          plain,
-          rest_names,
-          [],
-          consumed + remaining,
-          new_acc,
-          limits,
-        )
-      })
-    }
+    [name, ..rest_names], [] ->
+      consume_one_file_body(
+        plain,
+        name,
+        rest_names,
+        [],
+        sizes,
+        consumed,
+        acc,
+        limits,
+      )
   }
+}
+
+fn consume_one_file_body(
+  plain: BitArray,
+  name: String,
+  rest_names: List(String),
+  rest_empties: List(Bool),
+  sizes: List(Int),
+  consumed: Int,
+  acc: List(entry.Entry),
+  limits: limit.Limits,
+) -> Result(List(entry.Entry), error.ArchiveError) {
+  // Pull the next file size from the SubStreamsInfo when one was
+  // declared; otherwise fall back to "all the remaining bytes" so
+  // single-file archives that omit SubStreamsInfo keep working.
+  let #(this_size, next_sizes) = case sizes {
+    [s, ..rest] -> #(s, rest)
+    [] -> #(bit_array.byte_size(plain) - consumed, [])
+  }
+  let assert Ok(body) = bit_array.slice(plain, consumed, this_size)
+  add_file(name, body, acc, limits)
+  |> result.try(fn(new_acc) {
+    build_entries_loop(
+      plain,
+      rest_names,
+      rest_empties,
+      next_sizes,
+      consumed + this_size,
+      new_acc,
+      limits,
+    )
+  })
 }
 
 fn add_file(
