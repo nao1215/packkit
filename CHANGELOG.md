@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Implemented zstd sequence-symbol `Repeat_Mode` (mode 3) for all
+  three alphabets (LL / OF / ML).  The block loop now carries a
+  per-frame `SeqTablesState` alongside the existing Huffman tree
+  thread, so a block can ask to reuse the previous block's FSE
+  table without re-emitting the distribution.  A Repeat_Mode in
+  the first block of a frame still surfaces as a typed
+  `CodecInvalidData` with the alphabet's label.
+- Encoder now picks `RLE_Block` (block_type 1) when a chunk
+  repeats a single byte, falling back to `Raw_Block` otherwise.
+  Uniform-byte inputs collapse to a 1-byte RLE payload and the
+  output stays a valid Zstandard frame any conforming decoder
+  accepts.
+- Added a padded backward bit reader (`read_backward_bits_padded`
+  in `internal/fse.gleam`) that mirrors the zstd reference HUF
+  decoder's tolerance for the last symbol's code spanning the
+  bitstream boundary.  Huffman decode uses it for both the
+  lookup peek and the actual bit consume; strict-stream
+  behaviour is unchanged.
 - Fixed the zstd predefined Match_Length distribution that
   `internal/fse.gleam` was using.  The reference
   `ML_defaultNorm` (lib/common/zstd_internal.h) marks **seven**

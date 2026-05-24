@@ -15,8 +15,10 @@
 //// Huffman tree via the cross-block tree state threaded through
 //// the block loop).  A treeless block in the first position of a
 //// frame surfaces as a typed `CodecInvalidData`.  `Repeat_Mode`
-//// for sequence-symbol descriptions remains future work because
-//// it spans multiple blocks.
+//// for sequence-symbol descriptions also threads its FSE tables
+//// across blocks (per RFC 8478 §3.1.1.4 the LL / OF / ML tables
+//// survive across blocks within a frame), and a Repeat_Mode in the
+//// first block of a frame surfaces as a typed `CodecInvalidData`.
 
 import gleam/bit_array
 import gleam/bool
@@ -229,7 +231,12 @@ fn decode_frames_loop(
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   use #(checksum_flag, rest) <- result.try(parse_frame_header(bytes))
-  use #(output, rest) <- result.try(decode_blocks(rest, <<>>, limits, None))
+  use #(output, rest) <- result.try(decode_blocks(
+    rest,
+    <<>>,
+    limits,
+    initial_block_state,
+  ))
   use rest <- result.try(consume_checksum_returning_rest(rest, checksum_flag))
   let next_size = accumulated_size + bit_array.byte_size(output)
   case next_size > limit.max_output_bytes(limits) {
@@ -352,11 +359,32 @@ fn skip_frame_content_size(
 
 // -- block driver -------------------------------------------------------
 
+/// Snapshot of all per-frame block-to-block state that the zstd
+/// decoder must thread between successive compressed blocks: the
+/// most recently parsed Huffman literal tree (for treeless literals)
+/// and the LL / OF / ML FSE tables (for Repeat_Mode).
+type BlockState {
+  BlockState(huffman: Option(huf.Tree), sequences: SeqTablesState)
+}
+
+type SeqTablesState {
+  SeqTablesState(
+    ll: Option(#(dict.Dict(Int, fse.StateEntry), Int)),
+    of: Option(#(dict.Dict(Int, fse.StateEntry), Int)),
+    ml: Option(#(dict.Dict(Int, fse.StateEntry), Int)),
+  )
+}
+
+const initial_block_state: BlockState = BlockState(
+  huffman: None,
+  sequences: SeqTablesState(ll: None, of: None, ml: None),
+)
+
 fn decode_blocks(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
-  prev_tree: Option(huf.Tree),
+  state: BlockState,
 ) -> Result(#(BitArray, BitArray), error.CodecError) {
   case bytes {
     <<b0, b1, b2, rest:bytes>> -> {
@@ -371,16 +399,16 @@ fn decode_blocks(
       let last = int.bitwise_and(header, 0x1) == 1
       let block_type = int.bitwise_and(int.bitwise_shift_right(header, 1), 0x3)
       let block_size = int.bitwise_shift_right(header, 3)
-      use #(plain, rest, next_tree) <- result.try(decode_one_block(
+      use #(plain, rest, next_state) <- result.try(decode_one_block(
         rest,
         block_type,
         block_size,
-        prev_tree,
+        state,
       ))
       use new_output <- result.try(append_with_limit(output, plain, limits))
       case last {
         True -> Ok(#(new_output, rest))
-        False -> decode_blocks(rest, new_output, limits, next_tree)
+        False -> decode_blocks(rest, new_output, limits, next_state)
       }
     }
     _ -> Error(error.CodecInvalidData(message: "truncated zstd block header"))
@@ -391,16 +419,16 @@ fn decode_one_block(
   bytes: BitArray,
   block_type: Int,
   block_size: Int,
-  prev_tree: Option(huf.Tree),
-) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+  state: BlockState,
+) -> Result(#(BitArray, BitArray, BlockState), error.CodecError) {
   case block_type {
     0 ->
       decode_raw_block(bytes, block_size)
-      |> result.map(fn(pair) { #(pair.0, pair.1, prev_tree) })
+      |> result.map(fn(pair) { #(pair.0, pair.1, state) })
     1 ->
       decode_rle_block(bytes, block_size)
-      |> result.map(fn(pair) { #(pair.0, pair.1, prev_tree) })
-    2 -> decode_compressed_block(bytes, block_size, prev_tree)
+      |> result.map(fn(pair) { #(pair.0, pair.1, state) })
+    2 -> decode_compressed_block(bytes, block_size, state)
     _ -> Error(error.CodecInvalidData(message: "zstd reserved block type 3"))
   }
 }
@@ -410,8 +438,8 @@ fn decode_one_block(
 fn decode_compressed_block(
   bytes: BitArray,
   block_size: Int,
-  prev_tree: Option(huf.Tree),
-) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+  state: BlockState,
+) -> Result(#(BitArray, BitArray, BlockState), error.CodecError) {
   use payload <- result.try(slice_or_error(
     bytes,
     0,
@@ -421,11 +449,19 @@ fn decode_compressed_block(
   let assert Ok(rest) =
     bit_array.slice(bytes, block_size, bit_array.byte_size(bytes) - block_size)
 
-  use #(literals, after_literals, next_tree) <- result.try(
-    parse_literals_section(payload, prev_tree),
+  use #(literals, after_literals, next_huffman) <- result.try(
+    parse_literals_section(payload, state.huffman),
   )
-  use plain <- result.try(parse_and_apply_sequences(after_literals, literals))
-  Ok(#(plain, rest, next_tree))
+  use #(plain, next_sequences) <- result.try(parse_and_apply_sequences(
+    after_literals,
+    literals,
+    state.sequences,
+  ))
+  Ok(#(
+    plain,
+    rest,
+    BlockState(huffman: next_huffman, sequences: next_sequences),
+  ))
 }
 
 // -- literals section --------------------------------------------------
@@ -822,19 +858,20 @@ fn zstd_repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
 fn parse_and_apply_sequences(
   bytes: BitArray,
   literals: BitArray,
-) -> Result(BitArray, error.CodecError) {
+  prev_tables: SeqTablesState,
+) -> Result(#(BitArray, SeqTablesState), error.CodecError) {
   case bytes {
-    <<>> -> Ok(literals)
-    <<num_byte, _:bytes>> if num_byte == 0 -> Ok(literals)
+    <<>> -> Ok(#(literals, prev_tables))
+    <<num_byte, _:bytes>> if num_byte == 0 -> Ok(#(literals, prev_tables))
     <<num_byte, _:bytes>> if num_byte < 128 ->
-      parse_sequences(bytes, 1, num_byte, literals)
+      parse_sequences(bytes, 1, num_byte, literals, prev_tables)
     <<num_byte, b1, _:bytes>> if num_byte < 255 -> {
       let n = { num_byte - 128 } * 256 + b1 + 128
-      parse_sequences(bytes, 2, n, literals)
+      parse_sequences(bytes, 2, n, literals, prev_tables)
     }
     <<255, b1, b2, _:bytes>> -> {
       let n = b1 + b2 * 256 + 0x7F00
-      parse_sequences(bytes, 3, n, literals)
+      parse_sequences(bytes, 3, n, literals, prev_tables)
     }
     _ ->
       Error(error.CodecInvalidData(message: "truncated zstd sequences header"))
@@ -846,7 +883,8 @@ fn parse_sequences(
   count_size: Int,
   num_sequences: Int,
   literals: BitArray,
-) -> Result(BitArray, error.CodecError) {
+  prev_tables: SeqTablesState,
+) -> Result(#(BitArray, SeqTablesState), error.CodecError) {
   use after_count <- result.try(slice_after(
     bytes,
     count_size,
@@ -875,18 +913,21 @@ fn parse_sequences(
         after_modes,
         literal_lengths_mode,
         SeqAlphabetLl,
+        prev_tables.ll,
       ))
       use #(of_table, of_log, after_of) <- result.try(load_sequence_table(
         after_ll,
         offsets_mode,
         SeqAlphabetOf,
+        prev_tables.of,
       ))
       use #(ml_table, ml_log, bitstream) <- result.try(load_sequence_table(
         after_of,
         match_lengths_mode,
         SeqAlphabetMl,
+        prev_tables.ml,
       ))
-      apply_sequences_with_tables(
+      use plain <- result.try(apply_sequences_with_tables(
         num_sequences,
         bitstream,
         literals,
@@ -896,7 +937,15 @@ fn parse_sequences(
         of_log,
         ml_table,
         ml_log,
-      )
+      ))
+      Ok(#(
+        plain,
+        SeqTablesState(
+          ll: Some(#(ll_table, ll_log)),
+          of: Some(#(of_table, of_log)),
+          ml: Some(#(ml_table, ml_log)),
+        ),
+      ))
     }
     _ ->
       Error(error.CodecInvalidData(
@@ -971,6 +1020,7 @@ fn load_sequence_table(
   bytes: BitArray,
   mode: Int,
   alphabet: SeqAlphabet,
+  prev: Option(#(dict.Dict(Int, fse.StateEntry), Int)),
 ) -> Result(#(dict.Dict(Int, fse.StateEntry), Int, BitArray), error.CodecError) {
   case mode {
     0 -> {
@@ -1009,11 +1059,19 @@ fn load_sequence_table(
       Ok(#(table, accuracy_log, rest))
     }
     _ ->
-      Error(error.CodecNotImplemented(
-        feature: "zstd "
-        <> alphabet_label(alphabet)
-        <> " Repeat_Mode (FSE table reuse across blocks)",
-      ))
+      // Repeat_Mode: reuse the FSE table the previous block carried
+      // for this alphabet.  RFC 8478 §3.1.1.4 forbids Repeat_Mode in
+      // the first block of a frame, so an absent prior table is a
+      // hard error.
+      case prev {
+        Some(#(table, accuracy_log)) -> Ok(#(table, accuracy_log, bytes))
+        None ->
+          Error(error.CodecInvalidData(
+            message: "zstd "
+            <> alphabet_label(alphabet)
+            <> " Repeat_Mode without a prior FSE table",
+          ))
+      }
   }
 }
 

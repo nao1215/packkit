@@ -92,9 +92,11 @@ the signatures are matched strictly (gzip requires CM=8, zlib
 verifies the RFC 1950 check bits, bzip2 requires the block-size
 digit, ...).
 
-Still pending: zstd sequence-symbol `Repeat_Mode`, brotli
-LZ77/Huffman compression in the encoder, and zstd / xz / 7z
-encoders that do real compression.
+Still pending: brotli LZ77/Huffman compression in the encoder,
+and zstd / xz / 7z encoders that do full LZ-based compression.
+The zstd encoder currently picks the cheapest of Raw_Block and
+RLE_Block per chunk, which already shrinks uniform runs but
+does no LZ77 or Huffman compression yet.
 
 ## Install
 

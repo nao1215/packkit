@@ -1,18 +1,17 @@
 //// Tests for the non-predefined FSE compression modes
-//// (`RLE_Mode` and `FSE_Compressed_Mode`) in the Zstandard sequences
-//// section, plus regression coverage for the previously-rejected
-//// `Repeat_Mode` path.
+//// (`RLE_Mode`, `FSE_Compressed_Mode`, and `Repeat_Mode`) in the
+//// Zstandard sequences section.
 
+import gleam/string
 import gleeunit/should
 import packkit/error
 import packkit/zstd
 
-pub fn zstd_rejects_repeat_mode_with_clear_error_test() -> Nil {
+pub fn zstd_rejects_first_block_of_repeat_mode_with_clear_error_test() -> Nil {
   // Repeat_Mode reuses the previous block's FSE table, but the
-  // current decoder only carries state within a single block.  Make
-  // sure a stream that asks for repeat_mode surfaces a typed
-  // `CodecNotImplemented` rather than panicking or returning a
-  // generic CodecInvalidData.
+  // first block of a frame has no prior table to fall back on, so
+  // the decoder must surface a typed CodecInvalidData mentioning
+  // Repeat_Mode rather than panicking or producing wrong output.
   //
   // Forged stream:
   // - magic 28b52ffd
@@ -27,29 +26,41 @@ pub fn zstd_rejects_repeat_mode_with_clear_error_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x01, 0x30,
   >>
   case zstd.decode(bytes: stream) {
-    Error(error.CodecNotImplemented(feature: _)) -> Nil
+    Error(error.CodecInvalidData(message: msg)) ->
+      case string.contains(does: msg, contain: "Repeat_Mode") {
+        True -> Nil
+        False -> should.fail()
+      }
     _ -> should.fail()
   }
 }
 
-pub fn zstd_rejects_ll_repeat_mode_test() -> Nil {
+pub fn zstd_rejects_first_block_ll_repeat_mode_test() -> Nil {
   // Same as above but with LL in Repeat_Mode.
   let stream = <<
     0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x01, 0xC0,
   >>
   case zstd.decode(bytes: stream) {
-    Error(error.CodecNotImplemented(feature: _)) -> Nil
+    Error(error.CodecInvalidData(message: msg)) ->
+      case string.contains(does: msg, contain: "Repeat_Mode") {
+        True -> Nil
+        False -> should.fail()
+      }
     _ -> should.fail()
   }
 }
 
-pub fn zstd_rejects_ml_repeat_mode_test() -> Nil {
+pub fn zstd_rejects_first_block_ml_repeat_mode_test() -> Nil {
   // Same as above but with ML in Repeat_Mode.
   let stream = <<
     0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x01, 0x0C,
   >>
   case zstd.decode(bytes: stream) {
-    Error(error.CodecNotImplemented(feature: _)) -> Nil
+    Error(error.CodecInvalidData(message: msg)) ->
+      case string.contains(does: msg, contain: "Repeat_Mode") {
+        True -> Nil
+        False -> should.fail()
+      }
     _ -> should.fail()
   }
 }
