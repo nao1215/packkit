@@ -16,7 +16,9 @@ import metamon/generator/range
 import packkit/brotli
 import packkit/bzip2
 import packkit/deflate
+import packkit/error
 import packkit/gzip
+import packkit/limit
 import packkit/lz4
 import packkit/lzw
 import packkit/snappy
@@ -232,5 +234,72 @@ fn repeat(value: a, n: Int) -> List(a) {
   case n {
     0 -> []
     _ -> [value, ..repeat(value, n - 1)]
+  }
+}
+
+pub fn multi_stream_cumulative_output_limit_test() -> Nil {
+  // Regression for the multi-stream cumulative-output-limit fix
+  // landed across gzip / bzip2 / xz / zstd.  Each codec's inner
+  // decoder already capped the current member at
+  // max_output_bytes, but the multi-stream loop concatenated
+  // payloads with no running-total check.  Build a 3-member
+  // archive whose individual members each fit within a small
+  // limit but whose concatenation does not, and assert every
+  // codec rejects the total at the threshold rather than after
+  // materialising the whole output.
+  let payload = <<"twenty-byte-payload!":utf8>>
+  // 20 bytes per member, 3 members = 60 bytes total.
+  // Limit set to 40 bytes: members 1 + 2 fit, member 3 overflows.
+  let tight_limits =
+    limit.default()
+    |> limit.with_max_output_bytes(bytes: 40)
+
+  // gzip — already covered by a dedicated test, but exercised
+  // again here for cross-codec uniformity.
+  let assert Ok(g) = gzip.encode(bytes: payload, header: gzip.default_header())
+  case
+    gzip.decode_with_limits(
+      bytes: bit_array.concat([g, g, g]),
+      limits: tight_limits,
+    )
+  {
+    Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+
+  // bzip2
+  let assert Ok(b) = bzip2.encode(bytes: payload)
+  case
+    bzip2.decode_with_limits(
+      bytes: bit_array.concat([b, b, b]),
+      limits: tight_limits,
+    )
+  {
+    Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+
+  // xz
+  let assert Ok(x) = xz.encode(bytes: payload)
+  case
+    xz.decode_with_limits(
+      bytes: bit_array.concat([x, x, x]),
+      limits: tight_limits,
+    )
+  {
+    Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
+    _ -> should.fail()
+  }
+
+  // zstd
+  let assert Ok(z) = zstd.encode(bytes: payload)
+  case
+    zstd.decode_with_limits(
+      bytes: bit_array.concat([z, z, z]),
+      limits: tight_limits,
+    )
+  {
+    Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
+    _ -> should.fail()
   }
 }
