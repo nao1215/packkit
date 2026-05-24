@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleeunit/should
 import packkit/codec
 import packkit/error
@@ -193,4 +194,17 @@ pub fn decode_rejects_missing_magic_test() -> Nil {
   |> should.equal(
     Error(error.CodecInvalidData(message: "missing zstd frame magic")),
   )
+}
+
+pub fn decode_multi_frame_concatenated_test() -> Nil {
+  // `zstd` decoders are required to walk through any number of
+  // concatenated frames (RFC 8478 §3.1).  Build a two-frame fixture
+  // with our own encoder and prove the decoder catenates the
+  // payloads.
+  let assert Ok(f1) = zstd.encode(bytes: <<"first-frame-payload":utf8>>)
+  let assert Ok(f2) = zstd.encode(bytes: <<"-second-frame-payload":utf8>>)
+  let combined = bit_array.concat([f1, f2])
+  let assert Ok(plain) = zstd.decode(bytes: combined)
+  plain
+  |> should.equal(<<"first-frame-payload-second-frame-payload":utf8>>)
 }

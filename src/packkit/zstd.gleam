@@ -164,7 +164,10 @@ pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   decode_with_limits(bytes: bytes, limits: limit.default())
 }
 
-/// Decode a Zstandard frame using explicit limits.
+/// Decode a Zstandard frame using explicit limits.  Per RFC 8478 §3,
+/// a zstd "byte stream" is one or more frames concatenated; the
+/// decoder walks the entire input, appending each frame's payload to
+/// the result.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
@@ -177,10 +180,39 @@ pub fn decode_with_limits(
     )),
   )
 
+  decode_frames_loop(bytes, <<>>, limits)
+}
+
+fn decode_frames_loop(
+  bytes: BitArray,
+  acc: BitArray,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
   use #(checksum_flag, rest) <- result.try(parse_frame_header(bytes))
   use #(output, rest) <- result.try(decode_blocks(rest, <<>>, limits))
-  use _ <- result.try(consume_checksum(rest, checksum_flag))
-  Ok(output)
+  use rest <- result.try(consume_checksum_returning_rest(rest, checksum_flag))
+  let acc = bit_array.concat([acc, output])
+  case bit_array.byte_size(rest) {
+    0 -> Ok(acc)
+    _ -> decode_frames_loop(rest, acc, limits)
+  }
+}
+
+fn consume_checksum_returning_rest(
+  bytes: BitArray,
+  checksum_flag: Bool,
+) -> Result(BitArray, error.CodecError) {
+  case checksum_flag {
+    False -> Ok(bytes)
+    True ->
+      case bytes {
+        <<_crc:bytes-size(4), rest:bytes>> -> Ok(rest)
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "zstd content checksum is shorter than 4 bytes",
+          ))
+      }
+  }
 }
 
 // -- frame header -------------------------------------------------------
@@ -1289,33 +1321,6 @@ fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
   case count {
     0 -> acc
     _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
-  }
-}
-
-// -- trailing content checksum -----------------------------------------
-
-fn consume_checksum(
-  bytes: BitArray,
-  checksum_flag: Bool,
-) -> Result(Nil, error.CodecError) {
-  case checksum_flag {
-    False -> Ok(Nil)
-    True ->
-      case bit_array.byte_size(bytes) {
-        4 -> Ok(Nil)
-        // The 4-byte checksum is consumed but not verified — xxHash64
-        // is not yet implemented in pure Gleam.  Future work can read
-        // the value and confirm it against an xxh64 of the decoded
-        // bytes.
-        n if n < 4 ->
-          Error(error.CodecInvalidData(
-            message: "zstd content checksum is shorter than 4 bytes",
-          ))
-        _ ->
-          Error(error.CodecInvalidData(
-            message: "zstd frame has trailing bytes after checksum",
-          ))
-      }
   }
 }
 

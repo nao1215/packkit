@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added multi-frame zstd decoding (RFC 8478 §3.1).  A zstd byte
+  stream may be the concatenation of independent zstd frames (the
+  typical `cat a.zst b.zst` pattern); the decoder now walks the
+  entire input rather than returning as soon as the first frame's
+  optional content-checksum has been consumed, and catenates each
+  frame's payload into the resulting `BitArray`.
 - Added multi-stream bzip2 decoding.  A `.bz2` file may be the
   concatenation of independent bzip2 streams (the typical
   `bzcat`-style pattern); the decoder now follows each
