@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: zstd multi-block frames now thread the
+  running per-frame output and the repeated-offset triple
+  (rep0, rep1, rep2) across block boundaries.  Previously each
+  block decoded from an empty match window and a fresh rep
+  triple `(1, 4, 8)`, so any sequence whose match offset
+  reached back into a previous block surfaced as
+  "zstd match offset exceeds emitted output" (high `zstd`
+  levels) or silently emitted wrong bytes from byte
+  `block_size` onward (low levels).  RFC 8478 §3.1.1.5 spells
+  the requirement out: "Repeated offsets are maintained across
+  blocks (but not across frames)."  Frames now decode
+  byte-for-byte against typical `zstd -3` / -9 / -15 fixtures
+  >= 128 KB (the per-block ceiling).
 - **Fix (correctness)**: zstd `resolve_offset` dispatched on the
   FSE-decoded `of_code` instead of the resulting `raw_offset`
   (= `offset_value`).  RFC 8478 §3.1.1.5 keys the repeated-

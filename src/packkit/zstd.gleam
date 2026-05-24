@@ -418,11 +418,22 @@ fn skip_frame_content_size(
 // -- block driver -------------------------------------------------------
 
 /// Snapshot of all per-frame block-to-block state that the zstd
-/// decoder must thread between successive compressed blocks: the
-/// most recently parsed Huffman literal tree (for treeless literals)
-/// and the LL / OF / ML FSE tables (for Repeat_Mode).
+/// decoder must thread between successive compressed blocks:
+/// the most recently parsed Huffman literal tree (for treeless
+/// literals), the LL / OF / ML FSE tables (for Repeat_Mode), and
+/// the reversed concatenation of every previous block's output
+/// so this block's match copies can reach back into it.
 type BlockState {
-  BlockState(huffman: Option(huf.Tree), sequences: SeqTablesState)
+  BlockState(
+    huffman: Option(huf.Tree),
+    sequences: SeqTablesState,
+    previous_output_rev: List(Int),
+    /// Repeated-offset triple (rep0, rep1, rep2) persisted across
+    /// blocks within a frame.  RFC 8478 §3.1.1.5: "Repeated offsets
+    /// are maintained across blocks (but not across frames)."  The
+    /// per-frame initial values are (1, 4, 8).
+    reps: #(Int, Int, Int),
+  )
 }
 
 type SeqTablesState {
@@ -436,6 +447,8 @@ type SeqTablesState {
 const initial_block_state: BlockState = BlockState(
   huffman: None,
   sequences: SeqTablesState(ll: None, of: None, ml: None),
+  previous_output_rev: [],
+  reps: #(1, 4, 8),
 )
 
 fn decode_blocks(
@@ -482,13 +495,28 @@ fn decode_one_block(
   case block_type {
     0 ->
       decode_raw_block(bytes, block_size)
-      |> result.map(fn(pair) { #(pair.0, pair.1, state) })
+      |> result.map(fn(pair) {
+        let #(plain, rest) = pair
+        #(plain, rest, append_block_output(state, plain))
+      })
     1 ->
       decode_rle_block(bytes, block_size)
-      |> result.map(fn(pair) { #(pair.0, pair.1, state) })
+      |> result.map(fn(pair) {
+        let #(plain, rest) = pair
+        #(plain, rest, append_block_output(state, plain))
+      })
     2 -> decode_compressed_block(bytes, block_size, state)
     _ -> Error(error.CodecInvalidData(message: "zstd reserved block type 3"))
   }
+}
+
+/// Prepend this block's output bytes to the running per-frame
+/// reversed output so the next block's matches can reach back.
+fn append_block_output(state: BlockState, plain: BitArray) -> BlockState {
+  BlockState(
+    ..state,
+    previous_output_rev: prepend_bytes(plain, state.previous_output_rev),
+  )
 }
 
 // -- compressed block --------------------------------------------------
@@ -510,15 +538,24 @@ fn decode_compressed_block(
   use #(literals, after_literals, next_huffman) <- result.try(
     parse_literals_section(payload, state.huffman),
   )
-  use #(plain, next_sequences) <- result.try(parse_and_apply_sequences(
-    after_literals,
-    literals,
-    state.sequences,
-  ))
+  use #(plain, next_sequences, next_reps) <- result.try(
+    parse_and_apply_sequences(
+      after_literals,
+      literals,
+      state.sequences,
+      state.previous_output_rev,
+      state.reps,
+    ),
+  )
   Ok(#(
     plain,
     rest,
-    BlockState(huffman: next_huffman, sequences: next_sequences),
+    BlockState(
+      huffman: next_huffman,
+      sequences: next_sequences,
+      previous_output_rev: prepend_bytes(plain, state.previous_output_rev),
+      reps: next_reps,
+    ),
   ))
 }
 
@@ -917,25 +954,45 @@ fn parse_and_apply_sequences(
   bytes: BitArray,
   literals: BitArray,
   prev_tables: SeqTablesState,
-) -> Result(#(BitArray, SeqTablesState), error.CodecError) {
+  previous_output_rev: List(Int),
+  reps: #(Int, Int, Int),
+) -> Result(#(BitArray, SeqTablesState, #(Int, Int, Int)), error.CodecError) {
   case bytes {
-    <<>> -> Ok(#(literals, prev_tables))
-    <<num_byte, _:bytes>> if num_byte == 0 -> Ok(#(literals, prev_tables))
+    <<>> -> Ok(#(literals, prev_tables, reps))
+    <<num_byte, _:bytes>> if num_byte == 0 -> Ok(#(literals, prev_tables, reps))
     <<num_byte, _:bytes>> if num_byte < 128 ->
-      parse_sequences(bytes, 1, num_byte, literals, prev_tables)
+      parse_sequences(
+        bytes,
+        1,
+        num_byte,
+        literals,
+        prev_tables,
+        previous_output_rev,
+        reps,
+      )
     <<num_byte, b1, _:bytes>> if num_byte < 255 -> {
-      // RFC 8478 §3.1.1.3.2.1 / zstd_compression_format.md:
-      //   Number_of_Sequences = ((byte0 - 0x80) << 8) + byte1
-      // The 2-byte form FULLY OVERLAPS the 1-byte form (no extra
-      // 0x80 offset on top), so a prior `+ 128` was double-counting
-      // and produced ~2x the sequence count for any compressed
-      // block that emitted more than 127 sequences.
       let n = { num_byte - 128 } * 256 + b1
-      parse_sequences(bytes, 2, n, literals, prev_tables)
+      parse_sequences(
+        bytes,
+        2,
+        n,
+        literals,
+        prev_tables,
+        previous_output_rev,
+        reps,
+      )
     }
     <<255, b1, b2, _:bytes>> -> {
       let n = b1 + b2 * 256 + 0x7F00
-      parse_sequences(bytes, 3, n, literals, prev_tables)
+      parse_sequences(
+        bytes,
+        3,
+        n,
+        literals,
+        prev_tables,
+        previous_output_rev,
+        reps,
+      )
     }
     _ ->
       Error(error.CodecInvalidData(message: "truncated zstd sequences header"))
@@ -948,7 +1005,9 @@ fn parse_sequences(
   num_sequences: Int,
   literals: BitArray,
   prev_tables: SeqTablesState,
-) -> Result(#(BitArray, SeqTablesState), error.CodecError) {
+  previous_output_rev: List(Int),
+  reps: #(Int, Int, Int),
+) -> Result(#(BitArray, SeqTablesState, #(Int, Int, Int)), error.CodecError) {
   use after_count <- result.try(slice_after(
     bytes,
     count_size,
@@ -991,7 +1050,7 @@ fn parse_sequences(
         SeqAlphabetMl,
         prev_tables.ml,
       ))
-      use plain <- result.try(apply_sequences_with_tables(
+      use #(plain, new_reps) <- result.try(apply_sequences_with_tables(
         num_sequences,
         bitstream,
         literals,
@@ -1001,6 +1060,8 @@ fn parse_sequences(
         of_log,
         ml_table,
         ml_log,
+        previous_output_rev,
+        reps,
       ))
       Ok(#(
         plain,
@@ -1009,6 +1070,7 @@ fn parse_sequences(
           of: Some(#(of_table, of_log)),
           ml: Some(#(ml_table, ml_log)),
         ),
+        new_reps,
       ))
     }
     _ ->
@@ -1149,14 +1211,15 @@ fn apply_sequences_with_tables(
   of_log: Int,
   ml_table: dict.Dict(Int, fse.StateEntry),
   ml_log: Int,
-) -> Result(BitArray, error.CodecError) {
+  previous_output_rev: List(Int),
+  reps: #(Int, Int, Int),
+) -> Result(#(BitArray, #(Int, Int, Int)), error.CodecError) {
   case fse.new_backward_reader(bitstream) {
     Error(_) ->
       Error(error.CodecInvalidData(
         message: "zstd sequences bitstream is empty or missing marker",
       ))
     Ok(reader) -> {
-      // Read initial states: literal_length first, offset, then match_length
       use #(ll_state, reader) <- result.try(read_state_init(
         reader,
         ll_log,
@@ -1172,14 +1235,17 @@ fn apply_sequences_with_tables(
         ml_log,
         "match_length",
       ))
+      let prev_size = list.length(previous_output_rev)
+      let #(rep0, rep1, rep2) = reps
       let ctx =
         SeqContext(
           literals: literals,
           literal_pos: 0,
-          output_rev: [],
-          rep0: 1,
-          rep1: 4,
-          rep2: 8,
+          output_rev: previous_output_rev,
+          output_prev_size: prev_size,
+          rep0: rep0,
+          rep1: rep1,
+          rep2: rep2,
           ll_state: ll_state,
           of_state: of_state,
           ml_state: ml_state,
@@ -1188,7 +1254,7 @@ fn apply_sequences_with_tables(
           ml_table: ml_table,
         )
       use ctx <- result.try(decode_sequence_loop(num_sequences, ctx, reader))
-      Ok(append_remaining_literals(ctx))
+      Ok(#(append_remaining_literals(ctx), #(ctx.rep0, ctx.rep1, ctx.rep2)))
     }
   }
 }
@@ -1198,6 +1264,7 @@ type SeqContext {
     literals: BitArray,
     literal_pos: Int,
     output_rev: List(Int),
+    output_prev_size: Int,
     rep0: Int,
     rep1: Int,
     rep2: Int,
@@ -1767,8 +1834,24 @@ fn append_remaining_literals(ctx: SeqContext) -> BitArray {
   let remaining = bit_array.byte_size(ctx.literals) - ctx.literal_pos
   let assert Ok(tail) =
     bit_array.slice(ctx.literals, ctx.literal_pos, remaining)
-  let prefix = reverse_list_to_bit_array(ctx.output_rev, <<>>)
+  // ctx.output_rev now contains the previous blocks' bytes plus
+  // this block's bytes (most-recent first).  Trim the tail bytes
+  // that belong to previous blocks so we return only this block's
+  // payload.
+  let this_block_rev = list_drop_tail(ctx.output_rev, ctx.output_prev_size)
+  let prefix = reverse_list_to_bit_array(this_block_rev, <<>>)
   bit_array.concat([prefix, tail])
+}
+
+/// Drop the `n` trailing elements from a list.  Used to strip the
+/// previous-blocks suffix off the running output buffer so only the
+/// current block's payload is returned.
+fn list_drop_tail(items: List(Int), n: Int) -> List(Int) {
+  let total = list.length(items)
+  case total - n {
+    keep if keep <= 0 -> []
+    keep -> list.take(items, keep)
+  }
 }
 
 fn reverse_list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
