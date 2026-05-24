@@ -1,7 +1,14 @@
 //// Unix `ar` archive encoder and decoder.
 ////
-//// This module implements the BSD long-name variant so it can carry
-//// archive entries whose paths exceed 16 bytes or contain spaces.
+//// The encoder emits the BSD long-name variant (`#1/N`) so it can
+//// carry archive entries whose paths exceed 16 bytes or contain
+//// spaces.  The decoder additionally accepts the GNU long-name
+//// variant (a leading `//` string-table member plus `/<offset>`
+//// references in entry headers), which is the form produced by
+//// `binutils` ar and present in nearly every `.deb` / `.a` on
+//// Linux.  GNU symbol-table members (named `/`) are skipped
+//// transparently so they do not show up as user-visible entries.
+////
 //// Only regular file entries are supported - `ar` does not represent
 //// directories or symbolic links.
 
@@ -89,7 +96,7 @@ pub fn decode_with_limits(
 
   let body_size = bit_array.byte_size(bytes) - magic_size
   let assert Ok(rest) = bit_array.slice(bytes, magic_size, body_size)
-  decode_loop(rest, [], 0, limits)
+  decode_loop(rest, [], 0, option.None, limits)
   |> result.map(list.reverse)
   |> result.map(archives.from_entries(format: format(), entries: _))
 }
@@ -98,6 +105,7 @@ fn decode_loop(
   bytes: BitArray,
   acc: List(entry.Entry),
   count: Int,
+  string_table: option.Option(BitArray),
   limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
   case bit_array.byte_size(bytes) {
@@ -124,50 +132,6 @@ fn decode_loop(
             return: Error(error.ArchiveInvalid(message: "ar entry truncated")),
           )
 
-          use _ <- result.try(check_member_limit(count + 1, limits))
-
-          use name <- result.try(case record.name_extension {
-            0 -> Ok(record.header_name)
-            _ -> {
-              use ext_bits <- result.try(slice_or_error(
-                bytes,
-                after_header_offset,
-                record.name_extension,
-              ))
-              bytes_to_string(strip_trailing_nul(ext_bits))
-            }
-          })
-
-          use <- bool.guard(
-            when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
-            return: Error(error.ArchiveLimitExceeded(
-              limit: "max_entry_name_bytes",
-              actual: string.byte_size(name),
-            )),
-          )
-
-          let assert Ok(body) =
-            bit_array.slice(bytes, payload_offset, payload_size)
-          use base_entry <- result.try(
-            entry.file_checked(path: name, body: body)
-            |> result.map_error(entry_error_to_archive_error(_, name)),
-          )
-
-          let depth = entry.depth(entry.path(base_entry))
-          use <- bool.guard(
-            when: depth > limit.max_entry_depth(limits),
-            return: Error(error.ArchiveLimitExceeded(
-              limit: "max_entry_depth",
-              actual: depth,
-            )),
-          )
-
-          let entry_value =
-            base_entry
-            |> entry.with_mode(mode: record.mode)
-            |> entry.with_owner(user_id: record.uid, group_id: record.gid)
-            |> entry.with_modified_at(unix_seconds: record.mtime)
-
           let advance = min(padded_size, bit_array.byte_size(bytes))
           let assert Ok(remaining) =
             bit_array.slice(
@@ -175,8 +139,134 @@ fn decode_loop(
               advance,
               bit_array.byte_size(bytes) - advance,
             )
-          decode_loop(remaining, [entry_value, ..acc], count + 1, limits)
+
+          case record.special {
+            SymbolTable ->
+              decode_loop(remaining, acc, count, string_table, limits)
+            StringTable -> {
+              let assert Ok(table_body) =
+                bit_array.slice(bytes, payload_offset, payload_size)
+              decode_loop(
+                remaining,
+                acc,
+                count,
+                option.Some(table_body),
+                limits,
+              )
+            }
+            RegularEntry -> {
+              use _ <- result.try(check_member_limit(count + 1, limits))
+
+              use name <- result.try(resolve_entry_name(
+                record,
+                bytes,
+                after_header_offset,
+                string_table,
+              ))
+
+              use <- bool.guard(
+                when: string.byte_size(name)
+                  > limit.max_entry_name_bytes(limits),
+                return: Error(error.ArchiveLimitExceeded(
+                  limit: "max_entry_name_bytes",
+                  actual: string.byte_size(name),
+                )),
+              )
+
+              let assert Ok(body) =
+                bit_array.slice(bytes, payload_offset, payload_size)
+              use base_entry <- result.try(
+                entry.file_checked(path: name, body: body)
+                |> result.map_error(entry_error_to_archive_error(_, name)),
+              )
+
+              let depth = entry.depth(entry.path(base_entry))
+              use <- bool.guard(
+                when: depth > limit.max_entry_depth(limits),
+                return: Error(error.ArchiveLimitExceeded(
+                  limit: "max_entry_depth",
+                  actual: depth,
+                )),
+              )
+
+              let entry_value =
+                base_entry
+                |> entry.with_mode(mode: record.mode)
+                |> entry.with_owner(user_id: record.uid, group_id: record.gid)
+                |> entry.with_modified_at(unix_seconds: record.mtime)
+
+              decode_loop(
+                remaining,
+                [entry_value, ..acc],
+                count + 1,
+                string_table,
+                limits,
+              )
+            }
+          }
         }
+      }
+  }
+}
+
+fn resolve_entry_name(
+  record: ParsedRecord,
+  bytes: BitArray,
+  after_header_offset: Int,
+  string_table: option.Option(BitArray),
+) -> Result(String, error.ArchiveError) {
+  case record.name_extension, record.gnu_offset {
+    // BSD long name lives in the bytes immediately after the header.
+    n, _ if n > 0 -> {
+      use ext_bits <- result.try(slice_or_error(
+        bytes,
+        after_header_offset,
+        record.name_extension,
+      ))
+      bytes_to_string(strip_trailing_nul(ext_bits))
+    }
+    // GNU long name reference (`/<offset>`).
+    _, option.Some(offset) ->
+      case string_table {
+        option.None ->
+          Error(error.ArchiveInvalid(
+            message: "ar entry references missing GNU string table",
+          ))
+        option.Some(table) -> gnu_string_at(table, offset)
+      }
+    _, option.None -> Ok(record.header_name)
+  }
+}
+
+fn gnu_string_at(
+  table: BitArray,
+  offset: Int,
+) -> Result(String, error.ArchiveError) {
+  let size = bit_array.byte_size(table)
+  case offset < 0 || offset >= size {
+    True ->
+      Error(error.ArchiveInvalid(
+        message: "ar GNU string table offset out of range",
+      ))
+    False -> {
+      let assert Ok(tail) = bit_array.slice(table, offset, size - offset)
+      let end_index = find_gnu_terminator(tail, 0, size - offset)
+      let assert Ok(name_bits) = bit_array.slice(tail, 0, end_index)
+      bytes_to_string(name_bits)
+    }
+  }
+}
+
+fn find_gnu_terminator(bytes: BitArray, pos: Int, len: Int) -> Int {
+  case pos >= len {
+    True -> len
+    False ->
+      case bit_array.slice(bytes, pos, 1) {
+        // GNU writes "<name>/\n"; some toolchains write "<name>\0".
+        Ok(<<0x2F>>) -> pos
+        Ok(<<0x00>>) -> pos
+        Ok(<<0x0A>>) -> pos
+        _ -> find_gnu_terminator(bytes, pos + 1, len)
       }
   }
 }
@@ -192,10 +282,18 @@ fn check_member_limit(
   }
 }
 
+type SpecialKind {
+  RegularEntry
+  SymbolTable
+  StringTable
+}
+
 type ParsedRecord {
   ParsedRecord(
     header_name: String,
     name_extension: Int,
+    gnu_offset: option.Option(Int),
+    special: SpecialKind,
     mtime: Int,
     uid: Int,
     gid: Int,
@@ -220,36 +318,91 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
     return: Error(error.ArchiveInvalid(message: "ar header marker missing")),
   )
 
-  case string.starts_with(trimmed_name, "#1/") {
-    True -> {
-      let len_string = string.drop_start(trimmed_name, 3)
-      case int.parse(len_string) {
-        Ok(len) ->
-          Ok(ParsedRecord(
-            header_name: "",
-            name_extension: len,
-            mtime: mtime,
-            uid: uid,
-            gid: gid,
-            mode: mode,
-            size: size,
-          ))
-        Error(_) ->
-          Error(error.ArchiveInvalid(
-            message: "invalid BSD long name length in ar header",
-          ))
-      }
-    }
-    False ->
+  case trimmed_name {
+    "/" | "/SYM64/" ->
       Ok(ParsedRecord(
-        header_name: strip_trailing_slash(trimmed_name),
+        header_name: trimmed_name,
         name_extension: 0,
+        gnu_offset: option.None,
+        special: SymbolTable,
         mtime: mtime,
         uid: uid,
         gid: gid,
         mode: mode,
         size: size,
       ))
+    "//" | "ARFILENAMES/" ->
+      Ok(ParsedRecord(
+        header_name: trimmed_name,
+        name_extension: 0,
+        gnu_offset: option.None,
+        special: StringTable,
+        mtime: mtime,
+        uid: uid,
+        gid: gid,
+        mode: mode,
+        size: size,
+      ))
+    _ ->
+      case string.starts_with(trimmed_name, "#1/") {
+        True -> {
+          let len_string = string.drop_start(trimmed_name, 3)
+          case int.parse(len_string) {
+            Ok(len) ->
+              Ok(ParsedRecord(
+                header_name: "",
+                name_extension: len,
+                gnu_offset: option.None,
+                special: RegularEntry,
+                mtime: mtime,
+                uid: uid,
+                gid: gid,
+                mode: mode,
+                size: size,
+              ))
+            Error(_) ->
+              Error(error.ArchiveInvalid(
+                message: "invalid BSD long name length in ar header",
+              ))
+          }
+        }
+        False ->
+          case string.starts_with(trimmed_name, "/") {
+            True -> {
+              let offset_string = string.drop_start(trimmed_name, 1)
+              case int.parse(offset_string) {
+                Ok(offset) ->
+                  Ok(ParsedRecord(
+                    header_name: "",
+                    name_extension: 0,
+                    gnu_offset: option.Some(offset),
+                    special: RegularEntry,
+                    mtime: mtime,
+                    uid: uid,
+                    gid: gid,
+                    mode: mode,
+                    size: size,
+                  ))
+                Error(_) ->
+                  Error(error.ArchiveInvalid(
+                    message: "invalid GNU long name offset in ar header",
+                  ))
+              }
+            }
+            False ->
+              Ok(ParsedRecord(
+                header_name: strip_trailing_slash(trimmed_name),
+                name_extension: 0,
+                gnu_offset: option.None,
+                special: RegularEntry,
+                mtime: mtime,
+                uid: uid,
+                gid: gid,
+                mode: mode,
+                size: size,
+              ))
+          }
+      }
   }
 }
 

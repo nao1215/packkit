@@ -24,7 +24,10 @@ Implemented codecs and archive families:
 - **tar**: USTAR encode/decode (regular files, directories, symlinks,
   hardlinks, prefix/name split)
 - **cpio**: newc encode/decode
-- **ar**: BSD long-name encode/decode
+- **ar**: BSD long-name encode/decode; decoder also accepts the
+  GNU long-name string-table form (`//` member + `/<offset>`
+  references) so `.a` / `.deb` archives produced by `binutils ar`
+  round-trip end-to-end
 - **zip**: stored + deflate encode/decode with CRC-32 verification,
   plus Zip64 extensions (EOCD locator/record + per-entry header_id
   0x0001 extra field) so archives with > 65535 entries, > 4 GiB

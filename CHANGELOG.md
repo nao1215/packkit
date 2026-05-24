@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Extended the `ar` decoder with the GNU long-name string-table
+  variant.  In addition to the BSD `#1/N` form the decoder already
+  supported, the new path recognises the `//` (`ARFILENAMES/`)
+  member as a string table and resolves `/<offset>` references in
+  later headers to the corresponding long names.  GNU symbol-table
+  members (named `/` or `/SYM64/`) are skipped transparently so they
+  never appear as user-visible entries.  The encoder still emits the
+  BSD form, but archives produced by `binutils ar` (typical for
+  `.a` and `.deb` files on Linux) now round-trip through the
+  decoder end-to-end.
 - Added multi-frame zstd decoding (RFC 8478 §3.1).  A zstd byte
   stream may be the concatenation of independent zstd frames (the
   typical `cat a.zst b.zst` pattern); the decoder now walks the
