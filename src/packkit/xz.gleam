@@ -14,6 +14,7 @@ import gleam/result
 import packkit/checksum
 import packkit/codec as codecs
 import packkit/error
+import packkit/internal/bcj
 import packkit/internal/lzma
 import packkit/limit
 
@@ -588,6 +589,8 @@ fn validate_pre_filters(
   case filters {
     [] -> Ok(Nil)
     [#(0x03, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x04, _), ..rest] -> validate_pre_filters(rest)
+    [#(0x07, _), ..rest] -> validate_pre_filters(rest)
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(
         feature: "xz pre-processor filter id " <> int.to_string(id),
@@ -616,6 +619,16 @@ fn apply_pre_filters_loop(
       // distances 1..256 fit in one byte.
       let distance = props + 1
       apply_pre_filters_loop(delta_decode(bytes, distance), rest)
+    }
+    [#(0x04, _), ..rest] -> {
+      // x86 BCJ filter — xz resets the encoder's `now_pos` to 0 at
+      // every block boundary so the decoder does the same.
+      apply_pre_filters_loop(bcj.x86_decode(bytes, 0), rest)
+    }
+    [#(0x07, _), ..rest] -> {
+      // ARM A32 BCJ filter — same `now_pos = 0` block-reset
+      // convention as the x86 filter.
+      apply_pre_filters_loop(bcj.arm_decode(bytes, 0), rest)
     }
     [#(id, _), ..] ->
       Error(error.CodecNotImplemented(
