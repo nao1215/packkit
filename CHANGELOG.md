@@ -2,13 +2,15 @@
 
 ## Unreleased
 
-- Made `gzip.decode_with_limits` enforce `max_output_bytes` across
-  the whole multi-member stream, not just per member.  The
-  per-member deflate decoder already capped each member at the
+- Made the multi-member / multi-stream / multi-frame loops in
+  `gzip`, `bzip2`, `xz`, and `zstd` enforce `max_output_bytes`
+  across the full byte stream rather than per member.  Each
+  codec's inner decoder already capped the current member at the
   limit, but a stream of N members could still grow the catenated
-  payload to N × max_output_bytes; the new check folds the limit
-  into the running total so adversarial multi-member archives are
-  rejected as soon as the threshold is exceeded.
+  payload to N × max_output_bytes before any check fired.  The
+  new running-total check folds each member's contribution into
+  the limit so adversarial concatenated archives are rejected as
+  soon as the threshold is exceeded.
 - Made the `zstd` literals-section header parser cover all four
   size_format variants of `Compressed_Literals_Block` and
   `Treeless_Literals_Block` (3-, 4-, and 5-byte headers).  The

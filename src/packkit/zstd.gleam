@@ -183,21 +183,32 @@ pub fn decode_with_limits(
     )),
   )
 
-  decode_frames_loop(bytes, <<>>, limits)
+  decode_frames_loop(bytes, <<>>, 0, limits)
 }
 
 fn decode_frames_loop(
   bytes: BitArray,
   acc: BitArray,
+  accumulated_size: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   use #(checksum_flag, rest) <- result.try(parse_frame_header(bytes))
   use #(output, rest) <- result.try(decode_blocks(rest, <<>>, limits))
   use rest <- result.try(consume_checksum_returning_rest(rest, checksum_flag))
-  let acc = bit_array.concat([acc, output])
-  case bit_array.byte_size(rest) {
-    0 -> Ok(acc)
-    _ -> decode_frames_loop(rest, acc, limits)
+  let next_size = accumulated_size + bit_array.byte_size(output)
+  case next_size > limit.max_output_bytes(limits) {
+    True ->
+      Error(error.CodecLimitExceeded(
+        limit: "max_output_bytes",
+        actual: next_size,
+      ))
+    False -> {
+      let acc = bit_array.concat([acc, output])
+      case bit_array.byte_size(rest) {
+        0 -> Ok(acc)
+        _ -> decode_frames_loop(rest, acc, next_size, limits)
+      }
+    }
   }
 }
 

@@ -107,12 +107,13 @@ pub fn decode_with_limits(
     )),
   )
 
-  decode_streams_loop(bytes, <<>>, limits)
+  decode_streams_loop(bytes, <<>>, 0, limits)
 }
 
 fn decode_streams_loop(
   bytes: BitArray,
   acc: BitArray,
+  accumulated_size: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   use rest <- result.try(parse_stream_header(bytes))
@@ -122,10 +123,20 @@ fn decode_streams_loop(
     0,
     limits,
   ))
-  let acc = bit_array.concat([acc, payload])
-  case bit_array.byte_size(after) {
-    0 -> Ok(acc)
-    _ -> decode_streams_loop(after, acc, limits)
+  let next_size = accumulated_size + bit_array.byte_size(payload)
+  case next_size > limit.max_output_bytes(limits) {
+    True ->
+      Error(error.CodecLimitExceeded(
+        limit: "max_output_bytes",
+        actual: next_size,
+      ))
+    False -> {
+      let acc = bit_array.concat([acc, payload])
+      case bit_array.byte_size(after) {
+        0 -> Ok(acc)
+        _ -> decode_streams_loop(after, acc, next_size, limits)
+      }
+    }
   }
 }
 
