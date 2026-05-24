@@ -264,12 +264,18 @@ fn measure_extra_subfields(
   }
 }
 
-/// Encode `bytes` as a gzip stream using `header`.
+/// Encode `bytes` as a gzip stream using `header`.  The DEFLATE body
+/// uses the dynamic-Huffman encoder, which on typical text and
+/// structured-data payloads shrinks ~10–30 % more than the fixed-
+/// Huffman variant; for pathologically skewed inputs the encoder
+/// transparently falls back to fixed Huffman inside
+/// `deflate.encode_dynamic` so the stream is always a valid
+/// RFC 1951 BTYPE=01 or BTYPE=10 block.
 pub fn encode(
   bytes bytes: BitArray,
   header header: Header,
 ) -> Result(BitArray, error.CodecError) {
-  use deflated <- result.try(deflate.encode(bytes: bytes))
+  use deflated <- result.try(deflate.encode_dynamic(bytes: bytes))
 
   let mtime = case header.modified_at_unix {
     Some(value) -> value

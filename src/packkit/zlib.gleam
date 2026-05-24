@@ -29,26 +29,29 @@ pub fn codec() -> codecs.Codec {
   codecs.zlib()
 }
 
-/// Encode `data` as a zlib byte stream.
+/// Encode `data` as a zlib byte stream.  The DEFLATE body uses the
+/// dynamic-Huffman encoder (BTYPE=10) for better compression on
+/// typical inputs; pathologically-skewed payloads fall back to
+/// fixed Huffman (BTYPE=01) inside `deflate.encode_dynamic`.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  use deflated <- result.try(deflate.encode(bytes: bytes))
+  use deflated <- result.try(deflate.encode_dynamic(bytes: bytes))
   let header = <<cmf_byte, flg_byte>>
   let trailer = adler_trailer(bytes)
   Ok(bit_array.concat([header, deflated, trailer]))
 }
 
 /// Encode `bytes` as a zlib stream carrying the preset-dictionary
-/// adler ID for `dictionary`.  The body is still emitted by the
-/// fixed-Huffman DEFLATE encoder over `bytes` alone, so the receiver
-/// must already share `dictionary` to verify the four-byte DICT_ID;
-/// callers that have the dictionary on both sides can use this to
+/// adler ID for `dictionary`.  The body is emitted by the
+/// dynamic-Huffman DEFLATE encoder over `bytes` alone; the receiver
+/// must already share `dictionary` to verify the four-byte DICT_ID.
+/// Callers that have the dictionary on both sides can use this to
 /// round-trip a stream they will later decode with
 /// `decode_with_dictionary`.
 pub fn encode_with_dictionary(
   bytes bytes: BitArray,
   dictionary dictionary: BitArray,
 ) -> Result(BitArray, error.CodecError) {
-  use deflated <- result.try(deflate.encode(bytes: bytes))
+  use deflated <- result.try(deflate.encode_dynamic(bytes: bytes))
   let dict_id = checksum.adler32(dictionary)
   let header = <<cmf_byte, flg_byte_with_dict, dict_id:size(32)-big>>
   let trailer = adler_trailer(bytes)
