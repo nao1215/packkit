@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Completed zstd `Treeless_Literals_Block` decoding.  The block
+  loop now threads an `Option(huf.Tree)` forward; compressed
+  literals blocks publish their parsed tree, and treeless
+  blocks (block_type 3) reuse the most recently parsed one.
+  A treeless block in the first position of a frame still
+  surfaces as a typed `CodecInvalidData` with a "treeless
+  literals without a prior Huffman tree" message rather than
+  segfaulting into an undefined-tree path.  This closes the
+  last `Compressed_Literals_Block` / `Treeless_Literals_Block`
+  gap noted in earlier release notes.
 - Added the IA-64 / Itanium (filter id 0x06) and RISC-V (filter
   id 0x0B) BCJ pre-processor filters to the xz multi-filter
   chain.  IA-64 walks 16-byte bundles, indexes a branch table by

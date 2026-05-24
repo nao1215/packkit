@@ -7,21 +7,23 @@
 //// compressed blocks (type 2) decode through the FSE tables in
 //// `packkit/internal/fse`.  Sequences with `Predefined_Mode`,
 //// `RLE_Mode`, and `FSE_Compressed_Mode` symbol descriptions all
-//// decode (LL, OF, ML independently).  Literal blocks decode for
-//// `Raw_Literals_Block` and `RLE_Literals_Block` only; the
-//// `Compressed_Literals_Block` and `Treeless_Literals_Block`
-//// variants (Huffman-coded literals) still surface as
-//// `CodecNotImplemented`, with the diagnostic carrying the parsed
-//// regenerated_size / compressed_size / streams so users can see
-//// exactly which configuration their file uses.  `Repeat_Mode`
-//// for sequence-symbol descriptions also remains future work
-//// because it spans multiple blocks.
+//// decode (LL, OF, ML independently).  All four literal block
+//// types decode: `Raw_Literals_Block`, `RLE_Literals_Block`,
+//// `Compressed_Literals_Block` (Huffman-coded with direct-weight
+//// or FSE-weight tree descriptions, 1-stream or 4-stream form),
+//// and `Treeless_Literals_Block` (which reuses the prior block's
+//// Huffman tree via the cross-block tree state threaded through
+//// the block loop).  A treeless block in the first position of a
+//// frame surfaces as a typed `CodecInvalidData`.  `Repeat_Mode`
+//// for sequence-symbol descriptions remains future work because
+//// it spans multiple blocks.
 
 import gleam/bit_array
 import gleam/bool
 import gleam/dict
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
@@ -194,7 +196,7 @@ fn decode_frames_loop(
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
   use #(checksum_flag, rest) <- result.try(parse_frame_header(bytes))
-  use #(output, rest) <- result.try(decode_blocks(rest, <<>>, limits))
+  use #(output, rest) <- result.try(decode_blocks(rest, <<>>, limits, None))
   use rest <- result.try(consume_checksum_returning_rest(rest, checksum_flag))
   let next_size = accumulated_size + bit_array.byte_size(output)
   case next_size > limit.max_output_bytes(limits) {
@@ -321,6 +323,7 @@ fn decode_blocks(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
+  prev_tree: Option(huf.Tree),
 ) -> Result(#(BitArray, BitArray), error.CodecError) {
   case bytes {
     <<b0, b1, b2, rest:bytes>> -> {
@@ -335,15 +338,16 @@ fn decode_blocks(
       let last = int.bitwise_and(header, 0x1) == 1
       let block_type = int.bitwise_and(int.bitwise_shift_right(header, 1), 0x3)
       let block_size = int.bitwise_shift_right(header, 3)
-      use #(plain, rest) <- result.try(decode_one_block(
+      use #(plain, rest, next_tree) <- result.try(decode_one_block(
         rest,
         block_type,
         block_size,
+        prev_tree,
       ))
       use new_output <- result.try(append_with_limit(output, plain, limits))
       case last {
         True -> Ok(#(new_output, rest))
-        False -> decode_blocks(rest, new_output, limits)
+        False -> decode_blocks(rest, new_output, limits, next_tree)
       }
     }
     _ -> Error(error.CodecInvalidData(message: "truncated zstd block header"))
@@ -354,11 +358,16 @@ fn decode_one_block(
   bytes: BitArray,
   block_type: Int,
   block_size: Int,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+  prev_tree: Option(huf.Tree),
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
   case block_type {
-    0 -> decode_raw_block(bytes, block_size)
-    1 -> decode_rle_block(bytes, block_size)
-    2 -> decode_compressed_block(bytes, block_size)
+    0 ->
+      decode_raw_block(bytes, block_size)
+      |> result.map(fn(pair) { #(pair.0, pair.1, prev_tree) })
+    1 ->
+      decode_rle_block(bytes, block_size)
+      |> result.map(fn(pair) { #(pair.0, pair.1, prev_tree) })
+    2 -> decode_compressed_block(bytes, block_size, prev_tree)
     _ -> Error(error.CodecInvalidData(message: "zstd reserved block type 3"))
   }
 }
@@ -368,7 +377,8 @@ fn decode_one_block(
 fn decode_compressed_block(
   bytes: BitArray,
   block_size: Int,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+  prev_tree: Option(huf.Tree),
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
   use payload <- result.try(slice_or_error(
     bytes,
     0,
@@ -378,26 +388,47 @@ fn decode_compressed_block(
   let assert Ok(rest) =
     bit_array.slice(bytes, block_size, bit_array.byte_size(bytes) - block_size)
 
-  use #(literals, after_literals) <- result.try(parse_literals_section(payload))
+  use #(literals, after_literals, next_tree) <- result.try(
+    parse_literals_section(payload, prev_tree),
+  )
   use plain <- result.try(parse_and_apply_sequences(after_literals, literals))
-  Ok(#(plain, rest))
+  Ok(#(plain, rest, next_tree))
 }
 
 // -- literals section --------------------------------------------------
 
 fn parse_literals_section(
   bytes: BitArray,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+  prev_tree: Option(huf.Tree),
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
   case bytes {
     <<header_byte, _:bytes>> -> {
       let literals_block_type = int.bitwise_and(header_byte, 0x3)
       let size_format =
         int.bitwise_and(int.bitwise_shift_right(header_byte, 2), 0x3)
       case literals_block_type {
-        0 -> parse_raw_or_rle_literals(bytes, header_byte, size_format, False)
-        1 -> parse_raw_or_rle_literals(bytes, header_byte, size_format, True)
-        2 -> parse_compressed_literals(bytes, header_byte, size_format, False)
-        _ -> parse_compressed_literals(bytes, header_byte, size_format, True)
+        0 ->
+          parse_raw_or_rle_literals(bytes, header_byte, size_format, False)
+          |> result.map(fn(pair) { #(pair.0, pair.1, prev_tree) })
+        1 ->
+          parse_raw_or_rle_literals(bytes, header_byte, size_format, True)
+          |> result.map(fn(pair) { #(pair.0, pair.1, prev_tree) })
+        2 ->
+          parse_compressed_literals(
+            bytes,
+            header_byte,
+            size_format,
+            False,
+            prev_tree,
+          )
+        _ ->
+          parse_compressed_literals(
+            bytes,
+            header_byte,
+            size_format,
+            True,
+            prev_tree,
+          )
       }
     }
     _ ->
@@ -427,17 +458,15 @@ fn parse_compressed_literals(
   header_byte: Int,
   size_format: Int,
   treeless: Bool,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+  prev_tree: Option(huf.Tree),
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
   use header <- result.try(parse_compressed_literals_header(
     bytes,
     header_byte,
     size_format,
   ))
   case treeless {
-    True ->
-      Error(error.CodecNotImplemented(
-        feature: "zstd treeless literals (prior-tree reuse not supported)",
-      ))
+    True -> decode_treeless_literals_block(bytes, header, prev_tree)
     False -> decode_huffman_literals_block(bytes, header)
   }
 }
@@ -445,7 +474,7 @@ fn parse_compressed_literals(
 fn decode_huffman_literals_block(
   bytes: BitArray,
   header: CompressedLiteralsHeader,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
   // Slice the literals section payload out of the surrounding block
   // so the Huffman tree parser stops at the right boundary.
   let section_total = header.header_bytes + header.compressed_size
@@ -478,20 +507,70 @@ fn decode_huffman_literals_block(
         bitstream_size,
         "zstd Huffman literal bitstream",
       ))
-      use literals <- result.try(case header.streams {
-        1 ->
-          huf.decode_stream(tree, bitstream_bytes, header.regenerated_size)
-          |> result.map_error(huf_error_to_codec)
-        _ ->
-          huf.decode_four_streams(
-            tree,
-            bitstream_bytes,
-            header.regenerated_size,
-          )
-          |> result.map_error(huf_error_to_codec)
-      })
-      Ok(#(literals, after_section))
+      use literals <- result.try(decode_huffman_streams(
+        tree,
+        bitstream_bytes,
+        header,
+      ))
+      Ok(#(literals, after_section, Some(tree)))
     }
+  }
+}
+
+fn decode_treeless_literals_block(
+  bytes: BitArray,
+  header: CompressedLiteralsHeader,
+  prev_tree: Option(huf.Tree),
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+  case prev_tree {
+    None ->
+      Error(error.CodecInvalidData(
+        message: "zstd treeless literals without a prior Huffman tree",
+      ))
+    Some(tree) -> {
+      let section_total = header.header_bytes + header.compressed_size
+      use section <- result.try(slice_or_error(
+        bytes,
+        0,
+        section_total,
+        "zstd treeless literals section body",
+      ))
+      let assert Ok(after_section) =
+        bit_array.slice(
+          bytes,
+          section_total,
+          bit_array.byte_size(bytes) - section_total,
+        )
+      // Treeless literals omit the Huffman_Tree_Description so the
+      // whole compressed_size is the bitstream payload.
+      use bitstream_bytes <- result.try(slice_or_error(
+        section,
+        header.header_bytes,
+        header.compressed_size,
+        "zstd treeless literal bitstream",
+      ))
+      use literals <- result.try(decode_huffman_streams(
+        tree,
+        bitstream_bytes,
+        header,
+      ))
+      Ok(#(literals, after_section, prev_tree))
+    }
+  }
+}
+
+fn decode_huffman_streams(
+  tree: huf.Tree,
+  bitstream_bytes: BitArray,
+  header: CompressedLiteralsHeader,
+) -> Result(BitArray, error.CodecError) {
+  case header.streams {
+    1 ->
+      huf.decode_stream(tree, bitstream_bytes, header.regenerated_size)
+      |> result.map_error(huf_error_to_codec)
+    _ ->
+      huf.decode_four_streams(tree, bitstream_bytes, header.regenerated_size)
+      |> result.map_error(huf_error_to_codec)
   }
 }
 

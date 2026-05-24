@@ -71,11 +71,11 @@ Implemented codecs and archive families:
 - **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
   with Raw / RLE literals, **Huffman-compressed literals** (both
   direct-weight and FSE-weight tree descriptions; both 1-stream
-  and 4-stream jump-table forms), predefined / RLE /
-  FSE-compressed sequence modes, and multi-frame stream
-  decoding (concatenated zstd frames such as `cat a.zst b.zst`).
-  Treeless-literal blocks (reuse the prior block's Huffman tree)
-  are still pending because they require cross-block tree state
+  and 4-stream jump-table forms), **treeless literals** (the
+  prior block's Huffman tree is threaded through the block loop
+  and reused), predefined / RLE / FSE-compressed sequence modes,
+  and multi-frame stream decoding (concatenated zstd frames such
+  as `cat a.zst b.zst`)
 - **brotli**: full RFC 7932 decoder (uncompressed + compressed
   metablocks, static dictionary, context maps, block switching).
   Encoder emits uncompressed metablocks only — the stream is a
@@ -92,9 +92,9 @@ the signatures are matched strictly (gzip requires CM=8, zlib
 verifies the RFC 1950 check bits, bzip2 requires the block-size
 digit, ...).
 
-Still pending: zstd compressed-block Huffman literals and
-non-predefined FSE modes, brotli LZ77/Huffman compression in the
-encoder, and zstd / xz / 7z encoders that do real compression.
+Still pending: zstd sequence-symbol `Repeat_Mode`, brotli
+LZ77/Huffman compression in the encoder, and zstd / xz / 7z
+encoders that do real compression.
 
 ## Install
 

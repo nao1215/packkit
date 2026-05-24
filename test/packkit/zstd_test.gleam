@@ -197,15 +197,14 @@ pub fn decode_rejects_missing_magic_test() -> Nil {
   )
 }
 
-pub fn treeless_literals_block_still_surfaces_typed_error_test() -> Nil {
-  // Treeless literals blocks (block_type = 3) need a previous
-  // Huffman tree to reuse, which we don't carry across blocks
-  // yet.  The decoder must surface that gap as a typed
-  // CodecNotImplemented carrying the "treeless" wording.
-  // The exact encoded shape doesn't matter for this assertion;
-  // it only matters that the block_type field is 3.  Build a
-  // minimal compressed block with literals_section_header byte
-  // = (block_type 3 | size_format 0 << 2) = 0x03 then garbage.
+pub fn treeless_literals_without_prior_tree_is_invalid_data_test() -> Nil {
+  // Treeless literals blocks (block_type = 3) reuse the previous
+  // block's Huffman tree.  When the first block of a frame
+  // declares treeless literals there's no prior tree to reuse,
+  // so the decoder must surface a typed CodecInvalidData error
+  // mentioning treeless.  Build a minimal compressed block with
+  // literals_section_header byte = (block_type 3 | size_format 0
+  // << 2) = 0x03 then garbage.
   let block_payload = <<0x03, 0x00, 0x00, 0x00>>
   let block_size = bit_array.byte_size(block_payload)
   let block_header_int = 1 + 4 + { block_size * 8 }
@@ -218,8 +217,8 @@ pub fn treeless_literals_block_still_surfaces_typed_error_test() -> Nil {
     ])
 
   case zstd.decode(bytes: frame) {
-    Error(error.CodecNotImplemented(feature: feature)) ->
-      case string.contains(does: feature, contain: "treeless") {
+    Error(error.CodecInvalidData(message: message)) ->
+      case string.contains(does: message, contain: "treeless") {
         True -> Nil
         False -> should.fail()
       }
