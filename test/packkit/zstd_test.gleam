@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/string
 import gleeunit/should
 import packkit/codec
 import packkit/error
@@ -194,6 +195,67 @@ pub fn decode_rejects_missing_magic_test() -> Nil {
   |> should.equal(
     Error(error.CodecInvalidData(message: "missing zstd frame magic")),
   )
+}
+
+pub fn compressed_literals_header_surfaces_metadata_test() -> Nil {
+  // Hand-crafted zstd frame whose only compressed block uses a
+  // Huffman-compressed literals section.  We don't have a Huffman
+  // decoder yet, but the literals-section header parser must
+  // surface the parsed regenerated_size / compressed_size / streams
+  // so users can see exactly which configuration tripped the
+  // not-implemented path.
+  //
+  // Literals_Section_Header bytes for size_format=1 (3-byte header,
+  // 4 streams, 10-bit sizes):
+  //   regen=257  ( = 0b0100000001 )
+  //   comp =258  ( = 0b0100000010 )
+  // Encoded little-endian-by-bit-field:
+  //   header_byte = type(2) | size_format(1)<<2 | regen_low4<<4
+  //               = 2 | 4 | (1 << 4) = 0x16
+  //   b1 = regen_high6 | comp_low2<<6
+  //      = 0b010000 | (0b10 << 6) = 0x90
+  //   b2 = comp_high8 = 0b01000000 = 0x40
+  let literals_header = <<0x16, 0x90, 0x40>>
+  // The frame just needs to reach `decode_compressed_block`; the
+  // block payload is the literals header followed by a fake
+  // Huffman tree byte so the slice fits, but we never actually
+  // parse that — the failure is surfaced from the header parser.
+  let block_payload = bit_array.concat([literals_header, <<0x00>>])
+  let block_size = bit_array.byte_size(block_payload)
+  let block_header_int = 1 + 4 + { block_size * 8 }
+  // last=1, block_type=2 (compressed), block_size in high 21 bits.
+  let block_header = <<block_header_int:size(24)-little>>
+  let frame =
+    bit_array.concat([
+      <<0x28, 0xB5, 0x2F, 0xFD>>,
+      // Frame_Header_Descriptor: dictionary_id_flag=0,
+      // content_checksum_flag=0, single_segment=1, fcs_flag_size=0
+      <<0x20>>,
+      // FCS for single_segment with fcs_flag_size=0 → 1 byte.
+      <<0x01>>,
+      block_header,
+      block_payload,
+    ])
+
+  case zstd.decode(bytes: frame) {
+    Error(error.CodecNotImplemented(feature: feature)) -> {
+      // The diagnostic must include the parsed metadata so users
+      // can see what configuration their `.zst` file uses.
+      case string.contains(does: feature, contain: "regenerated_size=257") {
+        True -> Nil
+        False -> should.fail()
+      }
+      case string.contains(does: feature, contain: "compressed_size=258") {
+        True -> Nil
+        False -> should.fail()
+      }
+      case string.contains(does: feature, contain: "streams=4") {
+        True -> Nil
+        False -> should.fail()
+      }
+    }
+    _ -> should.fail()
+  }
 }
 
 pub fn decode_multi_frame_concatenated_test() -> Nil {

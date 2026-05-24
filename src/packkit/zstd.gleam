@@ -8,11 +8,14 @@
 //// `packkit/internal/fse`.  Sequences with `Predefined_Mode`,
 //// `RLE_Mode`, and `FSE_Compressed_Mode` symbol descriptions all
 //// decode (LL, OF, ML independently).  Literal blocks decode for
-//// `Raw_Literals_Block`, `RLE_Literals_Block`, and the single-stream
-//// `Compressed_Literals_Block` variant; four-stream Huffman literals
-//// and `Treeless_Literals_Block` still return `CodecNotImplemented`,
-//// and `Repeat_Mode` for sequence-symbol descriptions also remains
-//// future work because it spans multiple blocks.
+//// `Raw_Literals_Block` and `RLE_Literals_Block` only; the
+//// `Compressed_Literals_Block` and `Treeless_Literals_Block`
+//// variants (Huffman-coded literals) still surface as
+//// `CodecNotImplemented`, with the diagnostic carrying the parsed
+//// regenerated_size / compressed_size / streams so users can see
+//// exactly which configuration their file uses.  `Repeat_Mode`
+//// for sequence-symbol descriptions also remains future work
+//// because it spans multiple blocks.
 
 import gleam/bit_array
 import gleam/bool
@@ -381,15 +384,221 @@ fn parse_literals_section(
       case literals_block_type {
         0 -> parse_raw_or_rle_literals(bytes, header_byte, size_format, False)
         1 -> parse_raw_or_rle_literals(bytes, header_byte, size_format, True)
-        2 ->
-          Error(error.CodecNotImplemented(
-            feature: "zstd compressed (Huffman) literals",
-          ))
-        _ -> Error(error.CodecNotImplemented(feature: "zstd treeless literals"))
+        2 -> parse_compressed_literals(bytes, header_byte, size_format, False)
+        _ -> parse_compressed_literals(bytes, header_byte, size_format, True)
       }
     }
     _ ->
       Error(error.CodecInvalidData(message: "truncated zstd literals header"))
+  }
+}
+
+/// Parsed metadata for a compressed or treeless literals block.
+type CompressedLiteralsHeader {
+  CompressedLiteralsHeader(
+    /// Number of literal bytes to materialise.
+    regenerated_size: Int,
+    /// Number of bytes after the literals section header that make
+    /// up the Huffman_Tree_Description (if any), Jump_Table (if
+    /// `streams == 4`), and per-stream compressed bitstreams.
+    compressed_size: Int,
+    /// Number of compressed Huffman bitstreams (1 or 4).
+    streams: Int,
+    /// Bytes consumed by the literals section header itself
+    /// (3, 4, or 5 depending on the size format).
+    header_bytes: Int,
+  )
+}
+
+fn parse_compressed_literals(
+  bytes: BitArray,
+  header_byte: Int,
+  size_format: Int,
+  treeless: Bool,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  use header <- result.try(parse_compressed_literals_header(
+    bytes,
+    header_byte,
+    size_format,
+  ))
+  // We surface the parsed metadata in the error message so callers
+  // can see exactly which configuration tripped the not-implemented
+  // path.  This is intentionally specific: once Huffman literal
+  // decoding ships, this branch goes away in favour of the real
+  // decoder, but until then the message is the only diagnostic
+  // available to users debugging real-world `.zst` fixtures.
+  let kind = case treeless {
+    True -> "treeless"
+    False -> "Huffman-compressed"
+  }
+  let regen = int_to_decimal(header.regenerated_size)
+  let comp = int_to_decimal(header.compressed_size)
+  let streams = int_to_decimal(header.streams)
+  Error(error.CodecNotImplemented(
+    feature: "zstd "
+    <> kind
+    <> " literals (regenerated_size="
+    <> regen
+    <> ", compressed_size="
+    <> comp
+    <> ", streams="
+    <> streams
+    <> ")",
+  ))
+}
+
+fn parse_compressed_literals_header(
+  bytes: BitArray,
+  header_byte: Int,
+  size_format: Int,
+) -> Result(CompressedLiteralsHeader, error.CodecError) {
+  case size_format {
+    0 ->
+      // 3-byte header, 1 stream, 10-bit regen and compressed sizes.
+      case bytes {
+        <<_, b1, b2, _:bytes>> -> {
+          let high_bits_of_header_byte = int.bitwise_shift_right(header_byte, 4)
+          let regenerated_size =
+            int.bitwise_or(
+              high_bits_of_header_byte,
+              int.bitwise_shift_left(int.bitwise_and(b1, 0x3F), 4),
+            )
+          let compressed_size =
+            int.bitwise_or(
+              int.bitwise_shift_right(b1, 6),
+              int.bitwise_shift_left(b2, 2),
+            )
+          Ok(CompressedLiteralsHeader(
+            regenerated_size: regenerated_size,
+            compressed_size: compressed_size,
+            streams: 1,
+            header_bytes: 3,
+          ))
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd compressed-literals 3-byte header",
+          ))
+      }
+    1 ->
+      // 3-byte header, 4 streams, 10-bit regen and compressed sizes.
+      case bytes {
+        <<_, b1, b2, _:bytes>> -> {
+          let high_bits_of_header_byte = int.bitwise_shift_right(header_byte, 4)
+          let regenerated_size =
+            int.bitwise_or(
+              high_bits_of_header_byte,
+              int.bitwise_shift_left(int.bitwise_and(b1, 0x3F), 4),
+            )
+          let compressed_size =
+            int.bitwise_or(
+              int.bitwise_shift_right(b1, 6),
+              int.bitwise_shift_left(b2, 2),
+            )
+          Ok(CompressedLiteralsHeader(
+            regenerated_size: regenerated_size,
+            compressed_size: compressed_size,
+            streams: 4,
+            header_bytes: 3,
+          ))
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd compressed-literals 3-byte header",
+          ))
+      }
+    2 ->
+      // 4-byte header, 4 streams, 14-bit regen and compressed sizes.
+      case bytes {
+        <<_, b1, b2, b3, _:bytes>> -> {
+          let high_bits_of_header_byte = int.bitwise_shift_right(header_byte, 4)
+          let regenerated_size =
+            int.bitwise_or(
+              high_bits_of_header_byte,
+              int.bitwise_or(
+                int.bitwise_shift_left(b1, 4),
+                int.bitwise_shift_left(int.bitwise_and(b2, 0x3), 12),
+              ),
+            )
+          let compressed_size =
+            int.bitwise_or(
+              int.bitwise_shift_right(b2, 2),
+              int.bitwise_shift_left(b3, 6),
+            )
+          Ok(CompressedLiteralsHeader(
+            regenerated_size: regenerated_size,
+            compressed_size: compressed_size,
+            streams: 4,
+            header_bytes: 4,
+          ))
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd compressed-literals 4-byte header",
+          ))
+      }
+    _ ->
+      // size_format = 3: 5-byte header, 4 streams, 18-bit fields.
+      case bytes {
+        <<_, b1, b2, b3, b4, _:bytes>> -> {
+          let high_bits_of_header_byte = int.bitwise_shift_right(header_byte, 4)
+          let regenerated_size =
+            int.bitwise_or(
+              high_bits_of_header_byte,
+              int.bitwise_or(
+                int.bitwise_shift_left(b1, 4),
+                int.bitwise_shift_left(int.bitwise_and(b2, 0x3F), 12),
+              ),
+            )
+          let compressed_size =
+            int.bitwise_or(
+              int.bitwise_shift_right(b2, 6),
+              int.bitwise_or(
+                int.bitwise_shift_left(b3, 2),
+                int.bitwise_shift_left(b4, 10),
+              ),
+            )
+          Ok(CompressedLiteralsHeader(
+            regenerated_size: regenerated_size,
+            compressed_size: compressed_size,
+            streams: 4,
+            header_bytes: 5,
+          ))
+        }
+        _ ->
+          Error(error.CodecInvalidData(
+            message: "truncated zstd compressed-literals 5-byte header",
+          ))
+      }
+  }
+}
+
+fn int_to_decimal(value: Int) -> String {
+  case value {
+    0 -> "0"
+    _ -> int_to_decimal_loop(value, "")
+  }
+}
+
+fn int_to_decimal_loop(value: Int, acc: String) -> String {
+  case value {
+    0 -> acc
+    _ -> {
+      let digit = value - { value / 10 } * 10
+      let ch = case digit {
+        0 -> "0"
+        1 -> "1"
+        2 -> "2"
+        3 -> "3"
+        4 -> "4"
+        5 -> "5"
+        6 -> "6"
+        7 -> "7"
+        8 -> "8"
+        _ -> "9"
+      }
+      int_to_decimal_loop(value / 10, ch <> acc)
+    }
   }
 }
 
