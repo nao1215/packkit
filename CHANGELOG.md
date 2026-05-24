@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Extended the ZIP decoder to dispatch on three more
+  compression methods: 12 (bzip2), 93 (zstd), and 95 (xz).  Each
+  method routes through the corresponding packkit codec's
+  `decode_with_limits`, so archives produced by `7z a -tzip` or
+  `zip --compression-method bzip2 / xz / zstd` round-trip
+  without a manual unwrap step.  ZIP method 14 (PKWARE LZMA)
+  still requires its specific 4-byte stream wrapper and is left
+  as `ArchiveNotImplemented("ZIP method 14")` for now.
 - Added decoder support for the LZ4 legacy frame format
   (magic `0x184C2102` — emitted by older `lz4 -l` / `lz4c` and
   embedded toolchains).  The legacy format has no frame

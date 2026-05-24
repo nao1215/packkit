@@ -4,10 +4,14 @@ import gleam/option
 import gleam/string
 import gleeunit/should
 import packkit/archive
+import packkit/bzip2
+import packkit/checksum
 import packkit/entry
 import packkit/error
 import packkit/level
+import packkit/xz
 import packkit/zip
+import packkit/zstd
 
 pub fn roundtrip_single_file_test() -> Nil {
   let original =
@@ -224,4 +228,79 @@ fn archive_add_directory(
 ) -> archive.Archive {
   let assert Ok(dir_entry) = entry.directory_checked(path: path)
   archive.add(archive_value, entry: dir_entry)
+}
+
+pub fn decodes_zstd_compressed_entry_test() -> Nil {
+  // Hand-craft a ZIP archive whose single entry uses ZIP method 93
+  // (zstd).  Wrap a zstd-encoded body in the standard PKZIP
+  // local-file + central-directory + EOCD layout and prove the
+  // decoder dispatches through `zstd.decode_with_limits`.
+  let payload = <<"zstd-inside-zip":utf8>>
+  let assert Ok(compressed) = zstd.encode(bytes: payload)
+  zip_method_round_trip(method: 93, payload: payload, body: compressed)
+}
+
+pub fn decodes_bzip2_compressed_entry_test() -> Nil {
+  let payload = <<"bzip2-inside-zip":utf8>>
+  let assert Ok(compressed) = bzip2.encode(bytes: payload)
+  zip_method_round_trip(method: 12, payload: payload, body: compressed)
+}
+
+pub fn decodes_xz_compressed_entry_test() -> Nil {
+  let payload = <<"xz-inside-zip":utf8>>
+  let assert Ok(compressed) = xz.encode(bytes: payload)
+  zip_method_round_trip(method: 95, payload: payload, body: compressed)
+}
+
+fn zip_method_round_trip(
+  method method: Int,
+  payload payload: BitArray,
+  body body: BitArray,
+) -> Nil {
+  let crc = checksum.crc32(data: payload)
+  let comp_size = bit_array.byte_size(body)
+  let uncomp_size = bit_array.byte_size(payload)
+
+  let local_header = <<
+    0x50, 0x4B, 0x03, 0x04,
+    // version needed (20)
+    20, 0x00,
+    // gp flag
+    0x00, 0x00,
+    // method (LE 16)
+    method:size(16)-little,
+    // mod time / date
+    0x21, 0x00, 0x21, 0x00, crc:size(32)-little, comp_size:size(32)-little,
+    uncomp_size:size(32)-little,
+    // name length
+    5, 0x00,
+    // extra length
+    0x00, 0x00, "z.dat":utf8,
+  >>
+  let entry_bytes = bit_array.concat([local_header, body])
+  let local_size = bit_array.byte_size(entry_bytes)
+
+  let central = <<
+    0x50, 0x4B, 0x01, 0x02,
+    // version made by + needed
+    20, 0x03, 20, 0x00, 0x00, 0x00, method:size(16)-little, 0x21, 0x00, 0x21,
+    0x00, crc:size(32)-little, comp_size:size(32)-little,
+    uncomp_size:size(32)-little, 5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xA4, 0x81, 0x00, 0x00, 0x00, 0x00, "z.dat":utf8,
+  >>
+  let central_size = bit_array.byte_size(central)
+
+  let eocd = <<
+    0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 1, 0x00, 1, 0x00,
+    central_size:size(32)-little, local_size:size(32)-little, 0x00, 0x00,
+  >>
+  let stream = bit_array.concat([entry_bytes, central, eocd])
+  let assert Ok(arch) = zip.decode(bytes: stream)
+  case archive.entries(arch) {
+    [e] -> {
+      entry.body(e) |> should.equal(payload)
+      entry.to_string(entry.path(e)) |> should.equal("z.dat")
+    }
+    _ -> should.fail()
+  }
 }

@@ -32,7 +32,9 @@ Implemented codecs and archive families:
   plus Zip64 extensions (EOCD locator/record + per-entry header_id
   0x0001 extra field) so archives with > 65535 entries, > 4 GiB
   central directories, or > 4 GiB entries / offsets round-trip
-  through any conforming Zip64 reader
+  through any conforming Zip64 reader.  The decoder additionally
+  reads methods 12 (bzip2), 93 (zstd), and 95 (xz) by dispatching
+  to the corresponding packkit codec
 - **7z**: single-folder LZMA / LZMA2 reader (covers the common
   `7z a` single-file case)
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);

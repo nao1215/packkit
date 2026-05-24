@@ -35,6 +35,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import packkit/archive as archives
+import packkit/bzip2
 import packkit/checksum
 import packkit/codec as codecs
 import packkit/deflate
@@ -42,6 +43,8 @@ import packkit/entry
 import packkit/error
 import packkit/level
 import packkit/limit
+import packkit/xz
+import packkit/zstd
 
 const local_file_signature: Int = 0x04034b50
 
@@ -58,6 +61,25 @@ const zip64_extra_id: Int = 0x0001
 const method_store: Int = 0
 
 const method_deflate: Int = 8
+
+const method_bzip2: Int = 12
+
+// ZIP method 14 (LZMA) would use the PKWARE LZMA stream wrapper —
+// not the same as standalone `.lzma` or `.xz` — and we don't
+// have a raw-LZMA1 decoder yet, so it intentionally falls into
+// the generic "ZIP method N" not-implemented path.
+
+const method_zstd: Int = 93
+
+const method_xz: Int = 95
+
+fn is_supported_method(method: Int) -> Bool {
+  method == method_store
+  || method == method_deflate
+  || method == method_bzip2
+  || method == method_zstd
+  || method == method_xz
+}
 
 /// `version_needed` value emitted in any entry that carries a Zip64
 /// extra field.  PKZIP requires v4.5 (encoded as `45`) for Zip64.
@@ -871,7 +893,7 @@ fn parse_central_directory(
       )
 
       use <- bool.guard(
-        when: method != method_store && method != method_deflate,
+        when: !is_supported_method(method),
         return: Error(error.ArchiveNotImplemented(
           feature: "ZIP method " <> int.to_string(method),
         )),
@@ -950,7 +972,7 @@ fn read_local_entry(
 
   use method <- result.try(read_le16_at(full, local_offset + 8))
   use <- bool.guard(
-    when: method != method_store && method != method_deflate,
+    when: !is_supported_method(method),
     return: Error(error.ArchiveNotImplemented(
       feature: "ZIP method " <> int.to_string(method),
     )),
@@ -994,11 +1016,30 @@ fn read_local_entry(
 
   use body <- result.try(case method {
     m if m == method_store -> slice_or_error(full, data_offset, uncomp_size)
-    _ -> {
+    m if m == method_deflate -> {
       use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
       deflate.decode_with_limits(bytes: compressed, limits: limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
+    m if m == method_bzip2 -> {
+      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      bzip2.decode_with_limits(bytes: compressed, limits: limits)
+      |> result.map_error(codec_to_archive_error(_, name))
+    }
+    m if m == method_zstd -> {
+      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      zstd.decode_with_limits(bytes: compressed, limits: limits)
+      |> result.map_error(codec_to_archive_error(_, name))
+    }
+    m if m == method_xz -> {
+      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      xz.decode_with_limits(bytes: compressed, limits: limits)
+      |> result.map_error(codec_to_archive_error(_, name))
+    }
+    other ->
+      Error(error.ArchiveNotImplemented(
+        feature: "ZIP method " <> int.to_string(other),
+      ))
   })
 
   use <- bool.guard(
