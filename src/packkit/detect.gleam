@@ -156,10 +156,10 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
     <<0x04, 0x22, 0x4D, 0x18, _:bytes>> ->
       Ok(detected_codec(codec.lz4(), extension: "lz4"))
     // LZ4 legacy frame format (magic 0x184C2102, little-endian) is
-    // emitted by older `lz4 -l` / `lz4c` tools.  Our decoder does
-    // not yet read it but detection still routes the byte stream
-    // to the lz4 codec so callers get a typed
-    // `CodecNotImplemented` rather than a `DetectUnknownFormat`.
+    // emitted by older `lz4 -l` / `lz4c` tools.  The packkit lz4
+    // codec recognises this magic and decodes through
+    // `decode_legacy_blocks`, so detection routes the byte stream
+    // straight to a working decoder.
     <<0x02, 0x21, 0x4C, 0x18, _:bytes>> ->
       Ok(detected_codec(codec.lz4(), extension: "lz4"))
     // Snappy framed stream identifier chunk:
