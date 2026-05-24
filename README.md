@@ -38,7 +38,8 @@ Implemented codecs and archive families:
   block writers, plus a stored-only entry (`deflate.encode_stored_only`)
 - **zlib**: RFC 1950 wrapper with Adler-32 trailer
 - **gzip**: RFC 1952 wrapper with header metadata and CRC/ISIZE
-  verification
+  verification, plus multi-member stream decoding (concatenated
+  gzip files such as `cat a.gz b.gz`)
 - **lz4**: frame decoder + LZ77 block encoder (greedy 4-byte hash-
   chain match-finder with uncompressed-block fallback)
 - **snappy**: raw-block and framed codec with LZ77 block compressor

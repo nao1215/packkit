@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added multi-member gzip decoding (RFC 1952 §2.2).  A gzip byte
+  stream built by concatenating two or more single-member streams
+  (the typical `cat a.gz b.gz` pattern) now decodes to the
+  concatenated payloads instead of stopping at the first
+  member's trailer.  Supporting this required a new
+  `deflate.decode_with_remainder` API that returns both the
+  decoded bytes AND the byte-aligned remainder of the input, so
+  wrappers like gzip can know exactly where the embedded DEFLATE
+  stream ends.
 - Added Zip64 support to the ZIP encoder and decoder.  The decoder
   recognises the Zip64 EOCD locator (signature `0x07064b50`) when
   the standard EOCD carries the `0xFFFF` / `0xFFFFFFFF` sentinels,

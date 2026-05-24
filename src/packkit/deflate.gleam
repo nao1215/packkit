@@ -71,6 +71,62 @@ pub fn decode_with_limits(
   }
 }
 
+/// Decode a DEFLATE stream AND return the byte slice that follows the
+/// last block in the input.  Useful for wrappers like gzip that need
+/// to know exactly where the deflate stream ends so they can read a
+/// trailer immediately after it (and, for multi-member streams, the
+/// next member that comes after the trailer).
+///
+/// The remainder is byte-aligned: any partial bits left in the
+/// deflate decoder's buffer after the last block are discarded as
+/// inter-block padding per RFC 1952 §2.2.
+pub fn decode_with_remainder(
+  bytes bytes: BitArray,
+  limits limits: limit.Limits,
+) -> Result(#(BitArray, BitArray), error.CodecError) {
+  use <- bool.guard(
+    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
+    return: Error(error.CodecLimitExceeded(
+      limit: "max_input_bytes",
+      actual: bit_array.byte_size(bytes),
+    )),
+  )
+
+  let reader = Reader(buffer: 0, bits: 0, source: bytes, overflow: False)
+  use #(output, final_reader) <- result.try(inflate(reader, <<>>, limits))
+  // The decoder's bit reader pre-fetches whole bytes from `source`
+  // into `buffer` one byte at a time.  After the final block,
+  // `final_reader.bits` is the number of bits sitting in `buffer`
+  // that were pulled but never consumed; everything in `source` is
+  // strictly future input.  We need to recover the byte-aligned
+  // remainder, so put back any whole bytes still buffered (the high
+  // `bits / 8` bytes of `buffer`) and discard the partial-byte tail.
+  let remainder = recover_remaining_bytes(final_reader)
+  Ok(#(output, remainder))
+}
+
+fn recover_remaining_bytes(reader: Reader) -> BitArray {
+  let whole_bytes = reader.bits / 8
+  // The remaining bits inside the current byte are inter-block
+  // padding; drop them so the next byte-aligned read starts on the
+  // right boundary.
+  let partial = reader.bits - whole_bytes * 8
+  let buffer_after_partial = int.bitwise_shift_right(reader.buffer, partial)
+  let prefix = bytes_from_low_int(buffer_after_partial, whole_bytes, <<>>)
+  bit_array.concat([prefix, reader.source])
+}
+
+fn bytes_from_low_int(value: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ ->
+      bytes_from_low_int(int.bitwise_shift_right(value, 8), count - 1, <<
+        acc:bits,
+        int.bitwise_and(value, 0xFF),
+      >>)
+  }
+}
+
 /// Encode a byte stream as a fixed-Huffman DEFLATE block.
 ///
 /// The encoder uses a greedy LZ77 match-finder with a 3-byte hash

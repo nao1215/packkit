@@ -270,6 +270,12 @@ pub fn decode_payload_with_limits(
 }
 
 /// Decode a gzip byte stream using explicit limits.
+///
+/// Handles multi-member streams (RFC 1952 §2.2 — concatenated gzip
+/// files such as those produced by `cat a.gz b.gz`).  The returned
+/// `Decoded` carries the header from the FIRST member and the
+/// concatenated payload of every member that decoded successfully;
+/// no other gzip API exposes per-member headers yet.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
@@ -282,6 +288,50 @@ pub fn decode_with_limits(
     )),
   )
 
+  decode_first_member_and_continue(bytes, limits)
+}
+
+fn decode_first_member_and_continue(
+  bytes: BitArray,
+  limits: limit.Limits,
+) -> Result(Decoded, error.CodecError) {
+  use #(decoded, rest) <- result.try(decode_one_member(bytes, limits))
+  case bit_array.byte_size(rest) {
+    0 -> Ok(decoded)
+    _ -> {
+      use additional <- result.try(decode_remaining_members(rest, <<>>, limits))
+      Ok(
+        Decoded(
+          ..decoded,
+          payload: bit_array.concat([decoded.payload, additional]),
+        ),
+      )
+    }
+  }
+}
+
+fn decode_remaining_members(
+  bytes: BitArray,
+  acc: BitArray,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
+  case bit_array.byte_size(bytes) {
+    0 -> Ok(acc)
+    _ -> {
+      use #(decoded, rest) <- result.try(decode_one_member(bytes, limits))
+      decode_remaining_members(
+        rest,
+        bit_array.concat([acc, decoded.payload]),
+        limits,
+      )
+    }
+  }
+}
+
+fn decode_one_member(
+  bytes: BitArray,
+  limits: limit.Limits,
+) -> Result(#(Decoded, BitArray), error.CodecError) {
   case bytes {
     <<m1, m2, cm, flg, mtime:size(32)-little, _xfl, _os, rest:bytes>> -> {
       use <- bool.guard(
@@ -299,18 +349,18 @@ pub fn decode_with_limits(
         0 -> default_header()
         n -> Header(..default_header(), modified_at_unix: Some(n))
       }
-      decode_header(rest, flg, initial, limits)
+      decode_header_and_payload(rest, flg, initial, limits)
     }
     _ -> Error(error.CodecInvalidData(message: "gzip header truncated"))
   }
 }
 
-fn decode_header(
+fn decode_header_and_payload(
   bytes: BitArray,
   flg: Int,
   acc: Header,
   limits: limit.Limits,
-) -> Result(Decoded, error.CodecError) {
+) -> Result(#(Decoded, BitArray), error.CodecError) {
   use #(bytes, _) <- result.try(maybe_skip_extra(bytes, flg))
   use #(bytes, name_value) <- result.try(maybe_read_string(
     bytes,
@@ -331,35 +381,31 @@ fn decode_header(
 
   let _ = int.bitwise_and(flg, ftext_flag)
 
-  let total_size = bit_array.byte_size(bytes)
-  use <- bool.guard(
-    when: total_size < 8,
-    return: Error(error.CodecInvalidData(message: "gzip trailer truncated")),
-  )
-
-  let deflate_size = total_size - 8
-  let assert Ok(deflate_bits) = bit_array.slice(bytes, 0, deflate_size)
-  let assert Ok(trailer_bits) = bit_array.slice(bytes, deflate_size, 8)
-  let assert <<expected_crc:size(32)-little, expected_isize:size(32)-little>> =
-    trailer_bits
-
-  use plain <- result.try(deflate.decode_with_limits(
-    bytes: deflate_bits,
+  // Decode the deflate stream and learn exactly where it ends so the
+  // 8-byte CRC/ISIZE trailer can be read at the right offset and the
+  // remainder (if any) can be handed off to the next gzip member.
+  use #(plain, after_deflate) <- result.try(deflate.decode_with_remainder(
+    bytes: bytes,
     limits: limits,
   ))
 
-  use <- bool.guard(
-    when: checksum.crc32(plain) != expected_crc,
-    return: Error(error.CodecInvalidData(message: "gzip CRC-32 mismatch")),
-  )
+  case after_deflate {
+    <<expected_crc:size(32)-little, expected_isize:size(32)-little, rest:bytes>> -> {
+      use <- bool.guard(
+        when: checksum.crc32(plain) != expected_crc,
+        return: Error(error.CodecInvalidData(message: "gzip CRC-32 mismatch")),
+      )
 
-  let isize = int.bitwise_and(bit_array.byte_size(plain), 0xFFFFFFFF)
-  use <- bool.guard(
-    when: isize != expected_isize,
-    return: Error(error.CodecInvalidData(message: "gzip ISIZE mismatch")),
-  )
+      let isize = int.bitwise_and(bit_array.byte_size(plain), 0xFFFFFFFF)
+      use <- bool.guard(
+        when: isize != expected_isize,
+        return: Error(error.CodecInvalidData(message: "gzip ISIZE mismatch")),
+      )
 
-  Ok(Decoded(header: header, payload: plain))
+      Ok(#(Decoded(header: header, payload: plain), rest))
+    }
+    _ -> Error(error.CodecInvalidData(message: "gzip trailer truncated"))
+  }
 }
 
 fn apply_optional_name(header: Header, value: Option(String)) -> Header {

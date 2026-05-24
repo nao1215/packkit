@@ -154,3 +154,30 @@ pub fn streaming_decoder_round_trips_test() -> Nil {
   chunk
   |> should.equal(payload)
 }
+
+pub fn decode_multi_member_concatenated_test() -> Nil {
+  // RFC 1952 §2.2 explicitly allows a gzip stream to consist of
+  // multiple concatenated members (e.g. `cat a.gz b.gz > c.gz`).
+  // The decoder must concatenate the per-member payloads.
+  let assert Ok(member_a) =
+    gzip.encode(bytes: <<"alpha-":utf8>>, header: gzip.default_header())
+  let assert Ok(member_b) =
+    gzip.encode(bytes: <<"bravo-":utf8>>, header: gzip.default_header())
+  let assert Ok(member_c) =
+    gzip.encode(bytes: <<"charlie":utf8>>, header: gzip.default_header())
+  let combined = bit_array.concat([member_a, member_b, member_c])
+  let assert Ok(decoded) = gzip.decode(bytes: combined)
+  decoded.payload
+  |> should.equal(<<"alpha-bravo-charlie":utf8>>)
+}
+
+pub fn decode_multi_member_via_payload_helper_test() -> Nil {
+  let assert Ok(member_a) =
+    gzip.encode(bytes: <<"x":utf8>>, header: gzip.default_header())
+  let assert Ok(member_b) =
+    gzip.encode(bytes: <<"y":utf8>>, header: gzip.default_header())
+  let assert Ok(plain) =
+    gzip.decode_payload(bytes: bit_array.concat([member_a, member_b]))
+  plain
+  |> should.equal(<<"xy":utf8>>)
+}
