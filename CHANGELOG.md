@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added `lz4.encode_with_content_size` and a small pure-Gleam
+  `internal/xxh32` module that computes the LZ4 frame header
+  checksum byte.  The new encoder sets the FLG content-size flag
+  (0x08), writes the 8-byte little-endian uncompressed size, and
+  derives the HC byte as `(XXH32(FLG..BD..CSIZE, 0) >> 8) & 0xFF`
+  so strict LZ4 decoders (the reference `lz4` CLI in particular)
+  accept the frame and can pre-allocate the output buffer.  The
+  pre-existing `lz4.encode` keeps its no-content-size, fixed-HC
+  output unchanged so round trips with itself are bit-for-bit
+  identical to previous releases.
 - Extended the `ar` decoder with the GNU long-name string-table
   variant.  In addition to the BSD `#1/N` form the decoder already
   supported, the new path recognises the `//` (`ARFILENAMES/`)

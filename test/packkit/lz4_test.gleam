@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/int
 import gleeunit/should
 import packkit/lz4
 
@@ -96,6 +97,47 @@ pub fn roundtrip_random_short_test() -> Nil {
   let assert Ok(restored) = lz4.decode(bytes: frame)
   restored
   |> should.equal(payload)
+}
+
+pub fn encoder_with_content_size_sets_flag_and_field_test() -> Nil {
+  // `encode_with_content_size` must set the FLG content-size bit
+  // (0x08) and emit the 8-byte little-endian uncompressed size in
+  // the frame descriptor.  The HC byte that follows is the
+  // (XXH32 >> 8) of FLG..BD..CSIZE rather than the canned 0x73
+  // from the no-flags encoder.
+  let payload = <<"hello":utf8>>
+  let assert Ok(frame) = lz4.encode_with_content_size(bytes: payload)
+
+  // Frame magic is at offset 0..4, FLG at offset 4, content size
+  // begins at offset 6, HC byte at offset 14.
+  let assert <<
+    _magic:size(32)-little,
+    flg,
+    _bd,
+    csize:size(64)-little,
+    _hc,
+    _rest:bytes,
+  >> = frame
+
+  // FLG must have version v1 and content_size flag set.
+  case int.bitwise_and(flg, 0x08) {
+    0 -> should.fail()
+    _ -> Nil
+  }
+  csize
+  |> should.equal(5)
+
+  // Round trip must agree with the original payload.
+  let assert Ok(restored) = lz4.decode(bytes: frame)
+  restored
+  |> should.equal(payload)
+}
+
+pub fn encoder_with_content_size_zero_payload_test() -> Nil {
+  let assert Ok(frame) = lz4.encode_with_content_size(bytes: <<>>)
+  let assert Ok(restored) = lz4.decode(bytes: frame)
+  restored
+  |> should.equal(<<>>)
 }
 
 fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {

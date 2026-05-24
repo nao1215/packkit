@@ -17,6 +17,7 @@ import gleam/list
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
+import packkit/internal/xxh32
 import packkit/limit
 
 const magic: Int = 0x184D2204
@@ -44,9 +45,45 @@ pub fn codec() -> codecs.Codec {
   codecs.lz4()
 }
 
-/// Encode `bytes` as an LZ4 frame using uncompressed blocks.
+/// Encode `bytes` as an LZ4 frame.  The frame descriptor uses
+/// independent blocks, the v1 frame version, and a 4 MiB block
+/// maximum; no content size, block checksum, content checksum, or
+/// dictionary id is written.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  let header = <<magic:size(32)-little, 0x60, 0x70, 0x73>>
+  encode_internal(bytes, content_size_present: False)
+}
+
+/// Encode `bytes` as an LZ4 frame and store the uncompressed
+/// content size in the frame descriptor.  Strict LZ4 decoders use
+/// the value to pre-allocate the output buffer and reject any
+/// frame whose payload disagrees with the declared length; our own
+/// decoder simply skips the field today, so encoding it does not
+/// change `encode -> decode` round trips.
+pub fn encode_with_content_size(
+  bytes bytes: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  encode_internal(bytes, content_size_present: True)
+}
+
+fn encode_internal(
+  bytes: BitArray,
+  content_size_present content_size_present: Bool,
+) -> Result(BitArray, error.CodecError) {
+  let flg = case content_size_present {
+    True -> 0x60 + flg_content_size
+    False -> 0x60
+  }
+  let bd = 0x70
+  let descriptor = case content_size_present {
+    True -> <<flg, bd, bit_array.byte_size(bytes):size(64)-little>>
+    False -> <<flg, bd>>
+  }
+  let hc =
+    int.bitwise_and(
+      int.bitwise_shift_right(xxh32.digest(bytes: descriptor, seed: 0), 8),
+      0xFF,
+    )
+  let header = bit_array.concat([<<magic:size(32)-little>>, descriptor, <<hc>>])
   let blocks = encode_blocks(bytes, [])
   let end_mark = <<0:size(32)-little>>
   Ok(bit_array.concat([header, blocks, end_mark]))

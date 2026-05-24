@@ -44,7 +44,11 @@ Implemented codecs and archive families:
   verification, plus multi-member stream decoding (concatenated
   gzip files such as `cat a.gz b.gz`)
 - **lz4**: frame decoder + LZ77 block encoder (greedy 4-byte hash-
-  chain match-finder with uncompressed-block fallback)
+  chain match-finder with uncompressed-block fallback).
+  `lz4.encode_with_content_size` additionally stores the
+  uncompressed content size in the frame descriptor so strict
+  decoders (the reference `lz4` CLI, for instance) can pre-allocate
+  the output buffer and verify the declared length
 - **snappy**: raw-block and framed codec with LZ77 block compressor
   (greedy 4-byte hash-chain match-finder, literal + copy-1 / copy-2
   / copy-4 sequence emission)
