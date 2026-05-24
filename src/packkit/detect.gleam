@@ -57,6 +57,9 @@ fn filename_rules() -> List(#(List(String), fn() -> Detected)) {
     #([".tar.br"], fn() {
       detected_recipe(recipe.tar_brotli(), extension: "tar.br")
     }),
+    #([".tar.z", ".taz"], fn() {
+      detected_recipe(recipe.tar_lzw(), extension: "tar.Z")
+    }),
     #([".cpio.gz"], fn() {
       detected_recipe(recipe.cpio_gzip(), extension: "cpio.gz")
     }),

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added `recipe.tar_lzw` plus the `.tar.Z` / `.taz`
+  filename detection.  The lzw codec was already available
+  on its own but the tar recipe was missing.
 - Added `recipe.cpio_bzip2`, `recipe.cpio_xz`, and
   `recipe.cpio_zstd`, plus matching filename detection for
   `.cpio.bz2`, `.cpio.xz`, and `.cpio.zst`.  The cpio container
