@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Extended `detect.from_bytes` with two more signatures.  Zstd
+  skippable frames (magic range `0x184D2A50`..`0x184D2A5F`,
+  used by wrappers that embed metadata between real zstd frames)
+  now resolve to the zstd codec, and the snappy framed format's
+  stream-identifier chunk (`FF 06 00 00 "sNaPpY"`) is recognised
+  as snappy.  Both signatures are matched strictly so they cannot
+  false-positive on arbitrary byte streams.
 - Made the multi-member / multi-stream / multi-frame loops in
   `gzip`, `bzip2`, `xz`, and `zstd` enforce `max_output_bytes`
   across the full byte stream rather than per member.  Each

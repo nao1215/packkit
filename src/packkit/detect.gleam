@@ -112,6 +112,13 @@ fn find_filename_match(
 /// * bzip2 (`BZh`) additionally requires the block-size byte to be
 ///   an ASCII digit `1`..`9`.
 /// * lz4 (`04 22 4D 18`) and `.Z` (`1F 9D`) keep their fixed magic.
+/// * zstd skippable frames (magic `184D2A50`..`184D2A5F`) are
+///   recognised as zstd so wrappers that embed user metadata in
+///   skippable frames at the start of the stream do not fail to
+///   detect.
+/// * snappy framed format starts with a stream identifier chunk
+///   (`FF 06 00 00 sNaPpY`); the raw snappy block format has no
+///   magic so it can only be detected from filename.
 ///
 /// Looser signatures like a bare `0x78 _` would false-positive on
 /// any byte stream whose first byte happens to be `0x78`.
@@ -129,8 +136,17 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
       Ok(detected_codec(codec.xz(), extension: "xz"))
     <<0x28, 0xB5, 0x2F, 0xFD, _:bytes>> ->
       Ok(detected_codec(codec.zstd(), extension: "zst"))
+    // zstd skippable frame magic: 0x184D2A50..0x184D2A5F (little-endian).
+    // The low nibble of the first byte varies (0..F); the high nibble
+    // is always 5 and bytes 1..3 are fixed.
+    <<low, 0x2A, 0x4D, 0x18, _:bytes>> if low >= 0x50 && low <= 0x5F ->
+      Ok(detected_codec(codec.zstd(), extension: "zst"))
     <<0x04, 0x22, 0x4D, 0x18, _:bytes>> ->
       Ok(detected_codec(codec.lz4(), extension: "lz4"))
+    // Snappy framed stream identifier chunk:
+    //   chunk_type 0xFF, chunk_length 6 (LE 24-bit), body "sNaPpY".
+    <<0xFF, 0x06, 0x00, 0x00, "sNaPpY":utf8, _:bytes>> ->
+      Ok(detected_codec(codec.snappy(), extension: "snappy"))
     <<0x42, 0x5A, 0x68, lvl, _:bytes>> if lvl >= 0x31 && lvl <= 0x39 ->
       Ok(detected_codec(codec.bzip2(), extension: "bz2"))
     <<0x1F, 0x9D, _:bytes>> -> Ok(detected_codec(codec.lzw(), extension: "Z"))

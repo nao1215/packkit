@@ -87,3 +87,33 @@ pub fn from_filename_archive_only_has_no_outer_codec_test() -> Nil {
   detect.codec(info)
   |> should.equal(None)
 }
+
+pub fn from_bytes_zstd_skippable_frame_test() -> Nil {
+  // zstd skippable frames carry user metadata between real zstd
+  // frames; many wrappers (zfs, archive containers) embed them at
+  // the very start of a stream.  The detector must recognise the
+  // 0x184D2A5_ magic range so those streams still resolve to zstd.
+  let lowest = <<0x50, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00>>
+  let highest = <<0x5F, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00>>
+  // 0x4F is one below the range, must not match.
+  let below_range = <<0x4F, 0x2A, 0x4D, 0x18, 0x00, 0x00, 0x00, 0x00>>
+  let assert Ok(low_info) = detect.from_bytes(lowest)
+  low_info |> detect.codec |> should.equal(Some(codec.zstd()))
+  let assert Ok(high_info) = detect.from_bytes(highest)
+  high_info |> detect.codec |> should.equal(Some(codec.zstd()))
+  case detect.from_bytes(below_range) {
+    Error(error.DetectUnknownFormat(_)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn from_bytes_snappy_framed_stream_identifier_test() -> Nil {
+  // Snappy framed streams start with chunk_type=0xFF (stream
+  // identifier), chunk_length=6 (LE 24-bit), body="sNaPpY".
+  let real_snappy = <<
+    0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59, 0x00,
+  >>
+  let assert Ok(info) = detect.from_bytes(real_snappy)
+  detect.codec(info)
+  |> should.equal(Some(codec.snappy()))
+}
