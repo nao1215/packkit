@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Added Zip64 support to the ZIP encoder and decoder.  The decoder
+  recognises the Zip64 EOCD locator (signature `0x07064b50`) when
+  the standard EOCD carries the `0xFFFF` / `0xFFFFFFFF` sentinels,
+  reads the 64-bit totals from the Zip64 EOCD record (signature
+  `0x06064b50`), and walks each entry's extra-field block for the
+  `header_id = 0x0001` Zip64 extended-information record to pick up
+  64-bit `uncompressed_size`, `compressed_size`, and
+  `local_header_offset` values.  The encoder mirrors the decoder:
+  any entry whose size or local-header offset would overflow 32
+  bits transparently emits the sentinel in the legacy slot plus the
+  Zip64 extra field, and archives whose total entry count or
+  central-directory region overflow the legacy EOCD slots emit a
+  Zip64 EOCD record + locator before the standard EOCD.  Switched
+  the encoder's per-entry walk from explicit tail recursion to
+  `list.fold` so 65 537-entry archives no longer blow the
+  JavaScript engine's call stack.
 - Replaced the Snappy raw encoder's literal-only path with a real
   LZ77 block compressor.  The match-finder mirrors LZ4 (greedy
   4-byte hash table, 16-bit hash) but emits the Snappy block format:

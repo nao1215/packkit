@@ -1,10 +1,31 @@
 //// ZIP archive encoder and decoder.
 ////
 //// This module implements the PKZIP local-file-header / central
-//// directory layout for the "stored" (uncompressed) method.  ZIP is
-//// modelled as an archive family, not a recipe: per-entry compression
-//// is selected through `Method` values rather than through
-//// `packkit/recipe`.
+//// directory layout for the "stored" (uncompressed) and "deflate"
+//// methods, plus the Zip64 extensions (APPNOTE.TXT §4.4) needed to
+//// carry archives with > 65535 entries, central-directory regions
+//// > 4 GiB, individual entries > 4 GiB, or local-header offsets
+//// > 4 GiB.  ZIP is modelled as an archive family, not a recipe:
+//// per-entry compression is selected through `Method` values rather
+//// than through `packkit/recipe`.
+////
+//// On the decoder side: when the standard EOCD record has any
+//// sentinel field (`0xFFFF` for the 16-bit slots, `0xFFFFFFFF` for
+//// the 32-bit slots), the decoder follows the Zip64 EOCD locator at
+//// `eocd_offset - 20` to the Zip64 EOCD record and reads the real
+//// 64-bit values from there.  Per-entry Zip64 extra fields
+//// (`header_id = 0x0001`) are parsed in both the central-directory
+//// entry and the local file header so that compressed / uncompressed
+//// sizes and local-header offsets above the 4 GiB boundary decode
+//// correctly.
+////
+//// On the encoder side: each entry transparently switches to the
+//// Zip64 extra field when any of its `uncompressed_size`,
+//// `compressed_size`, or `local_header_offset` would not fit in 32
+//// bits.  Archives whose total entry count or central-directory
+//// region overflow the legacy 16-/32-bit EOCD slots also emit a
+//// Zip64 EOCD record + locator so the resulting bytes round-trip
+//// through any conforming Zip64 reader.
 
 import gleam/bit_array
 import gleam/bool
@@ -28,9 +49,19 @@ const central_directory_signature: Int = 0x02014b50
 
 const eocd_signature: Int = 0x06054b50
 
+const zip64_eocd_locator_signature: Int = 0x07064b50
+
+const zip64_eocd_signature: Int = 0x06064b50
+
+const zip64_extra_id: Int = 0x0001
+
 const method_store: Int = 0
 
 const method_deflate: Int = 8
+
+/// `version_needed` value emitted in any entry that carries a Zip64
+/// extra field.  PKZIP requires v4.5 (encoded as `45`) for Zip64.
+const version_needed_zip64: Int = 45
 
 const version_made_by_unix: Int = 0x0314
 
@@ -111,13 +142,6 @@ pub fn encode_with_method(
   let central_size = bit_array.byte_size(central_bytes)
   let count = list.length(entries)
 
-  // Pre-Zip64 the EOCD record only has 16-bit entry counts and 32-bit
-  // offsets / sizes.  Reject overflows up-front instead of silently
-  // wrapping into a corrupted archive.
-  use _ <- result.try(check_u16(count, "total_entries"))
-  use _ <- result.try(check_u32(central_size, "central_directory_size"))
-  use _ <- result.try(check_u32(central_offset, "central_directory_offset"))
-
   let comment_bytes = case archives.comment(archive_value) {
     Some(c) -> bit_array.from_string(c)
     None -> <<>>
@@ -125,20 +149,98 @@ pub fn encode_with_method(
   let comment_size = bit_array.byte_size(comment_bytes)
   use _ <- result.try(check_u16(comment_size, "archive_comment_length"))
 
+  // Decide whether the EOCD record needs Zip64 extensions.  Any of:
+  //  * total entry count > 65535
+  //  * central directory size > 4 GiB
+  //  * central directory offset > 4 GiB
+  // forces us to emit a Zip64 EOCD record + locator and put the
+  // sentinel 0xFFFF / 0xFFFFFFFF in the legacy EOCD slots so older
+  // readers correctly fall through to the Zip64 record.
+  let needs_zip64_eocd =
+    count > u16_max || central_size > u32_max || central_offset > u32_max
+
+  let zip64_trailer = case needs_zip64_eocd {
+    False -> <<>>
+    True -> build_zip64_eocd_and_locator(count, central_size, central_offset)
+  }
+
+  let eocd_total_entries = case count > u16_max {
+    True -> u16_max
+    False -> count
+  }
+  let eocd_central_size = case central_size > u32_max {
+    True -> u32_max
+    False -> central_size
+  }
+  let eocd_central_offset = case central_offset > u32_max {
+    True -> u32_max
+    False -> central_offset
+  }
+
   let eocd =
     bit_array.concat([
       le32(eocd_signature),
       le16(0),
       le16(0),
-      le16(count),
-      le16(count),
-      le32(central_size),
-      le32(central_offset),
+      le16(eocd_total_entries),
+      le16(eocd_total_entries),
+      le32(eocd_central_size),
+      le32(eocd_central_offset),
       le16(comment_size),
       comment_bytes,
     ])
 
-  Ok(bit_array.concat([local_bytes, central_bytes, eocd]))
+  Ok(bit_array.concat([local_bytes, central_bytes, zip64_trailer, eocd]))
+}
+
+/// Build the Zip64 EOCD record (56 bytes) followed by the Zip64 EOCD
+/// locator (20 bytes).  The locator's "Zip64 EOCD record offset" is
+/// the byte position of the Zip64 EOCD record relative to the start
+/// of the file — i.e. `local_bytes_size + central_bytes_size` since
+/// we always write the Zip64 record immediately after the central
+/// directory and immediately before the regular EOCD.
+fn build_zip64_eocd_and_locator(
+  count: Int,
+  central_size: Int,
+  central_offset: Int,
+) -> BitArray {
+  // The Zip64 EOCD record is laid out as:
+  //   +0  4-byte signature (0x06064b50)
+  //   +4  8-byte size of record excluding the first 12 bytes (= 44)
+  //   +12 2-byte version made by
+  //   +14 2-byte version needed to extract
+  //   +16 4-byte disk number (= 0)
+  //   +20 4-byte central-directory start disk (= 0)
+  //   +24 8-byte entries on this disk
+  //   +32 8-byte total entries
+  //   +40 8-byte central-directory size
+  //   +48 8-byte central-directory offset
+  let zip64_eocd =
+    bit_array.concat([
+      le32(zip64_eocd_signature),
+      le64(44),
+      le16(version_made_by_unix),
+      le16(version_needed_zip64),
+      le32(0),
+      le32(0),
+      le64(count),
+      le64(count),
+      le64(central_size),
+      le64(central_offset),
+    ])
+  // The locator must record the absolute offset of the Zip64 EOCD
+  // record (i.e. file start → record start).  The Zip64 record sits
+  // immediately after the central directory, so that offset equals
+  // `central_offset + central_size`.
+  let zip64_offset = central_offset + central_size
+  let zip64_locator =
+    bit_array.concat([
+      le32(zip64_eocd_locator_signature),
+      le32(0),
+      le64(zip64_offset),
+      le32(1),
+    ])
+  bit_array.concat([zip64_eocd, zip64_locator])
 }
 
 /// Run the deflate encoder honoring the requested level on the inner
@@ -255,27 +357,52 @@ pub fn decode_with_limits(
   }
 }
 
+/// Walk every entry once with `list.fold`, accumulating the running
+/// byte offset alongside the local-file + central-directory record
+/// lists.  Using `list.fold` here (instead of an explicit
+/// tail-recursive helper) keeps the encoder iterative on the
+/// JavaScript target, which doesn't TCO Gleam recursion and would
+/// otherwise blow its call stack on archives with tens of thousands
+/// of entries (and so couldn't ever build a Zip64-sized archive).
 fn encode_entries(
   remaining: List(entry.Entry),
-  offset: Int,
-  local_acc: List(BitArray),
-  central_acc: List(BitArray),
+  _offset: Int,
+  _local_acc: List(BitArray),
+  _central_acc: List(BitArray),
   method: Method,
 ) -> Result(#(List(BitArray), List(BitArray)), error.ArchiveError) {
-  case remaining {
-    [] -> Ok(#(list.reverse(local_acc), list.reverse(central_acc)))
-    [head, ..rest] -> {
-      use built <- result.try(encode_entry(head, offset, method))
-      let #(local_record, central_record, advance) = built
-      encode_entries(
-        rest,
-        offset + advance,
-        [local_record, ..local_acc],
-        [central_record, ..central_acc],
-        method,
-      )
-    }
+  let init = EncodeFold(offset: 0, local_acc: [], central_acc: [], error: None)
+  let folded =
+    list.fold(remaining, init, fn(state, entry_value) {
+      case state.error {
+        Some(_) -> state
+        None ->
+          case encode_entry(entry_value, state.offset, method) {
+            Ok(#(local_record, central_record, advance)) ->
+              EncodeFold(
+                offset: state.offset + advance,
+                local_acc: [local_record, ..state.local_acc],
+                central_acc: [central_record, ..state.central_acc],
+                error: None,
+              )
+            Error(e) -> EncodeFold(..state, error: Some(e))
+          }
+      }
+    })
+  case folded.error {
+    Some(e) -> Error(e)
+    None ->
+      Ok(#(list.reverse(folded.local_acc), list.reverse(folded.central_acc)))
   }
+}
+
+type EncodeFold {
+  EncodeFold(
+    offset: Int,
+    local_acc: List(BitArray),
+    central_acc: List(BitArray),
+    error: Option(error.ArchiveError),
+  )
 }
 
 fn encode_entry(
@@ -337,10 +464,8 @@ fn encode_entry(
 
   let comp_size = bit_array.byte_size(compressed_body)
 
-  // Each per-entry field is constrained by Zip's pre-Zip64 layout.
-  use _ <- result.try(check_u32(uncomp_size, "uncompressed_size"))
-  use _ <- result.try(check_u32(comp_size, "compressed_size"))
-  use _ <- result.try(check_u32(offset, "local_header_offset"))
+  // CRC32 and external attributes never need Zip64 — they're 32-bit
+  // values per spec.
   use _ <- result.try(check_u32(crc, "crc32"))
 
   let metadata = entry.metadata(value)
@@ -352,9 +477,62 @@ fn encode_entry(
   }
   use _ <- result.try(check_u32(external_attrs, "external_attributes"))
 
-  let version_needed = case method_code {
-    m if m == method_deflate -> 20
-    _ -> version_needed_store
+  // Decide whether the per-entry record needs a Zip64 extra field.
+  // The local file header carries comp_size + uncomp_size; if either
+  // overflows we put 0xFFFFFFFF in the legacy 32-bit slot and stash
+  // the real 8-byte values in a Zip64 extra (header_id 0x0001).  The
+  // central-directory record additionally tracks the local-header
+  // offset, which can overflow even when the sizes don't.
+  let local_needs_zip64 = uncomp_size > u32_max || comp_size > u32_max
+  let central_needs_zip64 = local_needs_zip64 || offset > u32_max
+
+  let local_uncomp_slot = case uncomp_size > u32_max {
+    True -> u32_max
+    False -> uncomp_size
+  }
+  let local_comp_slot = case comp_size > u32_max {
+    True -> u32_max
+    False -> comp_size
+  }
+  let central_offset_slot = case offset > u32_max {
+    True -> u32_max
+    False -> offset
+  }
+
+  let local_extra = case local_needs_zip64 {
+    False -> <<>>
+    True ->
+      // The local Zip64 extra MUST include BOTH size fields per
+      // APPNOTE §4.5.3, regardless of which one triggered the
+      // overflow.
+      build_zip64_extra(Some(uncomp_size), Some(comp_size), None)
+  }
+  let central_extra = case central_needs_zip64 {
+    False -> <<>>
+    True ->
+      build_zip64_extra(
+        case uncomp_size > u32_max {
+          True -> Some(uncomp_size)
+          False -> None
+        },
+        case comp_size > u32_max {
+          True -> Some(comp_size)
+          False -> None
+        },
+        case offset > u32_max {
+          True -> Some(offset)
+          False -> None
+        },
+      )
+  }
+
+  let version_needed = case
+    local_needs_zip64 || central_needs_zip64,
+    method_code
+  {
+    True, _ -> version_needed_zip64
+    False, m if m == method_deflate -> 20
+    False, _ -> version_needed_store
   }
 
   let local_header =
@@ -366,11 +544,12 @@ fn encode_entry(
       le16(default_mtime_dos),
       le16(default_mdate_dos),
       le32(crc),
-      le32(comp_size),
-      le32(uncomp_size),
+      le32(local_comp_slot),
+      le32(local_uncomp_slot),
       le16(name_length),
-      le16(0),
+      le16(bit_array.byte_size(local_extra)),
       name_bytes,
+      local_extra,
     ])
 
   let local_record = bit_array.concat([local_header, compressed_body])
@@ -386,19 +565,49 @@ fn encode_entry(
       le16(default_mtime_dos),
       le16(default_mdate_dos),
       le32(crc),
-      le32(comp_size),
-      le32(uncomp_size),
+      le32(local_comp_slot),
+      le32(local_uncomp_slot),
       le16(name_length),
-      le16(0),
+      le16(bit_array.byte_size(central_extra)),
       le16(0),
       le16(0),
       le16(0),
       le32(external_attrs),
-      le32(offset),
+      le32(central_offset_slot),
       name_bytes,
+      central_extra,
     ])
 
   Ok(#(local_record, central_record, local_record_size))
+}
+
+/// Build a Zip64 extended-information extra-field record.  Each of
+/// `uncomp` / `comp` / `local_offset` is `Some(value)` when the
+/// corresponding 32-bit slot has been replaced with the 0xFFFFFFFF
+/// sentinel; the function packs the present values in the order
+/// APPNOTE.TXT §4.5.3 prescribes.
+fn build_zip64_extra(
+  uncomp: Option(Int),
+  comp: Option(Int),
+  local_offset: Option(Int),
+) -> BitArray {
+  let body =
+    bit_array.concat([
+      case uncomp {
+        Some(v) -> le64(v)
+        None -> <<>>
+      },
+      case comp {
+        Some(v) -> le64(v)
+        None -> <<>>
+      },
+      case local_offset {
+        Some(v) -> le64(v)
+        None -> <<>>
+      },
+    ])
+  let body_size = bit_array.byte_size(body)
+  bit_array.concat([le16(zip64_extra_id), le16(body_size), body])
 }
 
 fn ensure_trailing_slash(value: String) -> String {
@@ -471,12 +680,107 @@ fn read_eocd(
       }
     }
   })
+
+  // When any of the 16-/32-bit slots carries its Zip64 sentinel the
+  // real value lives in the Zip64 EOCD record reached via the Zip64
+  // EOCD locator placed at `position - 20`.  Any non-sentinel value
+  // in the standard slot wins (the spec lets implementations write
+  // both forms for backward compatibility).
+  let needs_zip64 =
+    total_entries == u16_max
+    || central_size == u32_max
+    || central_offset == u32_max
+  use #(total_entries, central_size, central_offset) <- result.try(
+    case needs_zip64 {
+      False -> Ok(#(total_entries, central_size, central_offset))
+      True -> {
+        use #(zip64_entries, zip64_size, zip64_offset) <- result.try(
+          read_zip64_eocd_from_locator(bytes, position),
+        )
+        Ok(
+          #(
+            case total_entries == u16_max {
+              True -> zip64_entries
+              False -> total_entries
+            },
+            case central_size == u32_max {
+              True -> zip64_size
+              False -> central_size
+            },
+            case central_offset == u32_max {
+              True -> zip64_offset
+              False -> central_offset
+            },
+          ),
+        )
+      }
+    },
+  )
+
   Ok(EocdRecord(
     total_entries: total_entries,
     central_offset: central_offset,
     central_size: central_size,
     comment: comment,
   ))
+}
+
+/// Locate and parse the Zip64 EOCD record.  The locator sits in the
+/// 20 bytes immediately preceding the standard EOCD signature; the
+/// 8-byte little-endian field at offset 8 of the locator points to
+/// the Zip64 EOCD record itself.
+fn read_zip64_eocd_from_locator(
+  bytes: BitArray,
+  eocd_position: Int,
+) -> Result(#(Int, Int, Int), error.ArchiveError) {
+  case eocd_position < 20 {
+    True ->
+      Error(error.ArchiveInvalid(
+        message: "ZIP EOCD sentinel without Zip64 locator (archive too short)",
+      ))
+    False -> {
+      let locator_position = eocd_position - 20
+      use locator_sig <- result.try(read_le32_at(bytes, locator_position))
+      use <- bool.guard(
+        when: locator_sig != zip64_eocd_locator_signature,
+        return: Error(error.ArchiveInvalid(
+          message: "ZIP EOCD sentinel but no Zip64 EOCD locator present",
+        )),
+      )
+      use zip64_eocd_offset <- result.try(read_le64_at(
+        bytes,
+        locator_position + 8,
+      ))
+      read_zip64_eocd_record(bytes, zip64_eocd_offset)
+    }
+  }
+}
+
+fn read_zip64_eocd_record(
+  bytes: BitArray,
+  offset: Int,
+) -> Result(#(Int, Int, Int), error.ArchiveError) {
+  use signature <- result.try(read_le32_at(bytes, offset))
+  use <- bool.guard(
+    when: signature != zip64_eocd_signature,
+    return: Error(error.ArchiveInvalid(
+      message: "Zip64 EOCD signature missing at locator-pointed offset",
+    )),
+  )
+  // Skip:
+  //   +4  size of Zip64 EOCD record minus 12 (8 bytes)
+  //   +12 version made by (2 bytes)
+  //   +14 version needed (2 bytes)
+  //   +16 this disk number (4 bytes)
+  //   +20 disk with central directory start (4 bytes)
+  //   +24 entries on this disk (8 bytes)
+  //   +32 total entries (8 bytes)         <- want
+  //   +40 central directory size (8 bytes) <- want
+  //   +48 central directory offset (8 bytes) <- want
+  use total_entries <- result.try(read_le64_at(bytes, offset + 32))
+  use central_size <- result.try(read_le64_at(bytes, offset + 40))
+  use central_offset <- result.try(read_le64_at(bytes, offset + 48))
+  Ok(#(total_entries, central_size, central_offset))
 }
 
 fn parse_central_directory(
@@ -514,6 +818,37 @@ fn parse_central_directory(
         name_length,
       ))
       use name <- result.try(bytes_to_string(name_bits))
+
+      // Walk the extra-field block when any of the 32-bit slots is at
+      // its Zip64 sentinel and pick up the real 64-bit value(s).
+      use extra_bits <- result.try(slice_or_error(
+        bytes,
+        name_offset + name_length,
+        extra_length,
+      ))
+      let uncomp_at_sentinel = uncomp_size == u32_max
+      let comp_at_sentinel = comp_size == u32_max
+      let offset_at_sentinel = local_offset == u32_max
+      use #(zip64_uncomp, zip64_comp, zip64_offset) <- result.try(
+        parse_zip64_extra(
+          extra_bits,
+          uncomp_at_sentinel,
+          comp_at_sentinel,
+          offset_at_sentinel,
+        ),
+      )
+      let uncomp_size = case zip64_uncomp {
+        Some(v) -> v
+        None -> uncomp_size
+      }
+      let comp_size = case zip64_comp {
+        Some(v) -> v
+        None -> comp_size
+      }
+      let local_offset = case zip64_offset {
+        Some(v) -> v
+        None -> local_offset
+      }
 
       use <- bool.guard(
         when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
@@ -602,6 +937,37 @@ fn read_local_entry(
 
   use local_name_length <- result.try(read_le16_at(full, local_offset + 26))
   use local_extra_length <- result.try(read_le16_at(full, local_offset + 28))
+  use local_uncomp <- result.try(read_le32_at(full, local_offset + 22))
+  use local_comp <- result.try(read_le32_at(full, local_offset + 18))
+
+  // The local header carries its own copy of the comp/uncomp sizes;
+  // when they're at the 32-bit sentinel its Zip64 extra (header_id
+  // 0x0001) MUST include BOTH size fields per APPNOTE §4.5.3.  We
+  // prefer the central-directory values (passed in) but fall back to
+  // whatever the local Zip64 extra carries when the caller's values
+  // are themselves at sentinel — keeps the decoder robust against
+  // archives that only encode the real sizes in one place.
+  use local_extra_bits <- result.try(slice_or_error(
+    full,
+    local_offset + 30 + local_name_length,
+    local_extra_length,
+  ))
+  use #(local_zip64_uncomp, local_zip64_comp, _) <- result.try(
+    parse_zip64_extra(
+      local_extra_bits,
+      local_uncomp == u32_max,
+      local_comp == u32_max,
+      False,
+    ),
+  )
+  let uncomp_size = case uncomp_size, local_zip64_uncomp {
+    n, Some(v) if n == u32_max -> v
+    n, _ -> n
+  }
+  let comp_size = case comp_size, local_zip64_comp {
+    n, Some(v) if n == u32_max -> v
+    n, _ -> n
+  }
 
   let data_offset = local_offset + 30 + local_name_length + local_extra_length
 
@@ -761,5 +1127,101 @@ fn read_le32(bytes: BitArray) -> Result(Int, error.ArchiveError) {
   case bytes {
     <<value:size(32)-little>> -> Ok(value)
     _ -> Error(error.ArchiveInvalid(message: "short read for 32-bit value"))
+  }
+}
+
+fn read_le64_at(bytes: BitArray, offset: Int) -> Result(Int, error.ArchiveError) {
+  case bit_array.slice(bytes, offset, 8) {
+    Ok(<<value:size(64)-little>>) -> Ok(value)
+    _ -> Error(error.ArchiveInvalid(message: "short read for 64-bit value"))
+  }
+}
+
+fn le64(value: Int) -> BitArray {
+  <<value:size(64)-little>>
+}
+
+/// Parse the Zip64 extended-information extra field (header_id 0x0001)
+/// out of a packed extra-field block.  Only the slots that hit the
+/// 0xFFFFFFFF sentinel in the surrounding central-directory or local
+/// file header have 8-byte values present in the extra-field body,
+/// and they appear in a fixed order (uncomp_size, comp_size,
+/// local_offset, disk_start).  The decoder walks the extra-field
+/// chain and picks the first record with `header_id = 0x0001`.
+fn parse_zip64_extra(
+  extra: BitArray,
+  uncomp_at_sentinel: Bool,
+  comp_at_sentinel: Bool,
+  offset_at_sentinel: Bool,
+) -> Result(#(Option(Int), Option(Int), Option(Int)), error.ArchiveError) {
+  case find_extra_field(extra, zip64_extra_id) {
+    Ok(payload) ->
+      decode_zip64_extra_payload(
+        payload,
+        uncomp_at_sentinel,
+        comp_at_sentinel,
+        offset_at_sentinel,
+      )
+    _ -> Ok(#(None, None, None))
+  }
+}
+
+fn find_extra_field(extra: BitArray, want_id: Int) -> Result(BitArray, Nil) {
+  case extra {
+    <<id:size(16)-little, size:size(16)-little, rest:bytes>> ->
+      step_extra_field(rest, size, id, want_id)
+    _ -> Error(Nil)
+  }
+}
+
+fn step_extra_field(
+  rest: BitArray,
+  size: Int,
+  id: Int,
+  want_id: Int,
+) -> Result(BitArray, Nil) {
+  use body <- result.try(case bit_array.slice(rest, 0, size) {
+    Ok(b) -> Ok(b)
+    _ -> Error(Nil)
+  })
+  case id == want_id {
+    True -> Ok(body)
+    False ->
+      case bit_array.slice(rest, size, bit_array.byte_size(rest) - size) {
+        Ok(after) -> find_extra_field(after, want_id)
+        _ -> Error(Nil)
+      }
+  }
+}
+
+fn decode_zip64_extra_payload(
+  payload: BitArray,
+  uncomp_at_sentinel: Bool,
+  comp_at_sentinel: Bool,
+  offset_at_sentinel: Bool,
+) -> Result(#(Option(Int), Option(Int), Option(Int)), error.ArchiveError) {
+  use #(uncomp, payload) <- result.try(maybe_read_le64(
+    payload,
+    uncomp_at_sentinel,
+  ))
+  use #(comp, payload) <- result.try(maybe_read_le64(payload, comp_at_sentinel))
+  use #(offset, _payload) <- result.try(maybe_read_le64(
+    payload,
+    offset_at_sentinel,
+  ))
+  Ok(#(uncomp, comp, offset))
+}
+
+fn maybe_read_le64(
+  payload: BitArray,
+  needed: Bool,
+) -> Result(#(Option(Int), BitArray), error.ArchiveError) {
+  case needed {
+    False -> Ok(#(None, payload))
+    True ->
+      case payload {
+        <<value:size(64)-little, rest:bytes>> -> Ok(#(Some(value), rest))
+        _ -> Error(error.ArchiveInvalid(message: "Zip64 extra field truncated"))
+      }
   }
 }

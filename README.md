@@ -25,8 +25,11 @@ Implemented codecs and archive families:
   hardlinks, prefix/name split)
 - **cpio**: newc encode/decode
 - **ar**: BSD long-name encode/decode
-- **zip**: stored-method encode/decode with CRC-32 verification, plus
-  per-entry deflate decode
+- **zip**: stored + deflate encode/decode with CRC-32 verification,
+  plus Zip64 extensions (EOCD locator/record + per-entry header_id
+  0x0001 extra field) so archives with > 65535 entries, > 4 GiB
+  central directories, or > 4 GiB entries / offsets round-trip
+  through any conforming Zip64 reader
 - **7z**: single-folder LZMA / LZMA2 reader (covers the common
   `7z a` single-file case)
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
