@@ -674,9 +674,12 @@ fn decode_one_symbol(
   acc: BitArray,
 ) -> Result(BitArray, HufError) {
   // Peek `max_bits` bits to index the lookup table, then re-consume
-  // only the bits that the matched code actually uses.
+  // only the bits that the matched code actually uses.  Per RFC 8478
+  // §4.2.1.3 the end of the Huffman bitstream is implicitly padded
+  // with zeros for the last symbol(s), so we use the padded reader
+  // for both peek and consume.
   use #(index, _) <- result.try(
-    fse.read_backward_bits(reader, tree.max_bits)
+    fse.read_backward_bits_padded(reader, tree.max_bits)
     |> result.map_error(HufBitstreamError),
   )
   case dict.get(tree.lookup, index) {
@@ -684,7 +687,7 @@ fn decode_one_symbol(
       Error(HufInvalidWeights(message: "huf: bitstream index out of table"))
     Ok(#(sym, used_bits)) -> {
       use #(_, reader_consumed) <- result.try(
-        fse.read_backward_bits(reader, used_bits)
+        fse.read_backward_bits_padded(reader, used_bits)
         |> result.map_error(HufBitstreamError),
       )
       decode_symbols_loop(tree, reader_consumed, remaining - 1, <<

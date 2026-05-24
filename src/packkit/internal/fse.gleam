@@ -379,6 +379,36 @@ pub fn read_backward_bits(
   }
 }
 
+/// Read `count` bits MSB-first.  Any shortfall (fewer than `count`
+/// bits remain in the bitstream) is padded with zeros on the LSB
+/// side, matching the zstd reference Huffman decoder's behaviour of
+/// allowing over-consumption against an implicit zero-padded end.
+/// Returns `FseEmptyBitstream` only when zero bits are left to read.
+pub fn read_backward_bits_padded(
+  reader: BackwardReader,
+  count: Int,
+) -> Result(#(Int, BackwardReader), FseError) {
+  let reader = refill_backward(reader, count)
+  case reader.bits >= count {
+    True -> read_backward_bits(reader, count)
+    False ->
+      case reader.bits {
+        0 -> Error(FseEmptyBitstream)
+        available -> {
+          let pad = count - available
+          let mask = int.bitwise_shift_left(1, available) - 1
+          let value =
+            int.bitwise_and(reader.buffer, mask)
+            |> int.bitwise_shift_left(pad)
+          Ok(#(
+            value,
+            BackwardReader(buffer: 0, bits: 0, source_rev: reader.source_rev),
+          ))
+        }
+      }
+  }
+}
+
 fn refill_backward(reader: BackwardReader, needed: Int) -> BackwardReader {
   case reader.bits >= needed {
     True -> reader
