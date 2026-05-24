@@ -22,6 +22,20 @@ import packkit/limit
 
 const magic: Int = 0x184D2204
 
+/// LZ4 legacy frame format magic (`02 21 4C 18` little-endian).
+/// The legacy format predates RFC-style LZ4 frames and is still
+/// emitted by older `lz4 -l` / `lz4c` tools and embedded systems.
+/// It has no frame descriptor, no checksums, no content size — just
+/// a magic followed by a sequence of `<size_LE32, body>` blocks
+/// terminated at EOF.
+const legacy_magic: Int = 0x184C2102
+
+/// LZ4 legacy blocks have an 8 MiB block-size cap per the spec
+/// (`LZ4_LEGACY_BLOCKSIZE`).  Going past this would either be an
+/// adversarial header or a new concatenated frame, so we use it
+/// as an early-exit check during decoding.
+const legacy_max_block_size: Int = 8_388_608
+
 const flg_version_mask: Int = 0xC0
 
 const flg_version_v1: Int = 0x40
@@ -108,6 +122,11 @@ pub fn decode_with_limits(
   )
 
   case bytes {
+    <<m:size(32)-little, _rest:bytes>> if m == legacy_magic -> {
+      let assert Ok(after_magic) =
+        bit_array.slice(bytes, 4, bit_array.byte_size(bytes) - 4)
+      decode_legacy_blocks(after_magic, <<>>, limits)
+    }
     <<m:size(32)-little, flg, bd, rest:bytes>> -> {
       use <- bool.guard(
         when: m != magic,
@@ -496,6 +515,52 @@ fn collect_bytes(
         acc:bits,
         byte_at(table, start),
       >>)
+  }
+}
+
+fn decode_legacy_blocks(
+  bytes: BitArray,
+  output: BitArray,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
+  case bytes {
+    // Stream ends at EOF — there is no terminator block in the
+    // legacy format.
+    <<>> -> Ok(output)
+    <<block_size:size(32)-little, _rest:bytes>> if block_size == 0 ->
+      // Some implementations write an explicit terminator block;
+      // accept it for robustness.
+      Ok(output)
+    <<block_size:size(32)-little, _rest:bytes>>
+      if block_size > legacy_max_block_size
+    ->
+      // Per the legacy spec, a "block size" past 8 MiB indicates
+      // either a new concatenated frame magic or junk — stop
+      // decoding cleanly rather than allocating a huge slice.
+      Ok(output)
+    <<block_size:size(32)-little, rest:bytes>> -> {
+      case bit_array.byte_size(rest) < block_size {
+        True ->
+          Error(error.CodecInvalidData(
+            message: "lz4 legacy: block payload truncated",
+          ))
+        False -> {
+          let assert Ok(block) = bit_array.slice(rest, 0, block_size)
+          let assert Ok(after_block) =
+            bit_array.slice(
+              rest,
+              block_size,
+              bit_array.byte_size(rest) - block_size,
+            )
+          use new_output <- result.try(decode_block(block, output, limits))
+          decode_legacy_blocks(after_block, new_output, limits)
+        }
+      }
+    }
+    _ ->
+      Error(error.CodecInvalidData(
+        message: "lz4 legacy: block header truncated",
+      ))
   }
 }
 

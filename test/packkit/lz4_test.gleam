@@ -153,3 +153,40 @@ fn list_repeat(value: a, n: Int) -> List(a) {
     _ -> [value, ..list_repeat(value, n - 1)]
   }
 }
+
+pub fn legacy_frame_decode_hello_test() -> Nil {
+  // Hand-crafted LZ4 legacy frame.  Legacy magic + one block whose
+  // payload is a token byte (lit_len=5, match_len ignored) followed
+  // by the 5 literal bytes "hello".  The legacy format has no
+  // frame descriptor and no end marker — EOF terminates.
+  let fixture = <<
+    // legacy magic 0x184C2102 (little-endian)
+    0x02, 0x21, 0x4C, 0x18,
+    // block_size = 6 (LE 32-bit)
+    0x06, 0x00, 0x00, 0x00,
+    // token: lit_len=5, no match
+    0x50,
+    // 5 literals "hello"
+    0x68, 0x65, 0x6C, 0x6C, 0x6F,
+  >>
+  let assert Ok(plain) = lz4.decode(bytes: fixture)
+  plain
+  |> should.equal(<<"hello":utf8>>)
+}
+
+pub fn legacy_frame_decode_two_blocks_test() -> Nil {
+  // Two consecutive blocks "abc" + "xyz" — the legacy stream
+  // catenates each block's output into the result without any
+  // separator.
+  let fixture = <<
+    // legacy magic
+    0x02, 0x21, 0x4C, 0x18,
+    // block 1: size=4 (token + 3 literals "abc")
+    0x04, 0x00, 0x00, 0x00, 0x30, 0x61, 0x62, 0x63,
+    // block 2: size=4 (token + 3 literals "xyz")
+    0x04, 0x00, 0x00, 0x00, 0x30, 0x78, 0x79, 0x7A,
+  >>
+  let assert Ok(plain) = lz4.decode(bytes: fixture)
+  plain
+  |> should.equal(<<"abcxyz":utf8>>)
+}

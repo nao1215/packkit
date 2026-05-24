@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added decoder support for the LZ4 legacy frame format
+  (magic `0x184C2102` — emitted by older `lz4 -l` / `lz4c` and
+  embedded toolchains).  The legacy format has no frame
+  descriptor and no end marker, just a magic followed by
+  `<size_LE32, body>` blocks terminated at EOF; `lz4.decode`
+  now dispatches on the leading magic and routes legacy streams
+  through a dedicated block walker that reuses the existing LZ4
+  block decoder.  `detect.from_bytes` recognises the legacy
+  magic too.
 - Added `gzip.Subfield` and `gzip.with_extra` / `gzip.extra` so
   gzip's FEXTRA region (RFC 1952 §2.3.1.1) can now be set at
   encode time and recovered at decode time.  The decoder

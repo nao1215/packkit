@@ -48,7 +48,9 @@ Implemented codecs and archive families:
   `lz4.encode_with_content_size` additionally stores the
   uncompressed content size in the frame descriptor so strict
   decoders (the reference `lz4` CLI, for instance) can pre-allocate
-  the output buffer and verify the declared length
+  the output buffer and verify the declared length.  The legacy
+  frame format (`lz4 -l` / `lz4c` magic `0x184C2102`) is also
+  recognised and decoded
 - **snappy**: raw-block and framed codec with LZ77 block compressor
   (greedy 4-byte hash-chain match-finder, literal + copy-1 / copy-2
   / copy-4 sequence emission)

@@ -155,6 +155,13 @@ pub fn from_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
       Ok(detected_codec(codec.zstd(), extension: "zst"))
     <<0x04, 0x22, 0x4D, 0x18, _:bytes>> ->
       Ok(detected_codec(codec.lz4(), extension: "lz4"))
+    // LZ4 legacy frame format (magic 0x184C2102, little-endian) is
+    // emitted by older `lz4 -l` / `lz4c` tools.  Our decoder does
+    // not yet read it but detection still routes the byte stream
+    // to the lz4 codec so callers get a typed
+    // `CodecNotImplemented` rather than a `DetectUnknownFormat`.
+    <<0x02, 0x21, 0x4C, 0x18, _:bytes>> ->
+      Ok(detected_codec(codec.lz4(), extension: "lz4"))
     // Snappy framed stream identifier chunk:
     //   chunk_type 0xFF, chunk_length 6 (LE 24-bit), body "sNaPpY".
     <<0xFF, 0x06, 0x00, 0x00, "sNaPpY":utf8, _:bytes>> ->
