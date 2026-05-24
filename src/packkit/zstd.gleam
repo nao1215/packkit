@@ -1616,35 +1616,79 @@ fn read_bits_for(
 
 fn resolve_offset(
   ctx: SeqContext,
-  of_code: Int,
+  _of_code: Int,
   raw_offset: Int,
   literal_length: Int,
 ) -> #(Int, SeqContext) {
-  case of_code {
-    0 ->
+  // RFC 8478 §3.1.1.5 dispatches on the offset *value* (called
+  // `raw_offset` here, equal to `(1 << of_code) + extra`), NOT on
+  // the FSE-decoded of_code itself.  An earlier revision keyed on
+  // of_code, which silently clamped raw_offset values of 2 and 3
+  // (of_code == 1) into "use rep[0]" and produced wrong matches.
+  case raw_offset {
+    1 ->
       case literal_length {
         0 -> {
+          // LL == 0: offset_value 1 means repeated_offset[1] (and
+          // the rep history shifts accordingly).
           let actual = ctx.rep1
           #(actual, SeqContext(..ctx, rep0: ctx.rep1, rep1: ctx.rep0))
         }
-        _ -> #(ctx.rep0, ctx)
+        _ -> {
+          // LL > 0: repeated_offset[0], history unchanged.
+          #(ctx.rep0, ctx)
+        }
+      }
+    2 ->
+      case literal_length {
+        0 -> {
+          let actual = ctx.rep2
+          #(
+            actual,
+            SeqContext(..ctx, rep2: ctx.rep0, rep1: ctx.rep0, rep0: actual)
+              |> rotate_rep(actual),
+          )
+        }
+        _ -> {
+          let actual = ctx.rep1
+          #(actual, SeqContext(..ctx, rep0: ctx.rep1, rep1: ctx.rep0))
+        }
+      }
+    3 ->
+      case literal_length {
+        0 -> {
+          // LL == 0: offset_value 3 means repeated_offset[0] - 1.
+          let actual = case ctx.rep0 - 1 {
+            n if n <= 0 -> 1
+            n -> n
+          }
+          #(
+            actual,
+            SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: actual),
+          )
+        }
+        _ -> {
+          // LL > 0: offset_value 3 means repeated_offset[2].
+          let actual = ctx.rep2
+          #(
+            actual,
+            SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: actual),
+          )
+        }
       }
     _ -> {
+      // raw_offset > 3: a normal (non-repeated) offset.
       let actual = raw_offset - 3
-      let new_offset = case literal_length {
-        0 -> actual + 1
-        _ -> actual
-      }
-      let final_offset = case new_offset {
-        n if n <= 0 -> 1
-        n -> n
-      }
-      #(
-        final_offset,
-        SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: final_offset),
-      )
+      #(actual, SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: actual))
     }
   }
+}
+
+/// After picking rep[2] via the "raw_offset=2, LL=0" path we still
+/// need the canonical rep-list rotation: new rep0 = old rep2,
+/// new rep1 = old rep0, new rep2 = old rep1.
+fn rotate_rep(ctx: SeqContext, new_rep0: Int) -> SeqContext {
+  SeqContext(..ctx, rep2: ctx.rep1, rep1: ctx.rep0, rep0: new_rep0)
 }
 
 fn copy_literals(

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Fix (correctness)**: zstd `resolve_offset` dispatched on the
+  FSE-decoded `of_code` instead of the resulting `raw_offset`
+  (= `offset_value`).  RFC 8478 §3.1.1.5 keys the repeated-
+  offset logic on `raw_offset` (1, 2, or 3) — `of_code == 1`
+  yields `raw_offset` in {2, 3} with its associated repeated-
+  offset semantics — so the previous code clamped those cases
+  to "use rep[0]" and produced wrong match copies in any block
+  that hit a `raw_offset` of 2 or 3.  Visible symptom was
+  silent-wrong-output deep inside CSV / JSON / XML records
+  (mismatch at the same content-relative byte across many file
+  sizes).  After the fix every `zstd -3` / `zstd -9` fixture in
+  the regression suite — including 8 KB JSON-line records,
+  4 KB CSV rows, and 4 KB XML entries — round-trips byte-for-byte.
 - **Fix (correctness)**: zstd 2-byte `Number_of_Sequences`
   encoding (sequences section header) had a stray `+ 0x80` in
   `parse_and_apply_sequences`, so any compressed block emitting
