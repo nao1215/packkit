@@ -89,6 +89,12 @@ pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 }
 
 /// Decode a bzip2 stream using explicit `Limits`.
+///
+/// Handles multi-stream `.bz2` files (the `bzcat`-style concatenation
+/// of independent bzip2 streams).  When the end-of-stream marker for
+/// one stream is reached, the decoder aligns to the next byte
+/// boundary and looks for another `"BZh"` magic; if present, the
+/// next stream's payload is appended to the accumulated output.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
@@ -101,8 +107,26 @@ pub fn decode_with_limits(
     )),
   )
 
+  decode_streams_loop(bytes, <<>>, limits)
+}
+
+fn decode_streams_loop(
+  bytes: BitArray,
+  acc: BitArray,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
   use rest <- result.try(parse_stream_header(bytes))
-  decode_blocks(new_reader(rest), <<>>, 0, limits)
+  use #(payload, after) <- result.try(decode_blocks_with_remainder(
+    new_reader(rest),
+    <<>>,
+    0,
+    limits,
+  ))
+  let acc = bit_array.concat([acc, payload])
+  case bit_array.byte_size(after) {
+    0 -> Ok(acc)
+    _ -> decode_streams_loop(after, acc, limits)
+  }
 }
 
 // -- stream header -------------------------------------------------------
@@ -117,12 +141,12 @@ fn parse_stream_header(bytes: BitArray) -> Result(BitArray, error.CodecError) {
 
 // -- block driver --------------------------------------------------------
 
-fn decode_blocks(
+fn decode_blocks_with_remainder(
   reader: Reader,
   output: BitArray,
   combined_crc: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(#(BitArray, BitArray), error.CodecError) {
   use #(magic_high, reader) <- result.try(read_bits(reader, 24))
   use #(magic_low, reader) <- result.try(read_bits(reader, 24))
 
@@ -139,12 +163,12 @@ fn decode_blocks(
         block_bytes,
         limits,
       ))
-      decode_blocks(reader, new_output, combined_crc, limits)
+      decode_blocks_with_remainder(reader, new_output, combined_crc, limits)
     }
     h, l if h == eos_magic_high && l == eos_magic_low -> {
-      use #(stream_crc, _reader) <- result.try(read_bits(reader, 32))
+      use #(stream_crc, reader) <- result.try(read_bits(reader, 32))
       case stream_crc == combined_crc {
-        True -> Ok(output)
+        True -> Ok(#(output, byte_aligned_remainder(reader)))
         False ->
           Error(error.CodecInvalidData(message: "bzip2 stream CRC mismatch"))
       }
@@ -152,6 +176,15 @@ fn decode_blocks(
     _, _ ->
       Error(error.CodecInvalidData(message: "unexpected bzip2 block marker"))
   }
+}
+
+/// Recover the byte-aligned tail of the bit reader so the caller can
+/// look for another stream's `"BZh"` magic.  bzip2 streams pad to
+/// the next byte boundary after the stream CRC, so any partial bits
+/// still sitting in `reader.buffer` are padding and we discard them.
+fn byte_aligned_remainder(reader: Reader) -> BitArray {
+  let _ = reader.buffer
+  reader.source
 }
 
 fn combine_block_crc(combined: Int, block_crc: Int) -> Int {

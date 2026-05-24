@@ -190,6 +190,11 @@ pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 }
 
 /// Decode an xz stream using explicit limits.
+///
+/// Handles multi-stream files (per `xz-file-format.txt` §1: a `.xz`
+/// file is a concatenation of one or more independent streams, each
+/// optionally followed by stream padding aligned to 4 bytes).  The
+/// concatenated payloads are returned as a single `BitArray`.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
@@ -202,8 +207,39 @@ pub fn decode_with_limits(
     )),
   )
 
+  decode_streams_loop(bytes, <<>>, limits)
+}
+
+fn decode_streams_loop(
+  bytes: BitArray,
+  acc: BitArray,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
   use #(header_flags, rest) <- result.try(parse_stream_header(bytes))
-  decode_blocks(rest, header_flags, <<>>, [], limits)
+  use #(payload, rest) <- result.try(decode_blocks(
+    rest,
+    header_flags,
+    <<>>,
+    [],
+    limits,
+  ))
+  let acc = bit_array.concat([acc, payload])
+  let rest = skip_stream_padding(rest)
+  case bit_array.byte_size(rest) {
+    0 -> Ok(acc)
+    _ -> decode_streams_loop(rest, acc, limits)
+  }
+}
+
+/// Inter-stream padding is 0x00 bytes, always a multiple of 4.  Per
+/// the spec, the bytes between two streams must all be zero and the
+/// total count must be divisible by 4; we drop them so the next
+/// header parse starts at the right offset.
+fn skip_stream_padding(bytes: BitArray) -> BitArray {
+  case bytes {
+    <<0x00, 0x00, 0x00, 0x00, rest:bytes>> -> skip_stream_padding(rest)
+    _ -> bytes
+  }
 }
 
 // -- stream header -------------------------------------------------------
@@ -258,7 +294,7 @@ fn decode_blocks(
   output: BitArray,
   records_acc: List(#(Int, Int)),
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(#(BitArray, BitArray), error.CodecError) {
   case bytes {
     <<0x00, rest:bytes>> ->
       // Index indicator.  Validate the index and footer, then return.
@@ -680,7 +716,7 @@ fn finalize_stream(
   check_type: Int,
   output: BitArray,
   records: List(#(Int, Int)),
-) -> Result(BitArray, error.CodecError) {
+) -> Result(#(BitArray, BitArray), error.CodecError) {
   use #(num_records, rest) <- result.try(read_varint(bytes))
   use <- bool.guard(
     when: num_records != list.length(records),
@@ -714,13 +750,24 @@ fn finalize_stream(
   )
   let assert Ok(after_index) =
     bit_array.slice(rest, pad + 4, bit_array.byte_size(rest) - pad - 4)
-  case bit_array.byte_size(after_index) {
-    n if n != stream_footer_size ->
-      Error(error.CodecInvalidData(message: "xz stream footer must be 12 bytes"))
-    _ -> {
-      use _ <- result.try(verify_stream_footer(after_index, check_type))
-      Ok(output)
+  // The stream footer is always exactly 12 bytes, so the first 12
+  // bytes of `after_index` are the footer and everything after that
+  // is either inter-stream padding or the next stream.
+  case bit_array.slice(after_index, 0, stream_footer_size) {
+    Ok(footer) -> {
+      use _ <- result.try(verify_stream_footer(footer, check_type))
+      let assert Ok(after_footer) =
+        bit_array.slice(
+          after_index,
+          stream_footer_size,
+          bit_array.byte_size(after_index) - stream_footer_size,
+        )
+      Ok(#(output, after_footer))
     }
+    _ ->
+      Error(error.CodecInvalidData(
+        message: "xz stream footer truncated (need 12 bytes)",
+      ))
   }
 }
 

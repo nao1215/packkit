@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleeunit/should
 import packkit/codec
 import packkit/error
@@ -116,4 +117,35 @@ pub fn decode_rejects_missing_magic_test() -> Nil {
   |> should.equal(
     Error(error.CodecInvalidData(message: "invalid xz stream header")),
   )
+}
+
+pub fn decode_multi_stream_concatenated_test() -> Nil {
+  // Per xz-file-format.txt §1: a `.xz` file is a concatenation of one
+  // or more streams.  The decoder must concatenate the per-stream
+  // payloads instead of erroring out on the trailing bytes that
+  // belong to the next stream.
+  let assert Ok(s1) = xz.encode(bytes: <<"first-":utf8>>)
+  let assert Ok(s2) = xz.encode(bytes: <<"second-":utf8>>)
+  let assert Ok(s3) = xz.encode(bytes: <<"third":utf8>>)
+  let combined = bit_array.concat([s1, s2, s3])
+  let assert Ok(plain) = xz.decode(bytes: combined)
+  plain
+  |> should.equal(<<"first-second-third":utf8>>)
+}
+
+pub fn decode_multi_stream_with_padding_test() -> Nil {
+  // Streams may be separated by 4-byte-aligned all-zero "stream
+  // padding".  Build a fixture with 8 zero pad bytes between two
+  // streams and check the decoder skips them silently.
+  let assert Ok(s1) = xz.encode(bytes: <<"alpha":utf8>>)
+  let assert Ok(s2) = xz.encode(bytes: <<"beta":utf8>>)
+  let combined =
+    bit_array.concat([
+      s1,
+      <<0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>,
+      s2,
+    ])
+  let assert Ok(plain) = xz.decode(bytes: combined)
+  plain
+  |> should.equal(<<"alphabeta":utf8>>)
 }

@@ -46,11 +46,14 @@ Implemented codecs and archive families:
   (greedy 4-byte hash-chain match-finder, literal + copy-1 / copy-2
   / copy-4 sequence emission)
 - **bzip2**: round-trip (BWT inverse + MTF + Huffman + RUNA/RUNB + RLE1
-  for decode; naive forward BWT + length-limited Huffman for encode)
+  for decode; naive forward BWT + length-limited Huffman for encode);
+  multi-stream `.bz2` files (the `bzcat`-style concatenation of
+  several streams) decode end-to-end
 - **lzw**: Unix `.Z` (compress) encoder + decoder
 - **xz**: stream header / block header / index / footer + LZMA2 with
   both uncompressed and LZMA-compressed chunks (via the pure-Gleam
-  LZMA range coder in `packkit/internal/lzma`)
+  LZMA range coder in `packkit/internal/lzma`); multi-stream files
+  with 4-byte-aligned stream padding decode end-to-end
 - **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
   with Raw / RLE literals and predefined FSE modes; Huffman
   literals and non-predefined FSE modes still pending

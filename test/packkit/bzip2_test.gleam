@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleeunit/should
 import packkit/bzip2
 import packkit/codec
@@ -96,4 +97,16 @@ pub fn decode_rejects_invalid_level_test() -> Nil {
   |> should.equal(
     Error(error.CodecInvalidData(message: "invalid bzip2 stream header")),
   )
+}
+
+pub fn decode_multi_stream_concatenated_test() -> Nil {
+  // `bzcat` accepts the concatenation of independent bzip2 streams
+  // and emits the catenated payloads.  Build a two-stream fixture
+  // using our own encoder and prove the decoder follows suit.
+  let assert Ok(s1) = bzip2.encode(bytes: <<"first-part-of-stream":utf8>>)
+  let assert Ok(s2) = bzip2.encode(bytes: <<"-second-part-of-stream":utf8>>)
+  let combined = bit_array.concat([s1, s2])
+  let assert Ok(plain) = bzip2.decode(bytes: combined)
+  plain
+  |> should.equal(<<"first-part-of-stream-second-part-of-stream":utf8>>)
 }

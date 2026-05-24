@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added multi-stream bzip2 decoding.  A `.bz2` file may be the
+  concatenation of independent bzip2 streams (the typical
+  `bzcat`-style pattern); the decoder now follows each
+  end-of-stream marker, aligns to the next byte boundary, and
+  consumes any further `"BZh"` magic that appears in the
+  remainder.
+- Added multi-stream xz decoding.  A `.xz` file is a concatenation
+  of one or more independent streams per `xz-file-format.txt` §1,
+  optionally separated by 4-byte-aligned all-zero stream padding.
+  The decoder now walks the entire input rather than stopping
+  after the first stream footer; padding between streams is
+  consumed silently.
 - Added multi-member gzip decoding (RFC 1952 §2.2).  A gzip byte
   stream built by concatenating two or more single-member streams
   (the typical `cat a.gz b.gz` pattern) now decodes to the
