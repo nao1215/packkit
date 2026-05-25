@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **Feature (brotli)**: the encoder now also emits a real LZ77
+  compressed metablock as a third candidate (alongside the existing
+  uncompressed and literals-only paths).  A greedy 4-byte hash-chain
+  match finder over the 32 KiB window produces insert-and-copy
+  commands; each command picks a `cell_idx ≥ 2` IC symbol so the
+  distance is read from a dedicated distance Huffman code instead of
+  reusing the ring buffer.  Three complex-form Huffman descriptors
+  (256 literal, 704 IC, 64 distance) describe the alphabet, all
+  built via the same naive frequency-merge Huffman the literals path
+  already used.  Repetitive payloads compress dramatically further:
+  1 KiB of zeros drops to ~60 bytes (was ~140 bytes), `"abc" x 100`
+  to ~54 bytes (was ~85), and 1.35 KiB of repeated lorem-ipsum to
+  ~100 bytes.  All outputs round-trip through both packkit's own
+  decoder and the reference `brotli` CLI.
+- **Fix (brotli encoder, single-symbol Huffman codes)**:
+  `assign_brotli_canonical_codes` now matches the decoder's
+  `canonicalise_from_pairs` special case for single-active-symbol
+  alphabets: the decoder treats them as zero-bit codes
+  (`decode_prefix_walk` exits immediately when an entry has
+  `length == 0 && code == 0`), so the encoder must too — otherwise
+  the descriptor's trailing bits leak into the next section.  The
+  bug surfaced when the LZ77 distance alphabet held a single code
+  (e.g., every command shared the same distance), shifting all
+  subsequent bitstream sections.
 - **Feature (brotli)**: the encoder now optionally emits a single
   ISLAST=1 compressed metablock whose literal alphabet uses a
   complex-form Huffman code (RFC 7932 §3.5), still without an LZ77

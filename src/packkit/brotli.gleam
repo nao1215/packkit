@@ -101,13 +101,35 @@ pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 //      §4 / our own `run_commands` decoder loop).
 fn pick_smaller_brotli_stream(bytes: BitArray, total: Int) -> BitArray {
   let uncompressed = build_uncompressed_stream(bytes, total)
-  case build_compressed_literals_stream(bytes, total) {
-    Some(compressed) ->
-      case bit_array.byte_size(compressed) < bit_array.byte_size(uncompressed) {
-        True -> compressed
-        False -> uncompressed
+  let literals_candidate = build_compressed_literals_stream(bytes, total)
+  let lz77_candidate = build_lz77_compressed_stream(bytes, total)
+  let candidates = [uncompressed, ..option_to_list(literals_candidate)]
+  let candidates = list.append(candidates, option_to_list(lz77_candidate))
+  pick_smallest_bit_array(candidates)
+}
+
+fn option_to_list(value: Option(BitArray)) -> List(BitArray) {
+  case value {
+    Some(v) -> [v]
+    None -> []
+  }
+}
+
+fn pick_smallest_bit_array(candidates: List(BitArray)) -> BitArray {
+  case candidates {
+    [head, ..rest] -> pick_smallest_loop(rest, head)
+    [] -> <<>>
+  }
+}
+
+fn pick_smallest_loop(candidates: List(BitArray), best: BitArray) -> BitArray {
+  case candidates {
+    [] -> best
+    [head, ..rest] ->
+      case bit_array.byte_size(head) < bit_array.byte_size(best) {
+        True -> pick_smallest_loop(rest, head)
+        False -> pick_smallest_loop(rest, best)
       }
-    None -> uncompressed
   }
 }
 
@@ -1089,9 +1111,18 @@ fn build_literal_length_list(
 }
 
 // Canonical Huffman code assignment matching the decoder's
-// `assign_canonical`: sort by `(length asc, symbol asc)` and assign
-// codes via the standard "shift on length change, +1 per step"
+// `assign_canonical` (and the single-symbol fast path in
+// `canonicalise_from_pairs`): sort by `(length asc, symbol asc)` and
+// assign codes via the standard "shift on length change, +1 per step"
 // recurrence.  Returns `dict[symbol] = #(code, length)`.
+//
+// **Single-symbol special case**: when only one symbol has a non-zero
+// declared length, the decoder treats it as a length-0 (zero-bit) code
+// — `decode_prefix_walk` exits immediately because
+// `find_prefix_entry` matches `length == 0 && code == 0`.  The encoder
+// must mirror that: emit zero bits for the lone symbol instead of the
+// 1-bit code canonical assignment would compute, or the descriptor's
+// trailing bits leak into the next section.
 fn assign_brotli_canonical_codes(
   lengths: List(Int),
 ) -> dict.Dict(Int, #(Int, Int)) {
@@ -1102,19 +1133,24 @@ fn assign_brotli_canonical_codes(
         False -> acc
       }
     })
-  let by_sym =
-    list.sort(pairs, fn(a, b) {
-      let #(sa, _) = a
-      let #(sb, _) = b
-      int.compare(sa, sb)
-    })
-  let by_len =
-    list.sort(by_sym, fn(a, b) {
-      let #(_, la) = a
-      let #(_, lb) = b
-      int.compare(la, lb)
-    })
-  assign_canonical_loop(by_len, 0, 0, dict.new())
+  case pairs {
+    [#(sym, _)] -> dict.from_list([#(sym, #(0, 0))])
+    _ -> {
+      let by_sym =
+        list.sort(pairs, fn(a, b) {
+          let #(sa, _) = a
+          let #(sb, _) = b
+          int.compare(sa, sb)
+        })
+      let by_len =
+        list.sort(by_sym, fn(a, b) {
+          let #(_, la) = a
+          let #(_, lb) = b
+          int.compare(la, lb)
+        })
+      assign_canonical_loop(by_len, 0, 0, dict.new())
+    }
+  }
 }
 
 fn assign_canonical_loop(
@@ -1142,6 +1178,753 @@ fn assign_canonical_loop(
 /// `MLEN-1` form (65 536-byte ceiling) so every emitted metablock
 /// shares an identical bit layout.
 const uncompressed_chunk_size: Int = 65_536
+
+// --- LZ77 compressed-metablock encoder -------------------------------
+//
+// Greedy 3-byte hash-chain match finder over the payload (32 KiB
+// window).  Each match becomes a brotli insert-and-copy command —
+// `insert_len` literals then `copy_len` bytes copied from `distance`
+// bytes back.  The encoder picks `cell_idx ≥ 2` IC cells so every
+// command's distance is read explicitly from the distance Huffman
+// tree rather than reused from the ring buffer.  Three Huffman codes
+// (256 literal, 704 IC, 64 distance) are emitted via the same
+// complex-form descriptor as the literals-only path.  RFC 7932 §5 /
+// §9.2.
+
+const lz77_min_match: Int = 4
+
+const lz77_max_match: Int = 100
+
+const lz77_max_distance: Int = 32_768
+
+type BrCommand {
+  BrCommand(insert_len: Int, copy_len: Int, distance: Int)
+}
+
+fn build_lz77_compressed_stream(bytes: BitArray, total: Int) -> Option(BitArray) {
+  use <- bool.guard(
+    when: total > 65_536 || total < lz77_min_match,
+    return: None,
+  )
+  let commands = build_lz77_commands(bytes, total)
+  case has_real_match(commands, False) {
+    False -> None
+    True -> try_emit_lz77_metablock(bytes, total, commands)
+  }
+}
+
+fn has_real_match(commands: List(BrCommand), found: Bool) -> Bool {
+  case commands, found {
+    _, True -> True
+    [], _ -> False
+    [cmd, ..rest], _ ->
+      case cmd.copy_len > 0 {
+        True -> has_real_match(rest, True)
+        False -> has_real_match(rest, False)
+      }
+  }
+}
+
+fn try_emit_lz77_metablock(
+  bytes: BitArray,
+  total: Int,
+  commands: List(BrCommand),
+) -> Option(BitArray) {
+  // Collect frequencies for each of the three Huffman alphabets.
+  let lit_freqs = tally_literal_freqs(bytes, commands, 0, dict.new())
+  let ic_freqs = tally_ic_freqs(commands, dict.new())
+  let dist_freqs = tally_distance_freqs(commands, dict.new())
+
+  let lit_lengths = build_alphabet_lengths(lit_freqs, 256)
+  let ic_lengths = build_alphabet_lengths(ic_freqs, 704)
+  let dist_lengths = build_alphabet_lengths(dist_freqs, 64)
+
+  case
+    alphabet_valid(lit_lengths)
+    && alphabet_valid(ic_lengths)
+    && alphabet_valid(dist_lengths)
+  {
+    False -> None
+    True -> {
+      let lit_codes = assign_brotli_canonical_codes(lit_lengths)
+      let ic_codes = assign_brotli_canonical_codes(ic_lengths)
+      let dist_codes = assign_brotli_canonical_codes(dist_lengths)
+      let writer = new_bit_writer()
+      let writer = bw_write(writer, 0, 1)
+      let writer =
+        emit_lz77_metablock_body(
+          writer,
+          bytes,
+          total,
+          commands,
+          lit_lengths,
+          lit_codes,
+          ic_lengths,
+          ic_codes,
+          dist_lengths,
+          dist_codes,
+        )
+      Some(bw_flush(writer))
+    }
+  }
+}
+
+fn alphabet_valid(lengths: List(Int)) -> Bool {
+  // Reject any alphabet whose lengths blow the 15-bit cap or fail
+  // the Kraft-equality check (decoder's
+  // `validate_symbol_lengths` / `read_symbol_code_lengths` both
+  // require it).
+  max_in_int_list(lengths, 0) <= 15
+  && kraft_slot_total(lengths, 32_768, 15) == 32_768
+}
+
+fn build_alphabet_lengths(
+  freqs: dict.Dict(Int, Int),
+  alphabet_size: Int,
+) -> List(Int) {
+  let pairs =
+    dict.fold(freqs, [], fn(acc, sym, count) {
+      case count > 0 {
+        True -> [#(count, sym), ..acc]
+        False -> acc
+      }
+    })
+  let distinct = list.length(pairs)
+  case distinct {
+    0 -> alphabet_lengths_for_single(alphabet_size, 0)
+    1 -> {
+      // Single symbol — alphabet must still carry a valid Huffman
+      // code (the decoder accepts a 0-bit code via the simple-form
+      // single-symbol path, but the complex-form descriptor needs at
+      // least one length).  Give the one used symbol length 1 and
+      // pair it with a second unused symbol also at length 1 so
+      // Kraft = 1.
+      let used = case pairs {
+        [#(_, sym), ..] -> sym
+        [] -> 0
+      }
+      let partner = case used {
+        0 -> 1
+        _ -> 0
+      }
+      let lengths = alphabet_lengths_for_single(alphabet_size, 0)
+      let lengths = replace_length(lengths, used, 1)
+      replace_length(lengths, partner, 1)
+    }
+    _ -> {
+      let sorted = list.sort(pairs, fn(a, b) { int.compare(a.0, b.0) })
+      let nodes = list.map(sorted, fn(p) { #(p.0, BrLeaf(p.1)) })
+      let root = br_merge(nodes)
+      let dict_lengths = br_extract_lengths(root, 0, dict.new())
+      build_length_list_for_alphabet(dict_lengths, 0, alphabet_size, [])
+    }
+  }
+}
+
+fn alphabet_lengths_for_single(alphabet_size: Int, value: Int) -> List(Int) {
+  alphabet_lengths_for_single_loop(alphabet_size, value, [])
+}
+
+fn alphabet_lengths_for_single_loop(
+  remaining: Int,
+  value: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case remaining {
+    0 -> acc
+    _ -> alphabet_lengths_for_single_loop(remaining - 1, value, [value, ..acc])
+  }
+}
+
+fn replace_length(lengths: List(Int), idx: Int, value: Int) -> List(Int) {
+  replace_length_loop(lengths, idx, value, 0, [])
+}
+
+fn replace_length_loop(
+  lengths: List(Int),
+  idx: Int,
+  value: Int,
+  cur: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case lengths {
+    [] -> list.reverse(acc)
+    [head, ..rest] -> {
+      let next = case cur == idx {
+        True -> value
+        False -> head
+      }
+      replace_length_loop(rest, idx, value, cur + 1, [next, ..acc])
+    }
+  }
+}
+
+fn build_length_list_for_alphabet(
+  d: dict.Dict(Int, Int),
+  idx: Int,
+  alphabet_size: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case idx >= alphabet_size {
+    True -> list.reverse(acc)
+    False -> {
+      let len = case dict.get(d, idx) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      build_length_list_for_alphabet(d, idx + 1, alphabet_size, [len, ..acc])
+    }
+  }
+}
+
+// -- LZ77 match finder ------------------------------------------------
+
+fn build_lz77_commands(bytes: BitArray, total: Int) -> List(BrCommand) {
+  let #(commands_rev, _) = lz77_match_loop(bytes, 0, total, 0, dict.new(), [])
+  let trailing = total - find_consumed_position(commands_rev, 0)
+  let commands_rev = case trailing {
+    0 -> commands_rev
+    _ -> [
+      BrCommand(insert_len: trailing, copy_len: 0, distance: 0),
+      ..commands_rev
+    ]
+  }
+  list.reverse(commands_rev)
+}
+
+fn find_consumed_position(commands_rev: List(BrCommand), acc: Int) -> Int {
+  case commands_rev {
+    [] -> acc
+    list -> find_consumed_position_sum(list, 0)
+  }
+}
+
+fn find_consumed_position_sum(commands_rev: List(BrCommand), acc: Int) -> Int {
+  case commands_rev {
+    [] -> acc
+    [cmd, ..rest] ->
+      find_consumed_position_sum(rest, acc + cmd.insert_len + cmd.copy_len)
+  }
+}
+
+fn lz77_match_loop(
+  bytes: BitArray,
+  pos: Int,
+  total: Int,
+  last_emit: Int,
+  hashes: dict.Dict(Int, Int),
+  commands_rev: List(BrCommand),
+) -> #(List(BrCommand), Int) {
+  case pos + lz77_min_match > total {
+    True -> #(commands_rev, last_emit)
+    False -> {
+      let b0 = brotli_byte_at(bytes, pos)
+      let b1 = brotli_byte_at(bytes, pos + 1)
+      let b2 = brotli_byte_at(bytes, pos + 2)
+      let b3 = brotli_byte_at(bytes, pos + 3)
+      let key = brotli_hash4(b0, b1, b2, b3)
+      case dict.get(hashes, key) {
+        Error(_) ->
+          lz77_match_loop(
+            bytes,
+            pos + 1,
+            total,
+            last_emit,
+            dict.insert(hashes, key, pos),
+            commands_rev,
+          )
+        Ok(prev) ->
+          lz77_consider_match(
+            bytes,
+            pos,
+            total,
+            last_emit,
+            hashes,
+            commands_rev,
+            prev,
+          )
+      }
+    }
+  }
+}
+
+fn lz77_consider_match(
+  bytes: BitArray,
+  pos: Int,
+  total: Int,
+  last_emit: Int,
+  hashes: dict.Dict(Int, Int),
+  commands_rev: List(BrCommand),
+  prev: Int,
+) -> #(List(BrCommand), Int) {
+  let distance = pos - prev
+  case distance <= 0 || distance > lz77_max_distance {
+    True ->
+      lz77_match_loop(
+        bytes,
+        pos + 1,
+        total,
+        last_emit,
+        dict.insert(hashes, brotli_byte_key(bytes, pos), pos),
+        commands_rev,
+      )
+    False -> {
+      let cap = case total - pos < lz77_max_match {
+        True -> total - pos
+        False -> lz77_max_match
+      }
+      let m_len = brotli_match_len(bytes, prev, pos, cap, 0)
+      case m_len >= lz77_min_match {
+        True -> {
+          let cmd =
+            BrCommand(
+              insert_len: pos - last_emit,
+              copy_len: m_len,
+              distance: distance,
+            )
+          let hashes =
+            brotli_update_hashes(
+              bytes,
+              dict.insert(hashes, brotli_byte_key(bytes, pos), pos),
+              pos + 1,
+              pos + m_len,
+              total,
+            )
+          lz77_match_loop(bytes, pos + m_len, total, pos + m_len, hashes, [
+            cmd,
+            ..commands_rev
+          ])
+        }
+        False ->
+          lz77_match_loop(
+            bytes,
+            pos + 1,
+            total,
+            last_emit,
+            dict.insert(hashes, brotli_byte_key(bytes, pos), pos),
+            commands_rev,
+          )
+      }
+    }
+  }
+}
+
+fn brotli_byte_key(bytes: BitArray, pos: Int) -> Int {
+  let b0 = brotli_byte_at(bytes, pos)
+  let b1 = brotli_byte_at(bytes, pos + 1)
+  let b2 = brotli_byte_at(bytes, pos + 2)
+  let b3 = brotli_byte_at(bytes, pos + 3)
+  brotli_hash4(b0, b1, b2, b3)
+}
+
+fn brotli_hash4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int {
+  int.bitwise_and(
+    int.bitwise_exclusive_or(
+      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
+      int.bitwise_exclusive_or(b2 * 2_246_822_519, b3 * 374_761_393),
+    ),
+    0x3FFFF,
+  )
+}
+
+fn brotli_byte_at(bytes: BitArray, pos: Int) -> Int {
+  case bit_array.slice(bytes, pos, 1) {
+    Ok(<<b>>) -> b
+    _ -> 0
+  }
+}
+
+fn brotli_match_len(
+  bytes: BitArray,
+  a: Int,
+  b: Int,
+  cap: Int,
+  count: Int,
+) -> Int {
+  case count >= cap {
+    True -> count
+    False ->
+      case
+        brotli_byte_at(bytes, a + count) == brotli_byte_at(bytes, b + count)
+      {
+        True -> brotli_match_len(bytes, a, b, cap, count + 1)
+        False -> count
+      }
+  }
+}
+
+fn brotli_update_hashes(
+  bytes: BitArray,
+  hashes: dict.Dict(Int, Int),
+  start: Int,
+  stop: Int,
+  total: Int,
+) -> dict.Dict(Int, Int) {
+  case start >= stop || start + lz77_min_match > total {
+    True -> hashes
+    False ->
+      brotli_update_hashes(
+        bytes,
+        dict.insert(hashes, brotli_byte_key(bytes, start), start),
+        start + 1,
+        stop,
+        total,
+      )
+  }
+}
+
+// -- IC + distance code encoding --------------------------------------
+
+fn lz77_pick_insert_code(insert_len: Int) -> #(Int, Int, Int) {
+  let code = pick_insert_code_for_length(insert_len)
+  let extras_bits = insert_extra_bits_for(code)
+  let extras_value = insert_len - insert_base_offset(code)
+  #(code, extras_bits, extras_value)
+}
+
+fn lz77_pick_copy_code(copy_len: Int) -> #(Int, Int, Int) {
+  let code = pick_copy_code_for_length(copy_len)
+  let extras_bits = copy_extra_bits_for(code)
+  let extras_value = copy_len - copy_base_offset(code)
+  #(code, extras_bits, extras_value)
+}
+
+fn pick_copy_code_for_length(copy_len: Int) -> Int {
+  case copy_len {
+    n if n <= 9 -> n - 2
+    n if n <= 11 -> 8
+    n if n <= 13 -> 9
+    n if n <= 17 -> 10
+    n if n <= 21 -> 11
+    n if n <= 29 -> 12
+    n if n <= 37 -> 13
+    n if n <= 53 -> 14
+    n if n <= 69 -> 15
+    n if n <= 101 -> 16
+    n if n <= 133 -> 17
+    n if n <= 197 -> 18
+    n if n <= 325 -> 19
+    n if n <= 581 -> 20
+    n if n <= 1093 -> 21
+    n if n <= 2117 -> 22
+    _ -> 23
+  }
+}
+
+fn copy_extra_bits_for(code: Int) -> Int {
+  case code {
+    n if n <= 7 -> 0
+    8 | 9 -> 1
+    10 | 11 -> 2
+    12 | 13 -> 3
+    14 | 15 -> 4
+    16 | 17 -> 5
+    18 -> 6
+    19 -> 7
+    20 -> 8
+    21 -> 9
+    22 -> 10
+    _ -> 24
+  }
+}
+
+fn copy_base_offset(code: Int) -> Int {
+  case code {
+    n if n <= 7 -> 2 + n
+    8 -> 10
+    9 -> 12
+    10 -> 14
+    11 -> 18
+    12 -> 22
+    13 -> 30
+    14 -> 38
+    15 -> 54
+    16 -> 70
+    17 -> 102
+    18 -> 134
+    19 -> 198
+    20 -> 326
+    21 -> 582
+    22 -> 1094
+    _ -> 2118
+  }
+}
+
+// IC symbol for an explicit-distance command (cell_idx ≥ 2).  Mirrors
+// `cmd_lut_entry`'s decode: each cell carries 64 symbols, 8 insert
+// sub-values × 8 copy sub-values.  The cell index is determined by
+// the (insert_bucket, copy_bucket) pair where bucket = code / 8 * 8.
+fn lz77_ic_symbol(insert_code: Int, copy_code: Int) -> Int {
+  let insert_bucket = insert_code / 8 * 8
+  let copy_bucket = copy_code / 8 * 8
+  let cell_idx = lz77_cell_idx(insert_bucket, copy_bucket)
+  let within = { insert_code % 8 } * 8 + { copy_code % 8 }
+  cell_idx * 64 + within
+}
+
+fn lz77_cell_idx(insert_bucket: Int, copy_bucket: Int) -> Int {
+  case insert_bucket, copy_bucket {
+    0, 0 -> 2
+    0, 8 -> 3
+    8, 0 -> 4
+    8, 8 -> 5
+    0, 16 -> 6
+    16, 0 -> 7
+    8, 16 -> 8
+    16, 8 -> 9
+    _, _ -> 10
+  }
+}
+
+// Distance code (NPOSTFIX=0, NDIRECT=0).  Per RFC 7932 §4 long
+// distances start at code 16.  Returns the code in `16..63` and the
+// extra bits/value to emit alongside it.
+fn lz77_distance_code(d: Int) -> #(Int, Int, Int) {
+  lz77_distance_code_loop(d, 0)
+}
+
+fn lz77_distance_code_loop(d: Int, g: Int) -> #(Int, Int, Int) {
+  let bits = g / 2 + 1
+  let half = g % 2
+  let base = int.bitwise_shift_left(2 + half, bits) - 3
+  let span = int.bitwise_shift_left(1, bits)
+  case d >= base && d < base + span {
+    True -> #(16 + g, bits, d - base)
+    False -> lz77_distance_code_loop(d, g + 1)
+  }
+}
+
+// -- Frequency tallying for the three Huffman alphabets ---------------
+
+fn tally_literal_freqs(
+  bytes: BitArray,
+  commands: List(BrCommand),
+  pos: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case commands {
+    [] -> acc
+    [cmd, ..rest] -> {
+      let acc = tally_literal_range(bytes, pos, cmd.insert_len, acc)
+      tally_literal_freqs(bytes, rest, pos + cmd.insert_len + cmd.copy_len, acc)
+    }
+  }
+}
+
+fn tally_literal_range(
+  bytes: BitArray,
+  pos: Int,
+  count: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case count {
+    0 -> acc
+    _ -> {
+      let byte = brotli_byte_at(bytes, pos)
+      let cur = case dict.get(acc, byte) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      tally_literal_range(
+        bytes,
+        pos + 1,
+        count - 1,
+        dict.insert(acc, byte, cur + 1),
+      )
+    }
+  }
+}
+
+fn tally_ic_freqs(
+  commands: List(BrCommand),
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case commands {
+    [] -> acc
+    [cmd, ..rest] -> {
+      let #(ic_sym, _, _, _, _) = derive_ic_fields(cmd)
+      let cur = case dict.get(acc, ic_sym) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      tally_ic_freqs(rest, dict.insert(acc, ic_sym, cur + 1))
+    }
+  }
+}
+
+fn tally_distance_freqs(
+  commands: List(BrCommand),
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case commands {
+    [] -> acc
+    [cmd, ..rest] ->
+      case cmd.copy_len > 0 {
+        False -> tally_distance_freqs(rest, acc)
+        True -> {
+          let #(code, _, _) = lz77_distance_code(cmd.distance)
+          let cur = case dict.get(acc, code) {
+            Ok(v) -> v
+            Error(_) -> 0
+          }
+          tally_distance_freqs(rest, dict.insert(acc, code, cur + 1))
+        }
+      }
+  }
+}
+
+// Returns (ic_symbol, ins_extra_bits, ins_extra_value,
+// copy_extra_bits, copy_extra_value).  For terminal commands
+// (copy_len == 0) we use copy_code 2 (copy_len 4, no extras) — the
+// metablock will end after the insert step because state.remaining
+// hits 0, so the copy_len value is never observed.  copy_code 2 lives
+// in cell_idx 2's first row, so the IC symbol stays in the
+// explicit-distance bucket and the decoder still expects one
+// distance code, which we provide as distance 1 with no real copy.
+fn derive_ic_fields(cmd: BrCommand) -> #(Int, Int, Int, Int, Int) {
+  let #(insert_code, ins_bits, ins_value) =
+    lz77_pick_insert_code(cmd.insert_len)
+  let copy_len = case cmd.copy_len {
+    0 -> 4
+    n -> n
+  }
+  let #(copy_code, copy_bits, copy_value) = lz77_pick_copy_code(copy_len)
+  let ic_sym = lz77_ic_symbol(insert_code, copy_code)
+  #(ic_sym, ins_bits, ins_value, copy_bits, copy_value)
+}
+
+// -- Bitstream emission for the LZ77 metablock ------------------------
+
+fn emit_lz77_metablock_body(
+  writer: BitWriter,
+  bytes: BitArray,
+  mlen: Int,
+  commands: List(BrCommand),
+  lit_lengths: List(Int),
+  lit_codes: dict.Dict(Int, #(Int, Int)),
+  ic_lengths: List(Int),
+  ic_codes: dict.Dict(Int, #(Int, Int)),
+  dist_lengths: List(Int),
+  dist_codes: dict.Dict(Int, #(Int, Int)),
+) -> BitWriter {
+  // ISLAST=1, ISLASTEMPTY=0.
+  let writer = bw_write(writer, 1, 1)
+  let writer = bw_write(writer, 0, 1)
+  // MNIBBLES = 4 → 00; MLEN-1 in 16 bits.
+  let writer = bw_write(writer, 0, 2)
+  let writer = bw_write(writer, mlen - 1, 16)
+
+  // NBLTYPES (L, I, D) = 1 each, encoded as a single 0 bit.
+  let writer = bw_write(writer, 0, 1)
+  let writer = bw_write(writer, 0, 1)
+  let writer = bw_write(writer, 0, 1)
+
+  // NPOSTFIX = 0, NDIRECT = 0.
+  let writer = bw_write(writer, 0, 2)
+  let writer = bw_write(writer, 0, 4)
+
+  // Context mode for the single literal block type: LSB6 = 0.
+  let writer = bw_write(writer, 0, 2)
+
+  // NTREESL = NTREESD = 1, encoded as a 0 bit each.
+  let writer = bw_write(writer, 0, 1)
+  let writer = bw_write(writer, 0, 1)
+
+  // Three complex-form Huffman descriptors.
+  let writer = emit_complex_huffman_descriptor(writer, lit_lengths, 256)
+  let writer = emit_complex_huffman_descriptor(writer, ic_lengths, 704)
+  let writer = emit_complex_huffman_descriptor(writer, dist_lengths, 64)
+
+  // Command stream.
+  emit_lz77_commands(
+    writer,
+    bytes,
+    0,
+    commands,
+    lit_codes,
+    ic_codes,
+    dist_codes,
+  )
+}
+
+fn emit_lz77_commands(
+  writer: BitWriter,
+  bytes: BitArray,
+  pos: Int,
+  commands: List(BrCommand),
+  lit_codes: dict.Dict(Int, #(Int, Int)),
+  ic_codes: dict.Dict(Int, #(Int, Int)),
+  dist_codes: dict.Dict(Int, #(Int, Int)),
+) -> BitWriter {
+  case commands {
+    [] -> writer
+    [cmd, ..rest] -> {
+      let #(ic_sym, ins_bits, ins_value, copy_bits, copy_value) =
+        derive_ic_fields(cmd)
+      let writer = emit_huffman_symbol(writer, ic_codes, ic_sym)
+      let writer = bw_write(writer, ins_value, ins_bits)
+      let writer = bw_write(writer, copy_value, copy_bits)
+      let writer =
+        emit_literal_run(writer, bytes, pos, cmd.insert_len, lit_codes)
+      let next_pos = pos + cmd.insert_len
+      let writer = case cmd.copy_len {
+        0 -> {
+          // Synthetic copy_code still occupies a slot in cell_idx 2,
+          // so the decoder still expects a distance code.  Use the
+          // first available short-distance derived offset (code 16,
+          // extras 0 = distance 1) — the copy is never executed
+          // because state.remaining hits 0 after the insert step.
+          let #(d_code, d_bits, d_value) = lz77_distance_code(1)
+          let writer = emit_huffman_symbol(writer, dist_codes, d_code)
+          bw_write(writer, d_value, d_bits)
+        }
+        _ -> {
+          let #(d_code, d_bits, d_value) = lz77_distance_code(cmd.distance)
+          let writer = emit_huffman_symbol(writer, dist_codes, d_code)
+          bw_write(writer, d_value, d_bits)
+        }
+      }
+      emit_lz77_commands(
+        writer,
+        bytes,
+        next_pos + cmd.copy_len,
+        rest,
+        lit_codes,
+        ic_codes,
+        dist_codes,
+      )
+    }
+  }
+}
+
+fn emit_literal_run(
+  writer: BitWriter,
+  bytes: BitArray,
+  pos: Int,
+  remaining: Int,
+  codes: dict.Dict(Int, #(Int, Int)),
+) -> BitWriter {
+  case remaining {
+    0 -> writer
+    _ -> {
+      let byte = brotli_byte_at(bytes, pos)
+      let writer = emit_huffman_symbol(writer, codes, byte)
+      emit_literal_run(writer, bytes, pos + 1, remaining - 1, codes)
+    }
+  }
+}
+
+fn emit_huffman_symbol(
+  writer: BitWriter,
+  codes: dict.Dict(Int, #(Int, Int)),
+  symbol: Int,
+) -> BitWriter {
+  let #(code, length) = case dict.get(codes, symbol) {
+    Ok(v) -> v
+    Error(_) -> #(0, 0)
+  }
+  bw_write_code_msb_first(writer, code, length)
+}
 
 fn emit_empty_last_metablock(writer: BitWriter) -> BitWriter {
   // ISLAST=1, ISLASTEMPTY=1.

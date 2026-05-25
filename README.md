@@ -107,15 +107,17 @@ Implemented codecs and archive families:
   as `cat a.zst b.zst`)
 - **brotli**: full RFC 7932 decoder (uncompressed + compressed
   metablocks, static dictionary, context maps, block switching).
-  The encoder now picks the smaller of an uncompressed-only stream
-  and a single ISLAST=1 compressed metablock that codes the literal
-  alphabet under a complex-form Huffman descriptor (CL table
-  length-limited to 5 bits, RLE-encoded with sym 16 / 17 chain-
-  breaking, alphabet trimmed once the CL Huffman space is
-  exhausted).  LZ77 matches still aren't emitted yet, so the
-  compressed-literals path only helps repetitive-byte payloads —
-  but those round-trip through both the packkit decoder and the
-  reference `brotli` CLI.
+  The encoder now picks the smallest of three candidates per
+  payload: an uncompressed-only stream, a literals-only compressed
+  metablock with a complex-form 256-symbol Huffman code, and a real
+  LZ77 compressed metablock that emits insert-and-copy commands.
+  The LZ77 path runs a greedy 4-byte hash-chain match finder over a
+  32 KiB window, picks `cell_idx ≥ 2` IC cells so distances are
+  always read from a dedicated Huffman code, and emits all three
+  complex-form descriptors (literal / IC / distance).  Repetitive
+  payloads compress aggressively — 1 KiB of zeros to ~60 bytes,
+  `"abc" x 100` to ~54 bytes — and every output round-trips through
+  both the packkit decoder and the reference `brotli` CLI.
 
 The facade (`packkit.compress`, `packkit.decompress`, `packkit.read`,
 `packkit.write`, `packkit.pack`, `packkit.unpack`) is wired to these
@@ -127,9 +129,11 @@ the signatures are matched strictly (gzip requires CM=8, zlib
 verifies the RFC 1950 check bits, bzip2 requires the block-size
 digit, ...).
 
-Still pending: brotli LZ77 matches in the encoder (literals are
-Huffman-coded, but every command still has copy_len = 0 so the
-compressed metablock only shortens via literal entropy).
+Still pending: brotli context modeling, block-type switching, and
+multi-tree context maps in the encoder; the LZ77 path always uses
+NPOSTFIX=0 / NDIRECT=0 / single trees (NBLTYPESL=I=D=1, NTREESL=
+NTREESD=1) so the distance prefix code is the full 64-symbol
+alphabet with no postfix sharing.
 The zstd encoder now emits Compressed_Blocks with both Huffman-
 coded literals (1-stream ≤ 1023-byte and 4-stream ≤ 16 KiB chunk
 forms) and real LZ77 sequences (greedy 3-byte hash-chain match
