@@ -2,15 +2,22 @@
 ////
 //// The reader handles the common case produced by `7z a` on a small
 //// payload: a single packed stream wrapped in a single folder that
-//// uses one coder, either raw LZMA (`0x03 0x01 0x01`) or LZMA2
-//// (`0x21`).  Multiple files packed into that folder are supported
-//// when the archive carries a `SubStreamsInfo` block — the parser
-//// reads the per-substream sizes from `kSize` (0x09), derives the
-//// final size from the folder's total, and splits the decoded
-//// stream accordingly.  Multi-coder folders, BCJ filters, multiple
-//// folders, encryption, and most encoded-header variants are
-//// intentionally rejected with typed `ArchiveNotImplemented`
-//// errors so the reader is easy to extend incrementally.
+//// uses one coder.  Recognised single-coder ids:
+////   - LZMA2 (`0x21`)
+////   - raw LZMA (`0x03 0x01 0x01`)
+////   - Copy (`0x00`) — identity passthrough
+////   - Deflate (`0x04 0x01 0x08`) — raw DEFLATE, delegated to packkit/deflate
+////   - BZip2 (`0x04 0x02 0x02`) — full BZh stream, delegated to packkit/bzip2
+//// Multiple files packed into that folder are supported when the
+//// archive carries a `SubStreamsInfo` block — the parser reads the
+//// per-substream sizes from `kSize` (0x09), derives the final size
+//// from the folder's total, and splits the decoded stream
+//// accordingly.  Multi-coder folders, BCJ filters, multiple folders,
+//// encryption, and most encoded-header variants are intentionally
+//// rejected with typed `ArchiveNotImplemented` errors so the reader
+//// is easy to extend incrementally.  The encoder is unaffected —
+//// it still emits a single LZMA-coded folder regardless of which
+//// coders the decoder accepts.
 
 import gleam/bit_array
 import gleam/bool
@@ -19,7 +26,9 @@ import gleam/list
 import gleam/result
 import gleam/string
 import packkit/archive as archives
+import packkit/bzip2
 import packkit/checksum
+import packkit/deflate
 import packkit/entry
 import packkit/error
 import packkit/internal/lzma
@@ -34,6 +43,20 @@ const lzma_coder_id_high: Int = 0x03
 const lzma_coder_id_mid: Int = 0x01
 
 const lzma_coder_id_low: Int = 0x01
+
+const copy_coder_id: Int = 0x00
+
+const deflate_coder_id_high: Int = 0x04
+
+const deflate_coder_id_mid: Int = 0x01
+
+const deflate_coder_id_low: Int = 0x08
+
+const bzip2_coder_id_high: Int = 0x04
+
+const bzip2_coder_id_mid: Int = 0x02
+
+const bzip2_coder_id_low: Int = 0x02
 
 // NIDs from the 7z specification.
 const nid_end: Int = 0x00
@@ -421,7 +444,7 @@ pub fn decode_with_limits(
   ))
   use header <- result.try(case next_header_bytes {
     <<n, rest:bytes>> if n == nid_encoded_header ->
-      decode_encoded_header(rest, bytes)
+      decode_encoded_header(rest, bytes, limits)
     _ -> Ok(next_header_bytes)
   })
   use parsed <- result.try(parse_header(header))
@@ -433,6 +456,7 @@ pub fn decode_with_limits(
 fn decode_encoded_header(
   bytes_after_nid: BitArray,
   full_archive: BitArray,
+  limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
   // The encoded-header body is a StreamsInfo block describing the
   // packed stream(s) that contain the *actual* next-header bytes.
@@ -454,7 +478,7 @@ fn decode_encoded_header(
         pack_size,
         "7z encoded-header packed bytes",
       ))
-      decode_folder(packed, folder, unpack_sizes)
+      decode_folder(packed, folder, unpack_sizes, limits)
     }
   }
 }
@@ -521,6 +545,9 @@ type ParsedFolder {
 type CoderId {
   Lzma2
   Lzma
+  Copy
+  Deflate
+  BZip2
 }
 
 // -- top-level header parser -------------------------------------------
@@ -909,12 +936,23 @@ fn parse_single_folder(
 
 fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) {
   case id_bytes {
+    <<b>> if b == copy_coder_id -> Ok(Copy)
     <<b>> if b == lzma2_coder_id -> Ok(Lzma2)
     <<b1, b2, b3>>
       if b1 == lzma_coder_id_high
       && b2 == lzma_coder_id_mid
       && b3 == lzma_coder_id_low
     -> Ok(Lzma)
+    <<b1, b2, b3>>
+      if b1 == deflate_coder_id_high
+      && b2 == deflate_coder_id_mid
+      && b3 == deflate_coder_id_low
+    -> Ok(Deflate)
+    <<b1, b2, b3>>
+      if b1 == bzip2_coder_id_high
+      && b2 == bzip2_coder_id_mid
+      && b3 == bzip2_coder_id_low
+    -> Ok(BZip2)
     _ ->
       Error(error.ArchiveNotImplemented(
         feature: "7z coder id " <> describe_bit_array_hex(id_bytes, ""),
@@ -1433,6 +1471,7 @@ fn decode_archive(
     packed,
     parsed.folder,
     parsed.unpack_sizes,
+    limits,
   ))
   build_archive_entries(plain, parsed, limits)
 }
@@ -1453,10 +1492,106 @@ fn decode_folder(
   packed: BitArray,
   folder: ParsedFolder,
   unpack_sizes: List(Int),
+  limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
   case folder.coder_id {
     Lzma2 -> decode_lzma2_payload(packed, folder.properties, unpack_sizes)
     Lzma -> decode_raw_lzma(packed, folder.properties, unpack_sizes)
+    Copy -> decode_copy_coder(packed, unpack_sizes)
+    Deflate -> decode_deflate_coder(packed, unpack_sizes, limits)
+    BZip2 -> decode_bzip2_coder(packed, unpack_sizes, limits)
+  }
+}
+
+fn folder_unpack_total(unpack_sizes: List(Int)) -> Int {
+  case unpack_sizes {
+    [size, ..] -> size
+    [] -> 0
+  }
+}
+
+// The Copy coder is identity: packed bytes ARE the folder's unpacked
+// bytes.  7z still records the unpack size, so we cross-check and
+// reject a packed slice that's smaller than the declared size (which
+// would point at a truncated archive) or trim a trailing tail the
+// folder slice carries past the declared end (rare, but tolerated by
+// reference implementations).
+fn decode_copy_coder(
+  packed: BitArray,
+  unpack_sizes: List(Int),
+) -> Result(BitArray, error.ArchiveError) {
+  let target = folder_unpack_total(unpack_sizes)
+  let packed_size = bit_array.byte_size(packed)
+  case packed_size >= target {
+    True ->
+      case bit_array.slice(packed, 0, target) {
+        Ok(b) -> Ok(b)
+        Error(_) ->
+          Error(error.ArchiveInvalid(message: "7z Copy coder slice failed"))
+      }
+    False ->
+      Error(error.ArchiveInvalid(
+        message: "7z Copy coder packed size "
+        <> int.to_string(packed_size)
+        <> " < declared unpack size "
+        <> int.to_string(target),
+      ))
+  }
+}
+
+// 7z's Deflate coder carries a raw DEFLATE stream (no zlib / gzip
+// wrapper), which is exactly what `deflate.decode` expects.  Limits
+// are threaded through `decode_with_limits` so a corrupted stream
+// that decompresses past `max_output_bytes` surfaces as the typed
+// limit error instead of allocating without bound.
+fn decode_deflate_coder(
+  packed: BitArray,
+  unpack_sizes: List(Int),
+  limits: limit.Limits,
+) -> Result(BitArray, error.ArchiveError) {
+  let target = folder_unpack_total(unpack_sizes)
+  case deflate.decode_with_limits(bytes: packed, limits: limits) {
+    Ok(plain) -> verify_unpack_size(plain, target, "Deflate")
+    Error(err) -> Error(codec_to_archive(err))
+  }
+}
+
+// 7z's BZip2 coder carries a complete bzip2 stream (BZh magic and
+// all), so we delegate directly to `bzip2.decode_with_limits`.
+fn decode_bzip2_coder(
+  packed: BitArray,
+  unpack_sizes: List(Int),
+  limits: limit.Limits,
+) -> Result(BitArray, error.ArchiveError) {
+  let target = folder_unpack_total(unpack_sizes)
+  case bzip2.decode_with_limits(bytes: packed, limits: limits) {
+    Ok(plain) -> verify_unpack_size(plain, target, "BZip2")
+    Error(err) -> Error(codec_to_archive(err))
+  }
+}
+
+// Cross-check the codec output length against the folder's declared
+// unpack size.  A mismatch usually means a truncated payload or
+// header tampering; surface it as `ArchiveInvalid` rather than
+// silently handing the caller a short or oversized buffer that would
+// break later substream splitting.
+fn verify_unpack_size(
+  plain: BitArray,
+  expected: Int,
+  coder_name: String,
+) -> Result(BitArray, error.ArchiveError) {
+  let actual = bit_array.byte_size(plain)
+  case actual == expected {
+    True -> Ok(plain)
+    False ->
+      Error(error.ArchiveInvalid(
+        message: "7z "
+        <> coder_name
+        <> " unpacked "
+        <> int.to_string(actual)
+        <> " bytes but folder declared "
+        <> int.to_string(expected),
+      ))
   }
 }
 

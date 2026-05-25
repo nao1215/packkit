@@ -52,13 +52,22 @@ Implemented codecs and archive families:
   PKWARE traditional ("ZipCrypto") encryption decode via
   `zip.decode_with_password` (the strong-encryption gp flag bit
   is rejected explicitly rather than decoded as ZipCrypto)
-- **7z**: single-folder LZMA / LZMA2 reader (covers the common
-  `7z a` single-file case).  The encoder builds a single-folder,
-  single-coder archive with a raw LZMA1 coder, emitting the
-  `PackInfo` / `UnPackInfo` / optional `SubStreamsInfo` blocks
-  plus the `FilesInfo` UTF-16 LE name table.  Multi-file archives
+- **7z**: single-folder reader.  Recognised single-coder ids:
+  LZMA (`0x03 0x01 0x01`), LZMA2 (`0x21`), Copy (`0x00`),
+  Deflate (`0x04 0x01 0x08`), and BZip2 (`0x04 0x02 0x02`) — so
+  archives produced with `7z a -m0=Copy / -m0=Deflate /
+  -m0=BZip2` decode end-to-end alongside the default LZMA family.
+  Multi-coder folders, multiple folders, BCJ/Delta filters, and
+  encryption are still rejected with typed
+  `ArchiveNotImplemented` errors so the reader is easy to extend
+  incrementally.  The encoder builds a single-folder, single-coder
+  archive with a raw LZMA1 coder, emitting the `PackInfo` /
+  `UnPackInfo` / optional `SubStreamsInfo` blocks plus the
+  `FilesInfo` UTF-16 LE name table.  Multi-file archives
   round-trip; non-`File` entries are rejected because the encoder
-  does not emit `EmptyStream` / `Attribute` blocks yet
+  does not emit `EmptyStream` / `Attribute` blocks yet, and the
+  encoder still emits LZMA only (the new Copy / Deflate / BZip2
+  coverage is decode-side)
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
   LZ77 encoder (3-byte hash chain, 32 KiB window) with fixed-Huffman
   (`deflate.encode`) and dynamic-Huffman (`deflate.encode_dynamic`)
