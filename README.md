@@ -121,17 +121,19 @@ the signatures are matched strictly (gzip requires CM=8, zlib
 verifies the RFC 1950 check bits, bzip2 requires the block-size
 digit, ...).
 
-Still pending: brotli LZ77/Huffman compression in the encoder,
-and a zstd encoder that also does LZ77 sequence emission.
-The zstd encoder now emits a Compressed_Block with Huffman-coded
-literals on both the 1-stream form (≤ 1023-byte chunks) and the
-4-stream form (≤ 16 KiB chunks with a 6-byte jump table), holding
-~50 % compression ratio on English-like text across a wide range
-of input sizes.  The tree description picks the direct-weight
-form when the alphabet streams ≤ 127 weights and the FSE-
-compressed form (header byte 0..127 + FSE body) otherwise, so
-alphabets that use byte values above 127 are now Huffman-encoded
-instead of falling back to Raw / RLE.  The xz / 7z / ZIP method
+Still pending: brotli LZ77/Huffman compression in the encoder.
+The zstd encoder now emits Compressed_Blocks with both Huffman-
+coded literals (1-stream ≤ 1023-byte and 4-stream ≤ 16 KiB chunk
+forms) and real LZ77 sequences (greedy 3-byte hash-chain match
+finder, Predefined_Mode FSE for the LL / OF / ML alphabets), so
+repetitive payloads compress dramatically — a 16-byte motif x 50
+shrinks well below 200 bytes — and English-like text still
+holds steady at ~50 % through the Huffman path.  The Huffman
+tree description picks the direct-weight form when the alphabet
+streams ≤ 127 weights and the FSE-compressed form (header byte
+0..127 + FSE body) otherwise, so alphabets that use byte values
+above 127 are now Huffman-encoded instead of falling back to
+Raw / RLE.  The xz / 7z / ZIP method
 14 encoders share a real LZ77 LZMA1 encoder
 (`packkit/internal/lzma.encode_with_lz77`, 3-byte hash chain
 with a 32 KiB window plus LZMA rep-match and short-rep emission

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Feature (zstd)**: the zstd encoder now optionally emits a
+  Compressed_Block whose Sequences_Section carries real LZ77
+  sequences in addition to the existing literals-only path.  A
+  greedy 3-byte hash-chain match finder over each 16 KiB chunk
+  (32 KiB max distance) produces `Sequence(literal_length,
+  match_length, offset)` triples; the sequence symbols are
+  encoded under Predefined_Mode for all three FSE alphabets
+  (LL / OF / ML) so the sequence section is just
+  `Number_of_Sequences ++ 0x00 ++ FSE_bitstream`.  Each chunk
+  independently picks the smallest of Raw / RLE / Huffman /
+  sequences, so incompressible blocks never regress.  Highly
+  repetitive payloads now compress dramatically below the
+  literals-only floor — e.g. a 16-byte motif repeated 50 times
+  (800 bytes) drops to well under 200 bytes through the
+  sequences path.  Rep-match (`raw_offset` 1/2/3) optimisation
+  is still future work; every match emits a fresh raw offset.
 - **Feature (zip)**: ZIP decoder now reads entries protected by the
   PKWARE "traditional" / "ZipCrypto" encryption scheme via two new
   public entry points — `zip.decode_with_password` and

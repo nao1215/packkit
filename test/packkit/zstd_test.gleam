@@ -194,6 +194,26 @@ pub fn encode_uses_fse_huffman_for_wide_alphabet_test() -> Nil {
   decoded |> should.equal(payload)
 }
 
+pub fn encode_emits_lz77_sequences_block_for_repetitive_text_test() -> Nil {
+  // 800 bytes of a 16-byte motif repeated 50 times.  An encoder that
+  // only does literals-level compression (Huffman) gets at most ~4-5
+  // bits per byte for this kind of structured input; an LZ77 sequence
+  // encoder collapses every repeat into a single (literal_length=0,
+  // match_length=16, offset=16) sequence after the first emit, which
+  // brings the encoded size well under the literals-only floor.
+  let payload = repeat_bytes(<<"PACKKIT-ZSTD-LZ\n":utf8>>, 50)
+  let payload_size = bit_array.byte_size(payload)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+  // Sequence-based encoding should compress this payload to well
+  // under 25 % of its raw size — fail if not.
+  case bit_array.byte_size(encoded) * 4 < payload_size {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
 pub fn encode_compresses_skewed_wide_alphabet_via_fse_huffman_test() -> Nil {
   // 1000 bytes, alphabet of 150 distinct values, heavily skewed so
   // Huffman + FSE-form tree description actually beats Raw_Block.

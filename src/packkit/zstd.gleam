@@ -217,6 +217,14 @@ fn pick_best_block(chunk: BitArray, chunk_size: Int, is_last: Bool) -> BitArray 
     False -> None
   }
 
+  // LZ77 sequences block: Predefined_Mode for LL/OF/ML; only worth
+  // trying when there's enough input to amortise the ~10-byte FSE
+  // bitstream overhead.
+  let seq_block = case chunk_size >= 4 {
+    True -> try_sequences_block(chunk, chunk_size, is_last)
+    False -> None
+  }
+
   let candidates = [
     #(raw_size, raw_block),
     ..case rle_block {
@@ -230,6 +238,10 @@ fn pick_best_block(chunk: BitArray, chunk_size: Int, is_last: Bool) -> BitArray 
   }
   let candidates = case huff_4stream_block {
     Some(h) -> [#(bit_array.byte_size(h), h), ..candidates]
+    None -> candidates
+  }
+  let candidates = case seq_block {
+    Some(s) -> [#(bit_array.byte_size(s), s), ..candidates]
     None -> candidates
   }
   pick_smallest_block(candidates)
@@ -1529,6 +1541,671 @@ fn block_header(block_size: Int, block_type: Int, is_last: Bool) -> BitArray {
   let bh2 =
     int.bitwise_and(int.bitwise_shift_right(block_header_value, 16), 0xFF)
   <<bh0, bh1, bh2>>
+}
+
+// ============================================================
+// LZ77 sequences encoder (RFC 8478 §3.1.1.3)
+//
+// Greedy 3-byte hash-chain match finder over the chunk, emitting
+// `Sequence(literal_length, match_length, offset)` triples plus a
+// literal buffer.  Predefined_Mode is used for all three FSE
+// alphabets (LL / OF / ML) so the encoded sequence section is just
+// `Number_of_Sequences ++ 0x00 ++ FSE_bitstream`.  Sequence symbols
+// follow the standard zstd encoding (LL/ML base+extra-bit tables in
+// `packkit/internal/fse`; OF = high_bit(raw_offset) with raw_offset
+// = real_distance + 3 — rep-match optimisation is left as a follow-
+// up).  Initial encoder states are picked as the lowest state index
+// emitting the target symbol; subsequent transitions invert the
+// decoder's state table the same way the FSE-form Huffman tree
+// encoder does.
+// ============================================================
+
+type ZstdSequence {
+  ZstdSequence(literal_length: Int, match_length: Int, offset: Int)
+}
+
+const seq_lz77_min_match: Int = 3
+
+const seq_lz77_max_distance: Int = 0x8000
+
+const seq_lz77_max_match: Int = 131_074
+
+/// Run a greedy LZ77 match finder over `chunk` and return the list of
+/// emitted sequences (in input order) plus the concatenated literal
+/// buffer (every byte not covered by a match).  Lengths and offsets
+/// are real values — converting them to the LL/OF/ML wire symbols is
+/// the next stage's job.
+fn build_zstd_sequences(
+  chunk: BitArray,
+  chunk_size: Int,
+) -> #(List(ZstdSequence), BitArray) {
+  let #(sequences_rev, literals_acc, _) =
+    zstd_lz77_loop(chunk, 0, chunk_size, 0, dict.new(), [], <<>>)
+  #(list.reverse(sequences_rev), literals_acc)
+}
+
+fn zstd_lz77_loop(
+  bytes: BitArray,
+  pos: Int,
+  size: Int,
+  last_emit: Int,
+  hashes: dict.Dict(Int, Int),
+  seqs_rev: List(ZstdSequence),
+  literals: BitArray,
+) -> #(List(ZstdSequence), BitArray, Int) {
+  case pos >= size {
+    True -> {
+      // Trailing literals (last partial run from `last_emit` to end).
+      let trailing = zstd_byte_slice(bytes, last_emit, size - last_emit)
+      let final_literals = bit_array.concat([literals, trailing])
+      #(seqs_rev, final_literals, pos)
+    }
+    False ->
+      case pos + seq_lz77_min_match > size {
+        True ->
+          zstd_lz77_loop(
+            bytes,
+            pos + 1,
+            size,
+            last_emit,
+            hashes,
+            seqs_rev,
+            literals,
+          )
+        False -> {
+          let b0 = zstd_byte_at(bytes, pos)
+          let b1 = zstd_byte_at(bytes, pos + 1)
+          let b2 = zstd_byte_at(bytes, pos + 2)
+          let key = zstd_hash3(b0, b1, b2)
+          case dict.get(hashes, key) {
+            Error(_) ->
+              zstd_lz77_loop(
+                bytes,
+                pos + 1,
+                size,
+                last_emit,
+                dict.insert(hashes, key, pos),
+                seqs_rev,
+                literals,
+              )
+            Ok(prev) -> {
+              let distance = pos - prev
+              case distance <= 0 || distance > seq_lz77_max_distance {
+                True ->
+                  zstd_lz77_loop(
+                    bytes,
+                    pos + 1,
+                    size,
+                    last_emit,
+                    dict.insert(hashes, key, pos),
+                    seqs_rev,
+                    literals,
+                  )
+                False -> {
+                  let cap = case size - pos < seq_lz77_max_match {
+                    True -> size - pos
+                    False -> seq_lz77_max_match
+                  }
+                  let m_len = zstd_match_len(bytes, prev, pos, cap, 0)
+                  case m_len >= seq_lz77_min_match {
+                    True -> {
+                      let lit_len = pos - last_emit
+                      let lit_bytes = zstd_byte_slice(bytes, last_emit, lit_len)
+                      let seq =
+                        ZstdSequence(
+                          literal_length: lit_len,
+                          match_length: m_len,
+                          offset: distance,
+                        )
+                      let hashes =
+                        zstd_update_hashes_range(
+                          bytes,
+                          dict.insert(hashes, key, pos),
+                          pos + 1,
+                          pos + m_len,
+                          size,
+                        )
+                      zstd_lz77_loop(
+                        bytes,
+                        pos + m_len,
+                        size,
+                        pos + m_len,
+                        hashes,
+                        [seq, ..seqs_rev],
+                        bit_array.concat([literals, lit_bytes]),
+                      )
+                    }
+                    False ->
+                      zstd_lz77_loop(
+                        bytes,
+                        pos + 1,
+                        size,
+                        last_emit,
+                        dict.insert(hashes, key, pos),
+                        seqs_rev,
+                        literals,
+                      )
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+  }
+}
+
+fn zstd_hash3(b0: Int, b1: Int, b2: Int) -> Int {
+  int.bitwise_and(
+    int.bitwise_exclusive_or(
+      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
+      b2 * 2_246_822_519,
+    ),
+    0xFFFF,
+  )
+}
+
+fn zstd_byte_at(bytes: BitArray, pos: Int) -> Int {
+  case bit_array.slice(bytes, pos, 1) {
+    Ok(<<b>>) -> b
+    _ -> 0
+  }
+}
+
+fn zstd_byte_slice(bytes: BitArray, offset: Int, length: Int) -> BitArray {
+  case bit_array.slice(bytes, offset, length) {
+    Ok(v) -> v
+    Error(_) -> <<>>
+  }
+}
+
+fn zstd_match_len(
+  bytes: BitArray,
+  base: Int,
+  cursor: Int,
+  cap: Int,
+  acc: Int,
+) -> Int {
+  case acc >= cap {
+    True -> acc
+    False ->
+      case
+        zstd_byte_at(bytes, base + acc) == zstd_byte_at(bytes, cursor + acc)
+      {
+        True -> zstd_match_len(bytes, base, cursor, cap, acc + 1)
+        False -> acc
+      }
+  }
+}
+
+fn zstd_update_hashes_range(
+  bytes: BitArray,
+  hashes: dict.Dict(Int, Int),
+  from: Int,
+  to: Int,
+  size: Int,
+) -> dict.Dict(Int, Int) {
+  case from >= to || from + seq_lz77_min_match > size {
+    True -> hashes
+    False -> {
+      let key =
+        zstd_hash3(
+          zstd_byte_at(bytes, from),
+          zstd_byte_at(bytes, from + 1),
+          zstd_byte_at(bytes, from + 2),
+        )
+      zstd_update_hashes_range(
+        bytes,
+        dict.insert(hashes, key, from),
+        from + 1,
+        to,
+        size,
+      )
+    }
+  }
+}
+
+// --- sequence symbol mapping ------------------------------------------
+
+// LL code from a literal_length value.  Mirrors `fse.ll_base` /
+// `fse.ll_extra_bits` (RFC 8478 §3.1.1.3.2.1.1).
+fn ll_to_code(length: Int) -> Int {
+  case length {
+    n if n >= 0 && n <= 15 -> n
+    n if n < 18 -> 16
+    n if n < 20 -> 17
+    n if n < 22 -> 18
+    n if n < 24 -> 19
+    n if n < 28 -> 20
+    n if n < 32 -> 21
+    n if n < 40 -> 22
+    n if n < 48 -> 23
+    n if n < 64 -> 24
+    n if n < 128 -> 25
+    n if n < 256 -> 26
+    n if n < 512 -> 27
+    n if n < 1024 -> 28
+    n if n < 2048 -> 29
+    n if n < 4096 -> 30
+    n if n < 8192 -> 31
+    n if n < 16_384 -> 32
+    n if n < 32_768 -> 33
+    n if n < 65_536 -> 34
+    _ -> 35
+  }
+}
+
+// ML code from a real match_length value (>= 3).  Base table is
+// offset by 3 — code 0 corresponds to length 3.
+fn ml_to_code(length: Int) -> Int {
+  case length {
+    n if n >= 3 && n <= 34 -> n - 3
+    n if n < 37 -> 32
+    n if n < 39 -> 33
+    n if n < 41 -> 34
+    n if n < 43 -> 35
+    n if n < 47 -> 36
+    n if n < 51 -> 37
+    n if n < 59 -> 38
+    n if n < 67 -> 39
+    n if n < 83 -> 40
+    n if n < 99 -> 41
+    n if n < 131 -> 42
+    n if n < 259 -> 43
+    n if n < 515 -> 44
+    n if n < 1027 -> 45
+    n if n < 2051 -> 46
+    n if n < 4099 -> 47
+    n if n < 8195 -> 48
+    n if n < 16_387 -> 49
+    n if n < 32_771 -> 50
+    n if n < 65_539 -> 51
+    _ -> 52
+  }
+}
+
+// OF code from a raw_offset (real_distance + 3 in the simple encoder
+// that never emits rep matches).  OF_code == high_bit(raw_offset).
+fn of_to_code(raw_offset: Int) -> Int {
+  fse.high_bit_position(raw_offset)
+}
+
+// --- predefined-mode FSE sequence encoder -----------------------------
+
+fn build_seq_enc_slots(
+  table: dict.Dict(Int, fse.StateEntry),
+  table_size: Int,
+) -> dict.Dict(Int, List(FseEncSlot)) {
+  build_seq_enc_slots_loop(table, 0, table_size, dict.new())
+}
+
+fn build_seq_enc_slots_loop(
+  table: dict.Dict(Int, fse.StateEntry),
+  s_idx: Int,
+  table_size: Int,
+  acc: dict.Dict(Int, List(FseEncSlot)),
+) -> dict.Dict(Int, List(FseEncSlot)) {
+  case s_idx >= table_size {
+    True -> acc
+    False -> {
+      let entry = case dict.get(table, s_idx) {
+        Ok(e) -> e
+        Error(_) -> fse.StateEntry(symbol: 0, nb_bits: 0, baseline: 0)
+      }
+      let span = int.bitwise_shift_left(1, entry.nb_bits)
+      let slot =
+        FseEncSlot(
+          state_idx: s_idx,
+          baseline: entry.baseline,
+          hi: entry.baseline + span,
+          nb_bits: entry.nb_bits,
+        )
+      let existing = case dict.get(acc, entry.symbol) {
+        Ok(l) -> l
+        Error(_) -> []
+      }
+      build_seq_enc_slots_loop(
+        table,
+        s_idx + 1,
+        table_size,
+        dict.insert(acc, entry.symbol, [slot, ..existing]),
+      )
+    }
+  }
+}
+
+fn smallest_state_in(
+  slots: dict.Dict(Int, List(FseEncSlot)),
+  symbol: Int,
+  table_size: Int,
+) -> Int {
+  case dict.get(slots, symbol) {
+    Error(_) -> 0
+    Ok([]) -> 0
+    Ok(list) -> smallest_state_idx_loop(list, table_size)
+  }
+}
+
+// `find_slot_for` (above, used by the weight-FSE encoder) already
+// covers the inverse lookup; reuse it instead of duplicating.
+
+/// Encode the FSE sequence bitstream in Predefined_Mode for all three
+/// alphabets.  Emits the bits in reverse decoder-read order so the
+/// resulting backward bitstream finalises with the standard
+/// "highest-set-bit of the last byte" marker.
+fn encode_sequence_fse_bitstream(sequences: List(ZstdSequence)) -> BitArray {
+  let ll_table = fse.predefined_literal_length_table()
+  let of_table = fse.predefined_offset_table()
+  let ml_table = fse.predefined_match_length_table()
+  let ll_log = fse.predefined_literal_length_log()
+  let of_log = fse.predefined_offset_log()
+  let ml_log = fse.predefined_match_length_log()
+  let ll_size = int.bitwise_shift_left(1, ll_log)
+  let of_size = int.bitwise_shift_left(1, of_log)
+  let ml_size = int.bitwise_shift_left(1, ml_log)
+  let ll_slots = build_seq_enc_slots(ll_table, ll_size)
+  let of_slots = build_seq_enc_slots(of_table, of_size)
+  let ml_slots = build_seq_enc_slots(ml_table, ml_size)
+
+  // Walk sequences in reverse, computing per-sequence (code, extra)
+  // triples for LL/ML/OF.  Then push bits in reverse decoder-read
+  // order: per-seq updates (OF, ML, LL) for transitions, per-seq
+  // extras (LL, ML, OF) — the LAST sequence has no update, so its
+  // extras alone seed the bitstream.
+  let seq_codes =
+    list.map(sequences, fn(seq) {
+      let ll_code = ll_to_code(seq.literal_length)
+      let ml_code = ml_to_code(seq.match_length)
+      // raw_offset = distance + 3 (no rep-match optimisation yet)
+      let raw_offset = seq.offset + 3
+      let of_code = of_to_code(raw_offset)
+      let ll_extra_val = seq.literal_length - fse.ll_base(ll_code)
+      let ml_extra_val = seq.match_length - fse.ml_base(ml_code)
+      let of_extra_val = raw_offset - int.bitwise_shift_left(1, of_code)
+      #(ll_code, ml_code, of_code, ll_extra_val, ml_extra_val, of_extra_val)
+    })
+  let reversed = list.reverse(seq_codes)
+
+  case reversed {
+    [] -> <<>>
+    [first, ..rest] -> {
+      let #(ll0_c, ml0_c, of0_c, ll0_e, ml0_e, of0_e) = first
+      let ll_state = smallest_state_in(ll_slots, ll0_c, ll_size)
+      let of_state = smallest_state_in(of_slots, of0_c, of_size)
+      let ml_state = smallest_state_in(ml_slots, ml0_c, ml_size)
+      // Push the LAST sequence's extras (ll_extra, ml_extra, of_extra)
+      // in decoder-reverse order, which is: ll_extra, ml_extra,
+      // of_extra (decoder reads of_extra first per sequence).
+      let #(buf, bits, out) = #(0, 0, <<>>)
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, ll0_e, fse.ll_extra_bits(ll0_c))
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, ml0_e, fse.ml_extra_bits(ml0_c))
+      let #(buf, bits, out) = push_bits_unchecked(buf, bits, out, of0_e, of0_c)
+      // Now process remaining sequences (which are the EARLIER seqs in
+      // input order — they each had an update step BEFORE the seq we
+      // just processed).  For each, push: update bits (OF, ML, LL)
+      // followed by the sequence's own extras (LL, ML, OF).
+      let #(buf, bits, out, ll_state, of_state, ml_state) =
+        seq_encode_loop(
+          rest,
+          ll_slots,
+          of_slots,
+          ml_slots,
+          ll_state,
+          of_state,
+          ml_state,
+          buf,
+          bits,
+          out,
+        )
+      // Push initial states in decoder-reverse order: ML_init,
+      // OF_init, LL_init.
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, ml_state, ml_log)
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, of_state, of_log)
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, ll_state, ll_log)
+      let buf2 = int.bitwise_or(buf, int.bitwise_shift_left(1, bits))
+      let bits2 = bits + 1
+      flush_final_bits(buf2, bits2, out)
+    }
+  }
+}
+
+fn seq_encode_loop(
+  remaining: List(#(Int, Int, Int, Int, Int, Int)),
+  ll_slots: dict.Dict(Int, List(FseEncSlot)),
+  of_slots: dict.Dict(Int, List(FseEncSlot)),
+  ml_slots: dict.Dict(Int, List(FseEncSlot)),
+  ll_state: Int,
+  of_state: Int,
+  ml_state: Int,
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, BitArray, Int, Int, Int) {
+  case remaining {
+    [] -> #(buf, bits, out, ll_state, of_state, ml_state)
+    [#(ll_c, ml_c, of_c, ll_e, ml_e, of_e), ..rest] -> {
+      // Decoder for this seq updates LL, then ML, then OF (in that
+      // order); the encoder pushes them in REVERSE: OF, ML, LL.
+      let #(buf, bits, out, of_prev) =
+        push_state_update(of_slots, of_c, of_state, buf, bits, out)
+      let #(buf, bits, out, ml_prev) =
+        push_state_update(ml_slots, ml_c, ml_state, buf, bits, out)
+      let #(buf, bits, out, ll_prev) =
+        push_state_update(ll_slots, ll_c, ll_state, buf, bits, out)
+      // Push this seq's extras in reverse decoder-read order.
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, ll_e, fse.ll_extra_bits(ll_c))
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, ml_e, fse.ml_extra_bits(ml_c))
+      let #(buf, bits, out) = push_bits_unchecked(buf, bits, out, of_e, of_c)
+      seq_encode_loop(
+        rest,
+        ll_slots,
+        of_slots,
+        ml_slots,
+        ll_prev,
+        of_prev,
+        ml_prev,
+        buf,
+        bits,
+        out,
+      )
+    }
+  }
+}
+
+fn push_state_update(
+  slots: dict.Dict(Int, List(FseEncSlot)),
+  symbol: Int,
+  current_state: Int,
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, BitArray, Int) {
+  case find_slot_for(slots, symbol, current_state) {
+    Error(_) -> #(buf, bits, out, current_state)
+    Ok(slot) -> {
+      let emit_value = current_state - slot.baseline
+      let #(buf, bits, out) =
+        push_bits_unchecked(buf, bits, out, emit_value, slot.nb_bits)
+      #(buf, bits, out, slot.state_idx)
+    }
+  }
+}
+
+// --- block assembly --------------------------------------------------
+
+fn encode_sequences_count(num: Int) -> BitArray {
+  case num {
+    n if n < 128 -> <<n>>
+    n if n < 0x7F00 -> {
+      let high = int.bitwise_shift_right(n, 8) + 128
+      let low = int.bitwise_and(n, 0xFF)
+      <<high, low>>
+    }
+    n -> {
+      let value = n - 0x7F00
+      let lo = int.bitwise_and(value, 0xFF)
+      let hi = int.bitwise_and(int.bitwise_shift_right(value, 8), 0xFF)
+      <<255, lo, hi>>
+    }
+  }
+}
+
+/// Try emitting `chunk` as a Compressed_Block with LZ77 sequences.
+/// Returns None when sequences would not improve over the literals-
+/// only (Huffman) path — i.e. when the match finder finds no matches
+/// or when the resulting block grows past `huffman_max_block_compressed`.
+fn try_sequences_block(
+  chunk: BitArray,
+  chunk_size: Int,
+  is_last: Bool,
+) -> Option(BitArray) {
+  let #(sequences, literals) = build_zstd_sequences(chunk, chunk_size)
+  let num_sequences = list.length(sequences)
+  case num_sequences {
+    0 -> None
+    _ -> {
+      let literals_size = bit_array.byte_size(literals)
+      // Encode literals; pick the cheapest of Raw / RLE / Huffman.
+      let literals_section =
+        encode_literals_section_choice(literals, literals_size)
+      let count_bytes = encode_sequences_count(num_sequences)
+      let mode_byte = <<0x00>>
+      let seq_bitstream = encode_sequence_fse_bitstream(sequences)
+      let sequence_section =
+        bit_array.concat([count_bytes, mode_byte, seq_bitstream])
+      let block_body = bit_array.concat([literals_section, sequence_section])
+      let block_body_size = bit_array.byte_size(block_body)
+      // The block-header size field is 21 bits — comfortably large
+      // for any chunk our caller produces (≤ 16 KiB).
+      case block_body_size >= int.bitwise_shift_left(1, 20) {
+        True -> None
+        False ->
+          Some(
+            bit_array.concat([
+              block_header(block_body_size, 2, is_last),
+              block_body,
+            ]),
+          )
+      }
+    }
+  }
+}
+
+// Pick the cheapest literals-section representation for the given
+// literal buffer.  Mirrors the per-chunk choice in `pick_best_block`
+// but produces just the literals section (no surrounding block
+// header / sequences section).
+fn encode_literals_section_choice(
+  literals: BitArray,
+  literals_size: Int,
+) -> BitArray {
+  // Raw_Literals_Block: header + raw bytes.
+  let raw_section = build_raw_literals_section(literals, literals_size)
+  // RLE_Literals_Block (when uniform).
+  let rle_section = case literals_size >= 1, peek_uniform_byte(literals) {
+    True, Ok(byte) -> Some(build_rle_literals_section(byte, literals_size))
+    _, _ -> None
+  }
+  let candidates = case rle_section {
+    Some(r) -> [
+      #(bit_array.byte_size(r), r),
+      #(bit_array.byte_size(raw_section), raw_section),
+    ]
+    None -> [#(bit_array.byte_size(raw_section), raw_section)]
+  }
+  // Huffman 1-stream form when the chunk fits.
+  let huff = case
+    literals_size >= huffman_min_input_size
+    && literals_size <= huffman_1stream_max_regen
+  {
+    True -> build_huffman_literals_section_only(literals, literals_size)
+    False -> None
+  }
+  let candidates = case huff {
+    Some(h) -> [#(bit_array.byte_size(h), h), ..candidates]
+    None -> candidates
+  }
+  case candidates {
+    [first, ..rest] ->
+      list.fold(rest, first, fn(acc, item) {
+        case item.0 < acc.0 {
+          True -> item
+          False -> acc
+        }
+      }).1
+    [] -> raw_section
+  }
+}
+
+fn build_raw_literals_section(literals: BitArray, size: Int) -> BitArray {
+  // Use size_format = 3 (3-byte header, 20-bit regenerated_size) so a
+  // single code path covers every chunk size up to 1 MiB.
+  let b0 =
+    int.bitwise_or(0x00, int.bitwise_shift_left(int.bitwise_and(size, 0x0F), 4))
+  let b0 = int.bitwise_or(b0, int.bitwise_shift_left(3, 2))
+  let b1 = int.bitwise_and(int.bitwise_shift_right(size, 4), 0xFF)
+  let b2 = int.bitwise_and(int.bitwise_shift_right(size, 12), 0xFF)
+  bit_array.concat([<<b0, b1, b2>>, literals])
+}
+
+fn build_rle_literals_section(byte: Int, size: Int) -> BitArray {
+  let b0 =
+    int.bitwise_or(0x01, int.bitwise_shift_left(int.bitwise_and(size, 0x0F), 4))
+  let b0 = int.bitwise_or(b0, int.bitwise_shift_left(3, 2))
+  let b1 = int.bitwise_and(int.bitwise_shift_right(size, 4), 0xFF)
+  let b2 = int.bitwise_and(int.bitwise_shift_right(size, 12), 0xFF)
+  bit_array.concat([<<b0, b1, b2>>, <<byte>>])
+}
+
+/// Same Huffman 1-stream literals section the existing
+/// `try_huffman_block` builds — exposed here without the surrounding
+/// Sequences_Section so a sequences-encoding block can reuse it as
+/// just the literals portion.
+fn build_huffman_literals_section_only(
+  chunk: BitArray,
+  chunk_size: Int,
+) -> Option(BitArray) {
+  let freqs = count_byte_frequencies(chunk)
+  let distinct = list.length(list.filter(freqs, fn(p) { p.1 > 0 }))
+  case distinct < 2 {
+    True -> None
+    False ->
+      case build_canonical_lengths(freqs) {
+        Error(_) -> None
+        Ok(#(lengths, max_bits)) ->
+          case max_bits > huffman_max_tree_depth {
+            True -> None
+            False ->
+              case serialize_huffman_tree_unified(lengths) {
+                None -> None
+                Some(tree_bytes) -> {
+                  let code_table = assign_canonical_codes(lengths, max_bits)
+                  let bitstream = encode_huffman_bitstream(chunk, code_table)
+                  let comp_size =
+                    bit_array.byte_size(tree_bytes)
+                    + bit_array.byte_size(bitstream)
+                  case comp_size >= huffman_max_block_compressed {
+                    True -> None
+                    False ->
+                      Some(build_compressed_literals_section(
+                        chunk_size,
+                        comp_size,
+                        tree_bytes,
+                        bitstream,
+                      ))
+                  }
+                }
+              }
+          }
+      }
+  }
 }
 
 /// Decode a Zstandard frame using default limits.
