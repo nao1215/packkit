@@ -160,6 +160,33 @@ pub fn decode_lzma_pangram_repeated_test() -> Nil {
   |> should.equal(expected)
 }
 
+pub fn decode_block_header_without_compressed_size_test() -> Nil {
+  // `printf 'hi\n' | xz -c` — the system xz tool emits a block
+  // header with the optional `compressed_size` field omitted (block
+  // flags = 0x00, neither bit 6 nor bit 7 set).  Per the xz format
+  // spec those fields are OPTIONAL, but the prior decoder treated
+  // omission as `payload_size = 0` and then handed the empty slice
+  // to the LZMA2 stream decoder, which failed with "truncated lzma2
+  // stream".  The fix lets the LZMA2 decoder run on the remainder
+  // of the file and report how many bytes it actually consumed so
+  // the surrounding padding / check calculations still work.
+  //
+  // Regression for the round-2 inspector finding: packkit could not
+  // decode any .xz file produced by `xz`, `xz-utils`, `tar -cJf`,
+  // `pixz`, or any other tool that doesn't write the compressed_size
+  // field — only its own output.
+  let fixture = <<
+    0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04, 0xE6, 0xD6, 0xB4, 0x46,
+    0x02, 0x00, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x74, 0x2F, 0xE5, 0xA3,
+    0x01, 0x00, 0x02, 0x68, 0x69, 0x0A, 0x00, 0x00, 0xFB, 0x7B, 0xE8, 0xE8,
+    0x2A, 0x58, 0x43, 0x4F, 0x00, 0x01, 0x1B, 0x03, 0x0B, 0x2F, 0xB9, 0x10,
+    0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
+  >>
+  let assert Ok(plain) = xz.decode(bytes: fixture)
+  plain
+  |> should.equal(<<"hi\n":utf8>>)
+}
+
 pub fn decode_rejects_missing_magic_test() -> Nil {
   xz.decode(bytes: <<0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>)
   |> should.equal(

@@ -423,18 +423,54 @@ fn decode_block(
           ))
           let _ = flags
           // Slice the compressed data immediately after the header.
+          // When the xz block header carries the optional
+          // `compressed_size` field we slice exactly that many bytes;
+          // otherwise we hand the LZMA2 decoder the entire remainder
+          // of the stream and let it terminate naturally on the 0x00
+          // end-of-stream marker.  The decoder reports the bytes it
+          // actually consumed so the surrounding padding / check
+          // calculations still work.
           let payload_offset = header_size
+          use payload <- result.try(case comp_size {
+            CompressedKnown(v) ->
+              slice_required(bytes, payload_offset, v, "xz block data")
+            CompressedUnknown -> {
+              let total = bit_array.byte_size(bytes)
+              case total >= payload_offset {
+                True -> {
+                  let assert Ok(b) =
+                    bit_array.slice(
+                      bytes,
+                      payload_offset,
+                      total - payload_offset,
+                    )
+                  Ok(b)
+                }
+                False ->
+                  Error(error.CodecInvalidData(
+                    message: "truncated xz block data",
+                  ))
+              }
+            }
+          })
+          use #(lzma_out, lzma2_consumed) <- result.try(decode_lzma2(
+            payload,
+            lzma2_props,
+            limits,
+          ))
           let payload_size = case comp_size {
             CompressedKnown(v) -> v
-            CompressedUnknown -> 0
+            CompressedUnknown -> lzma2_consumed
           }
-          use payload <- result.try(slice_required(
-            bytes,
-            payload_offset,
-            payload_size,
-            "xz block data",
-          ))
-          use lzma_out <- result.try(decode_lzma2(payload, lzma2_props, limits))
+          use <- bool.guard(
+            when: case comp_size {
+              CompressedKnown(v) -> lzma2_consumed != v
+              CompressedUnknown -> False
+            },
+            return: Error(error.CodecInvalidData(
+              message: "xz block compressed_size mismatch",
+            )),
+          )
           use plain <- result.try(apply_pre_filters_reverse(
             lzma_out,
             pre_filters,
@@ -773,26 +809,34 @@ fn byte_list_to_bit_array(bytes: List(Int), acc: BitArray) -> BitArray {
 
 // -- LZMA2 stream -------------------------------------------------------
 
+/// Decode an LZMA2 stream and return the decoded payload plus the
+/// number of bytes consumed from `payload` (inclusive of the 0x00
+/// end-of-stream marker but excluding any block padding that follows).
+/// The caller uses the consumed count when the surrounding xz block
+/// header omits the optional `compressed_size` field — there is no
+/// pre-known slice boundary in that case, only the self-terminating
+/// LZMA2 stream itself.
 fn decode_lzma2(
   payload: BitArray,
   default_props: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(#(BitArray, Int), error.CodecError) {
   let initial = case lzma.properties_of_byte(default_props) {
     Ok(p) -> p
     Error(_) -> lzma.Properties(lc: 3, lp: 0, pb: 2)
   }
-  decode_lzma2_loop(payload, <<>>, initial, limits)
+  decode_lzma2_loop(payload, <<>>, 0, initial, limits)
 }
 
 fn decode_lzma2_loop(
   payload: BitArray,
   output: BitArray,
+  consumed: Int,
   props: lzma.Properties,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(#(BitArray, Int), error.CodecError) {
   case payload {
-    <<0x00, _:bytes>> -> Ok(output)
+    <<0x00, _:bytes>> -> Ok(#(output, consumed + 1))
     <<control, _:bytes>> if control == 0x01 || control == 0x02 -> {
       case payload {
         <<_control, size_high, size_low, rest:bytes>> -> {
@@ -807,7 +851,14 @@ fn decode_lzma2_loop(
           use new_output <- result.try(append_with_limit(output, data, limits))
           let assert Ok(next) =
             bit_array.slice(rest, size, bit_array.byte_size(rest) - size)
-          decode_lzma2_loop(next, new_output, props, limits)
+          // 1 control byte + 2 size bytes + `size` body bytes
+          decode_lzma2_loop(
+            next,
+            new_output,
+            consumed + 3 + size,
+            props,
+            limits,
+          )
         }
         _ ->
           Error(error.CodecInvalidData(
@@ -816,7 +867,7 @@ fn decode_lzma2_loop(
       }
     }
     <<control, _:bytes>> if control >= 0x80 ->
-      decode_lzma2_lzma_chunk(payload, control, output, props, limits)
+      decode_lzma2_lzma_chunk(payload, control, output, consumed, props, limits)
     <<other, _:bytes>> ->
       Error(error.CodecInvalidData(
         message: "invalid lzma2 control byte " <> int.to_string(other),
@@ -829,9 +880,10 @@ fn decode_lzma2_lzma_chunk(
   payload: BitArray,
   control: Int,
   output: BitArray,
+  consumed: Int,
   props: lzma.Properties,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(#(BitArray, Int), error.CodecError) {
   let has_new_props = control >= 0xC0
   case payload {
     <<_control, usize_high, usize_low, csize_high, csize_low, rest:bytes>> -> {
@@ -843,7 +895,7 @@ fn decode_lzma2_lzma_chunk(
         + 1
       let csize =
         int.bitwise_or(int.bitwise_shift_left(csize_high, 8), csize_low) + 1
-      use #(new_props, lzma_input, after_chunk) <- result.try(
+      use #(new_props, lzma_input, after_chunk, props_byte_count) <- result.try(
         case has_new_props {
           True ->
             case rest {
@@ -863,7 +915,7 @@ fn decode_lzma2_lzma_chunk(
                     csize,
                     bit_array.byte_size(rest_after_props) - csize,
                   )
-                Ok(#(parsed_props, lzma_data, after))
+                Ok(#(parsed_props, lzma_data, after, 1))
               }
               _ ->
                 Error(error.CodecInvalidData(
@@ -879,7 +931,7 @@ fn decode_lzma2_lzma_chunk(
             ))
             let assert Ok(after) =
               bit_array.slice(rest, csize, bit_array.byte_size(rest) - csize)
-            Ok(#(props, lzma_data, after))
+            Ok(#(props, lzma_data, after, 0))
           }
         },
       )
@@ -890,7 +942,15 @@ fn decode_lzma2_lzma_chunk(
       ))
       use #(decoded, _state) <- result.try(lzma.decode_into(decoder, usize))
       use new_output <- result.try(append_with_limit(output, decoded, limits))
-      decode_lzma2_loop(after_chunk, new_output, new_props, limits)
+      // 1 control + 2 usize + 2 csize + optional 1 props + csize body
+      let chunk_bytes = 5 + props_byte_count + csize
+      decode_lzma2_loop(
+        after_chunk,
+        new_output,
+        consumed + chunk_bytes,
+        new_props,
+        limits,
+      )
     }
     _ ->
       Error(error.CodecInvalidData(message: "truncated lzma2 LZMA chunk header"))
