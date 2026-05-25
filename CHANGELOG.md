@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Feature (brotli)**: the encoder now optionally emits a single
+  ISLAST=1 compressed metablock whose literal alphabet uses a
+  complex-form Huffman code (RFC 7932 §3.5), still without an LZ77
+  match step.  The complex-form descriptor is built via a CL-Huffman
+  table length-limited to 5 bits, RLE-encoded with sym 16 / 17 chain-
+  breaking `Lit` separators, trimmed at the last non-zero alphabet
+  length, and — crucially — terminated as soon as the CL Huffman
+  space is exhausted (matching the decoder's early-exit Kraft check
+  in `read_one_cl`).  The encoder picks the smaller of the
+  uncompressed and the compressed candidate per payload, so
+  incompressible payloads never regress.  Repetitive byte alphabets
+  (e.g. `abc` x 100, mostly-zero tar headers) round-trip through both
+  packkit's own decoder and the reference `brotli` CLI.
+- **Fix (brotli decoder, JS target)**: `emit_literals_loop` and
+  `decode_prefix_walk` previously called themselves through
+  `use <- result.try(...)` closures and through mutually-recursive
+  helpers, so the Gleam JS compiler could not emit a `while` loop.
+  Each compressed-metablock literal added a stack frame and a payload
+  of more than ~10 000 prefix-code bit reads — easily reached by a
+  3 KiB tar archive — blew the JS engine's call-stack limit.  Both
+  loops are now structured around an explicit `LiteralStep` /
+  inlined-`case` dispatcher so the recursive call stays in tail
+  position, restoring single-frame iteration on JS.
 - **Feature (zstd)**: the sequences encoder now also emits
   `FSE_Compressed_Mode` for LL/OF/ML tables whenever the per-chunk
   symbol distribution is biased enough that a chunk-specific FSE

@@ -107,9 +107,15 @@ Implemented codecs and archive families:
   as `cat a.zst b.zst`)
 - **brotli**: full RFC 7932 decoder (uncompressed + compressed
   metablocks, static dictionary, context maps, block switching).
-  Encoder emits uncompressed metablocks only — the stream is a
-  valid brotli stream that any conforming decoder accepts, but
-  does no actual LZ77/Huffman compression yet.
+  The encoder now picks the smaller of an uncompressed-only stream
+  and a single ISLAST=1 compressed metablock that codes the literal
+  alphabet under a complex-form Huffman descriptor (CL table
+  length-limited to 5 bits, RLE-encoded with sym 16 / 17 chain-
+  breaking, alphabet trimmed once the CL Huffman space is
+  exhausted).  LZ77 matches still aren't emitted yet, so the
+  compressed-literals path only helps repetitive-byte payloads —
+  but those round-trip through both the packkit decoder and the
+  reference `brotli` CLI.
 
 The facade (`packkit.compress`, `packkit.decompress`, `packkit.read`,
 `packkit.write`, `packkit.pack`, `packkit.unpack`) is wired to these
@@ -121,7 +127,9 @@ the signatures are matched strictly (gzip requires CM=8, zlib
 verifies the RFC 1950 check bits, bzip2 requires the block-size
 digit, ...).
 
-Still pending: brotli LZ77/Huffman compression in the encoder.
+Still pending: brotli LZ77 matches in the encoder (literals are
+Huffman-coded, but every command still has copy_len = 0 so the
+compressed metablock only shortens via literal entropy).
 The zstd encoder now emits Compressed_Blocks with both Huffman-
 coded literals (1-stream ≤ 1023-byte and 4-stream ≤ 16 KiB chunk
 forms) and real LZ77 sequences (greedy 3-byte hash-chain match

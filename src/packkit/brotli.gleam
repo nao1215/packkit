@@ -44,6 +44,7 @@
 
 import gleam/bit_array
 import gleam/bool
+import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -74,18 +75,1066 @@ pub fn codec() -> codecs.Codec {
 /// metablocks and the stream is terminated with a separate empty
 /// `ISLAST=1, ISLASTEMPTY=1` marker.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  let writer = new_bit_writer()
-  // WBITS prefix: a single 0 bit encodes WBITS = 16.
-  let writer = bw_write(writer, 0, 1)
   let total = bit_array.byte_size(bytes)
-  let writer = case total {
-    0 -> emit_empty_last_metablock(writer)
-    _ -> {
-      let writer = encode_chunks(writer, bytes, 0, total)
-      emit_empty_last_metablock(writer)
+  case total {
+    // Empty payload still needs a valid stream: WBITS + ISLAST=1
+    // ISLASTEMPTY=1 marker.
+    0 -> {
+      let writer = new_bit_writer()
+      let writer = bw_write(writer, 0, 1)
+      let writer = emit_empty_last_metablock(writer)
+      Ok(bw_flush(writer))
+    }
+    _ -> Ok(pick_smaller_brotli_stream(bytes, total))
+  }
+}
+
+// Encode `bytes` two ways and return the smaller stream:
+//   1. The existing uncompressed-metablock chain (one or more
+//      ISLAST=0 uncompressed metablocks + a final ISLAST=1
+//      ISLASTEMPTY=1 marker).
+//   2. A single ISLAST=1 compressed metablock that emits the entire
+//      payload as literals coded with a complex-form Huffman code
+//      (no LZ77 yet — a single insert-and-copy command emits MLEN
+//      literals, the copy step is suppressed because the metablock
+//      ends as soon as the insert step reaches MLEN per RFC 7932
+//      §4 / our own `run_commands` decoder loop).
+fn pick_smaller_brotli_stream(bytes: BitArray, total: Int) -> BitArray {
+  let uncompressed = build_uncompressed_stream(bytes, total)
+  case build_compressed_literals_stream(bytes, total) {
+    Some(compressed) ->
+      case bit_array.byte_size(compressed) < bit_array.byte_size(uncompressed) {
+        True -> compressed
+        False -> uncompressed
+      }
+    None -> uncompressed
+  }
+}
+
+fn build_uncompressed_stream(bytes: BitArray, total: Int) -> BitArray {
+  let writer = new_bit_writer()
+  let writer = bw_write(writer, 0, 1)
+  let writer = encode_chunks(writer, bytes, 0, total)
+  let writer = emit_empty_last_metablock(writer)
+  bw_flush(writer)
+}
+
+/// Build a single ISLAST=1 compressed metablock whose insert-and-
+/// copy stream is exactly one command: insert MLEN literals, copy
+/// (suppressed once MLEN is reached).  Returns `None` when the
+/// payload won't fit the 16-bit MLEN-1 field (> 65 536 bytes) or
+/// when the naive Huffman tree for the literals exceeds the 15-bit
+/// code-length cap — the caller falls back to the uncompressed
+/// path either way.
+fn build_compressed_literals_stream(
+  bytes: BitArray,
+  total: Int,
+) -> Option(BitArray) {
+  use <- bool.guard(when: total > 65_536 || total < 1, return: None)
+  case build_literal_huffman_lengths(bytes) {
+    Error(_) -> None
+    Ok(lengths) -> try_emit_compressed_literals(bytes, total, lengths)
+  }
+}
+
+fn try_emit_compressed_literals(
+  bytes: BitArray,
+  total: Int,
+  lengths: List(Int),
+) -> Option(BitArray) {
+  // The decoder accepts code lengths up to 15 bits and requires the
+  // Huffman space to be exhausted exactly (Kraft equality).  Bail to
+  // the uncompressed fallback if either invariant is violated.
+  let max_len_ok = max_in_int_list(lengths, 0) <= 15
+  let kraft_ok = kraft_slot_total(lengths, 32_768, 15) == 32_768
+  case max_len_ok && kraft_ok {
+    False -> None
+    True -> {
+      let codes = assign_brotli_canonical_codes(lengths)
+      let writer = new_bit_writer()
+      let writer = bw_write(writer, 0, 1)
+      let writer =
+        emit_compressed_literals_metablock(writer, bytes, total, lengths, codes)
+      Some(bw_flush(writer))
     }
   }
-  Ok(bw_flush(writer))
+}
+
+// Sum the Kraft slot contribution `2^(scale - len)` of every non-zero
+// length in the list.  For a valid Huffman code at `max_len = 15`
+// this returns exactly `2^15 = 32_768`.
+fn kraft_slot_total(lengths: List(Int), _scale: Int, _max_len: Int) -> Int {
+  kraft_slot_loop(lengths, 0)
+}
+
+fn kraft_slot_loop(lengths: List(Int), acc: Int) -> Int {
+  case lengths {
+    [] -> acc
+    [0, ..rest] -> kraft_slot_loop(rest, acc)
+    [len, ..rest] ->
+      kraft_slot_loop(rest, acc + int.bitwise_shift_right(32_768, len))
+  }
+}
+
+fn max_in_int_list(values: List(Int), acc: Int) -> Int {
+  case values {
+    [] -> acc
+    [v, ..rest] ->
+      case v > acc {
+        True -> max_in_int_list(rest, v)
+        False -> max_in_int_list(rest, acc)
+      }
+  }
+}
+
+fn emit_compressed_literals_metablock(
+  writer: BitWriter,
+  bytes: BitArray,
+  mlen: Int,
+  literal_lengths: List(Int),
+  literal_codes: dict.Dict(Int, #(Int, Int)),
+) -> BitWriter {
+  // ISLAST=1, ISLASTEMPTY=0.
+  let writer = bw_write(writer, 1, 1)
+  let writer = bw_write(writer, 0, 1)
+  // MNIBBLES: 2-bit field, value N-4.  We always use 4 nibbles so
+  // MLEN-1 fits in 16 bits.  Value = 0.
+  let writer = bw_write(writer, 0, 2)
+  let writer = bw_write(writer, mlen - 1, 16)
+  // (No ISUNCOMPRESSED bit because ISLAST=1.)
+
+  // NBLTYPESL: encoded as a prefix code, but for 1 type a single
+  // 0 bit suffices.  RFC 7932 §9.2 uses the "NBLTYPES code":
+  //   0          -> 1 type (no extra bits)
+  //   10        -> 2 types
+  //   110xx    -> 3..4 types
+  //   ...
+  // For our single-type case, emit just a 0 bit.
+  let writer = bw_write(writer, 0, 1)
+  let writer = bw_write(writer, 0, 1)
+  let writer = bw_write(writer, 0, 1)
+
+  // NPOSTFIX (2 bits) + NDIRECT (4 bits).
+  let writer = bw_write(writer, 0, 2)
+  let writer = bw_write(writer, 0, 4)
+
+  // Context mode for the first (and only) literal block type:
+  //   00 = LSB6.  Encoded as a literal 2-bit value.
+  let writer = bw_write(writer, 0, 2)
+
+  // NTREESL: prefix-coded; 0 = 1 tree (no context map).
+  let writer = bw_write(writer, 0, 1)
+  // NTREESD: same.
+  let writer = bw_write(writer, 0, 1)
+
+  // HTREEL: complex-form Huffman descriptor for the 256-symbol
+  // literal alphabet.
+  let writer = emit_complex_huffman_descriptor(writer, literal_lengths, 256)
+
+  // HTREEI: simple-form, 1 symbol from the 704-symbol IC alphabet.
+  // We pick the symbol that encodes (insert_code, copy_code=0) for
+  // the chosen insert_code.
+  let #(insert_code, ic_symbol) = pick_insert_code_and_symbol(mlen)
+  let writer = emit_simple_huffman_descriptor(writer, ic_symbol, 704)
+
+  // HTREED: simple-form, 1 symbol from the distance alphabet.
+  // alphabet size = 16 + NDIRECT + (48 << NPOSTFIX) = 16 + 0 + 48 = 64.
+  // We never use distances so the symbol value is arbitrary — pick 0.
+  let writer = emit_simple_huffman_descriptor(writer, 0, 64)
+
+  // Emit the single IC command symbol via the literal-only HTREEI
+  // (which is a 1-symbol code, so 0 bits).  Then write the insert
+  // extras.
+  let writer = bw_write(writer, 0, 0)
+  let extras_bits = insert_extra_bits_for(insert_code)
+  let extras_value = mlen - insert_base_offset(insert_code)
+  let writer = bw_write(writer, extras_value, extras_bits)
+
+  // Emit MLEN literal codes via the HTREEL.  Each literal byte is
+  // encoded MSB-first per RFC 7932 §3.3.
+  emit_literals_via_huffman(writer, bytes, 0, mlen, literal_codes)
+}
+
+fn emit_literals_via_huffman(
+  writer: BitWriter,
+  bytes: BitArray,
+  pos: Int,
+  total: Int,
+  codes: dict.Dict(Int, #(Int, Int)),
+) -> BitWriter {
+  case pos >= total {
+    True -> writer
+    False -> {
+      let byte = case bit_array.slice(bytes, pos, 1) {
+        Ok(<<b>>) -> b
+        _ -> 0
+      }
+      let #(code, length) = case dict.get(codes, byte) {
+        Ok(v) -> v
+        Error(_) -> #(0, 0)
+      }
+      let writer = bw_write_code_msb_first(writer, code, length)
+      emit_literals_via_huffman(writer, bytes, pos + 1, total, codes)
+    }
+  }
+}
+
+// Write `code` MSB-first using the LSB-first underlying bit writer.
+// The decoder accumulates bits via `accumulated = (accumulated << 1)
+// + bit`, so the first bit it consumes ends up as the MSB of the
+// final code value — we have to reverse the bit order before
+// handing the value to `bw_write`.
+fn bw_write_code_msb_first(
+  writer: BitWriter,
+  code: Int,
+  length: Int,
+) -> BitWriter {
+  case length {
+    0 -> writer
+    _ -> bw_write(writer, reverse_bits(code, length), length)
+  }
+}
+
+fn reverse_bits(value: Int, length: Int) -> Int {
+  reverse_bits_loop(value, length, 0)
+}
+
+fn reverse_bits_loop(value: Int, remaining: Int, acc: Int) -> Int {
+  case remaining {
+    0 -> acc
+    _ ->
+      reverse_bits_loop(
+        int.bitwise_shift_right(value, 1),
+        remaining - 1,
+        int.bitwise_or(
+          int.bitwise_shift_left(acc, 1),
+          int.bitwise_and(value, 1),
+        ),
+      )
+  }
+}
+
+// --- Insert-and-copy command symbol selection -------------------------
+//
+// We emit a single IC command per metablock that says "insert MLEN
+// bytes, then copy K bytes" where K is implied by the IC symbol's
+// copy_code.  The copy step is skipped because the metablock ends
+// once `remaining <= 0` after the insert step (RFC 7932 §4; our
+// `run_commands` decoder explicitly bails before the copy step in
+// that case).
+//
+// To avoid the cells whose distance code triggers a Huffman read we
+// stick to insert_code 0..7 (cell_idx 0) for tiny payloads and use
+// cells 4 / 7 only for the larger insert_codes, where the suppressed
+// copy step keeps the distance Huffman code unread anyway.
+
+fn pick_insert_code_and_symbol(mlen: Int) -> #(Int, Int) {
+  let code = pick_insert_code_for_length(mlen)
+  let symbol = ic_symbol_for(code)
+  #(code, symbol)
+}
+
+fn pick_insert_code_for_length(mlen: Int) -> Int {
+  case mlen {
+    n if n <= 5 -> n
+    n if n <= 7 -> 6
+    n if n <= 9 -> 7
+    n if n <= 13 -> 8
+    n if n <= 17 -> 9
+    n if n <= 25 -> 10
+    n if n <= 33 -> 11
+    n if n <= 49 -> 12
+    n if n <= 65 -> 13
+    n if n <= 97 -> 14
+    n if n <= 129 -> 15
+    n if n <= 193 -> 16
+    n if n <= 321 -> 17
+    n if n <= 577 -> 18
+    n if n <= 1089 -> 19
+    n if n <= 2113 -> 20
+    n if n <= 6209 -> 21
+    n if n <= 22_593 -> 22
+    _ -> 23
+  }
+}
+
+fn insert_base_offset(code: Int) -> Int {
+  case code {
+    n if n <= 5 -> n
+    6 -> 6
+    7 -> 8
+    8 -> 10
+    9 -> 14
+    10 -> 18
+    11 -> 26
+    12 -> 34
+    13 -> 50
+    14 -> 66
+    15 -> 98
+    16 -> 130
+    17 -> 194
+    18 -> 322
+    19 -> 578
+    20 -> 1090
+    21 -> 2114
+    22 -> 6210
+    _ -> 22_594
+  }
+}
+
+fn insert_extra_bits_for(code: Int) -> Int {
+  case code {
+    n if n <= 5 -> 0
+    6 | 7 -> 1
+    8 | 9 -> 2
+    10 | 11 -> 3
+    12 | 13 -> 4
+    14 | 15 -> 5
+    16 -> 6
+    17 -> 7
+    18 -> 8
+    19 -> 9
+    20 -> 10
+    21 -> 12
+    22 -> 14
+    _ -> 24
+  }
+}
+
+// IC symbol with copy_code = 0.  Mirrors the cell-layout mapping in
+// the decoder's `cmd_lut_entry`:
+//
+//   insert_code 0..7  -> cell_idx 0 (cell_pos 0), symbol = insert_code * 8.
+//   insert_code 8..15 -> cell_idx 4 (cell_pos 8), symbol = 256 + (ic-8) * 8.
+//   insert_code 16..23-> cell_idx 7 (cell_pos 16), symbol = 448 + (ic-16) * 8.
+fn ic_symbol_for(insert_code: Int) -> Int {
+  case insert_code {
+    n if n <= 7 -> n * 8
+    n if n <= 15 -> 256 + { n - 8 } * 8
+    n -> 448 + { n - 16 } * 8
+  }
+}
+
+// --- Simple-form Huffman descriptor ----------------------------------
+//
+// 2-bit descriptor `01` (value 1 = "simple form"), 2-bit NSYM-1
+// (we always use 1 symbol → 0), then one alphabet-bit value.
+
+fn emit_simple_huffman_descriptor(
+  writer: BitWriter,
+  symbol: Int,
+  alphabet_size: Int,
+) -> BitWriter {
+  // Descriptor value 1 = simple form.  bw_write puts low bits first,
+  // so writing value 1 with count 2 emits bits 1, 0 — decoder
+  // reads them low-first and sees `1`.  ✓
+  let writer = bw_write(writer, 1, 2)
+  // NSYM - 1 = 0 (one symbol).
+  let writer = bw_write(writer, 0, 2)
+  let alphabet_bits = ceil_log2(alphabet_size)
+  bw_write(writer, symbol, alphabet_bits)
+}
+
+// --- Complex-form Huffman descriptor (RFC 7932 §3.5) -----------------
+//
+// Two-stage:
+//   1. Write the 18 "code-length code" lengths (CLCL), each via a
+//      fixed 4-bit lookup.  HSKIP leading entries are implicitly 0
+//      and not transmitted; HSKIP is the descriptor value 0/2/3.
+//   2. Build a canonical CL Huffman code from those lengths.  Use
+//      it to encode the actual alphabet's code lengths, RLE-encoded
+//      via symbols 16 (repeat-prev 3..6 + 2 extra bits) and 17
+//      (repeat-zero 3..10 + 3 extra bits).
+
+fn emit_complex_huffman_descriptor(
+  writer: BitWriter,
+  lengths: List(Int),
+  _alphabet_size: Int,
+) -> BitWriter {
+  // Compose the RLE sequence of CL symbols (each in 0..17) plus
+  // any extra-bit pairs (for symbols 16 / 17).  Also tally how
+  // often each CL symbol appears so we can build the CL Huffman
+  // code.
+  let rle = rle_encode_lengths(lengths)
+  let cl_freqs = tally_cl_symbols(rle, dict.new())
+  // Build CL Huffman code lengths from frequencies (length-limited
+  // to 5 bits — that's all the fixed CL-code-length lookup can
+  // encode).
+  let cl_lengths_dict = build_cl_huffman_lengths(cl_freqs)
+  let cl_lengths_list = cl_length_list(cl_lengths_dict)
+
+  // Pick HSKIP: choose the leading prefix of `cl_code_order` whose
+  // length entries we can omit (i.e. they're zero).  HSKIP must be
+  // 0, 2, or 3 per RFC 7932 §3.5 (the 2-bit descriptor).
+  let hskip = pick_hskip(cl_lengths_dict)
+
+  // Emit the 2-bit descriptor (HSKIP itself).
+  let writer = bw_write(writer, hskip, 2)
+
+  // Emit the CL-CL values in `cl_code_order[hskip..]` order.
+  let to_emit = list.drop(cl_code_order(), hskip)
+  let writer = emit_cl_lengths(writer, to_emit, cl_lengths_dict)
+
+  // Build canonical CL Huffman code from the lengths.
+  let cl_codes = assign_brotli_canonical_codes(cl_lengths_list)
+
+  // Encode the alphabet's lengths using the CL code + RLE codes.
+  emit_rle_via_cl(writer, rle, cl_codes)
+}
+
+// CL code order used by RFC 7932 §3.5; matches the decoder's
+// `cl_code_order()`.
+fn cl_code_order_writer() -> List(Int) {
+  [1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+}
+
+// Inverse of `cl_prefix_lookup`: given a code-length-code-length in
+// 0..5, returns `(bits_to_emit, value)` for `bw_write`.
+fn cl_clcl_emit(clcl_value: Int) -> #(Int, Int) {
+  case clcl_value {
+    0 -> #(2, 0)
+    1 -> #(4, 7)
+    2 -> #(3, 3)
+    3 -> #(2, 2)
+    4 -> #(2, 1)
+    _ -> #(4, 15)
+  }
+}
+
+// Emit code-length-code lengths in `cl_code_order[hskip..]` order, but
+// stop as soon as the CL Huffman space is exhausted (`space <= 0`).
+// `read_cl_code_lengths` in the decoder exits early when `new_space <=
+// 0`; any further zero-length entries we emit would leak as spurious
+// Lit(0) atoms into the symbol-code-length section and shift the
+// alphabet (RFC 7932 §3.5; see `read_one_cl`).
+fn emit_cl_lengths(
+  writer: BitWriter,
+  order: List(Int),
+  cl_lengths: dict.Dict(Int, Int),
+) -> BitWriter {
+  emit_cl_lengths_loop(writer, order, cl_lengths, 32)
+}
+
+fn emit_cl_lengths_loop(
+  writer: BitWriter,
+  order: List(Int),
+  cl_lengths: dict.Dict(Int, Int),
+  space: Int,
+) -> BitWriter {
+  case order {
+    [] -> writer
+    [sym, ..rest] -> {
+      let len = case dict.get(cl_lengths, sym) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      let #(bits, value) = cl_clcl_emit(len)
+      let writer = bw_write(writer, value, bits)
+      let new_space = case len {
+        0 -> space
+        _ -> space - int.bitwise_shift_right(32, len)
+      }
+      case new_space <= 0 {
+        True -> writer
+        False -> emit_cl_lengths_loop(writer, rest, cl_lengths, new_space)
+      }
+    }
+  }
+}
+
+fn pick_hskip(cl_lengths: dict.Dict(Int, Int)) -> Int {
+  // HSKIP must be 0, 2, or 3.  Pick 3 when the first 3 codes in
+  // `cl_code_order` are unused; otherwise 2 when the first 2 are
+  // unused; otherwise 0.
+  let order = cl_code_order_writer()
+  case order {
+    [a, b, c, ..] ->
+      case all_zero_in(cl_lengths, [a, b, c]), all_zero_in(cl_lengths, [a, b]) {
+        True, _ -> 3
+        _, True -> 2
+        _, _ -> 0
+      }
+    _ -> 0
+  }
+}
+
+fn all_zero_in(cl_lengths: dict.Dict(Int, Int), syms: List(Int)) -> Bool {
+  case syms {
+    [] -> True
+    [s, ..rest] ->
+      case dict.get(cl_lengths, s) {
+        Ok(0) -> all_zero_in(cl_lengths, rest)
+        Error(_) -> all_zero_in(cl_lengths, rest)
+        Ok(_) -> False
+      }
+  }
+}
+
+// Run-length encode the alphabet's code lengths.  Produces a list
+// of `RleAtom` values; consecutive 0-length runs collapse onto
+// symbol 17 with a 3-bit extra (3..10 entries per symbol); other
+// repeats collapse onto symbol 16 with a 2-bit extra (3..6 entries
+// per symbol).  Single non-zero entries emit symbol = length.
+type RleAtom {
+  RleLit(value: Int)
+  RleRepPrev(extra: Int)
+  // 0..3, decoder sees count = 3 + extra
+  RleRepZero(extra: Int)
+  // 0..7, decoder sees count = 3 + extra
+}
+
+fn rle_encode_lengths(lengths: List(Int)) -> List(RleAtom) {
+  // The decoder stops reading code-length codes once the Kraft sum
+  // is exhausted (RFC 7932 §3.5; `read_symbol_code_lengths` exits
+  // when `state.space <= 0`).  Any RLE atoms emitted for trailing
+  // zero entries beyond the last non-zero length would then leak
+  // into the next descriptor's bitstream and corrupt the stream,
+  // so trim those trailing zeros before encoding.
+  let trimmed = trim_trailing_zeros(lengths)
+  let runs = collect_runs(trimmed, [])
+  expand_runs(runs, [])
+}
+
+fn trim_trailing_zeros(lengths: List(Int)) -> List(Int) {
+  trim_trailing_zeros_loop(list.reverse(lengths), [])
+}
+
+fn trim_trailing_zeros_loop(rev_lengths: List(Int), acc: List(Int)) -> List(Int) {
+  case rev_lengths, acc {
+    [], _ -> acc
+    [0, ..rest], [] -> trim_trailing_zeros_loop(rest, [])
+    [head, ..rest], _ -> trim_trailing_zeros_loop(rest, [head, ..acc])
+  }
+}
+
+fn collect_runs(
+  remaining: List(Int),
+  acc: List(#(Int, Int)),
+) -> List(#(Int, Int)) {
+  case remaining {
+    [] -> list.reverse(acc)
+    [v, ..rest] ->
+      case acc {
+        [#(top_value, top_count), ..tail] if top_value == v ->
+          collect_runs(rest, [#(top_value, top_count + 1), ..tail])
+        _ -> collect_runs(rest, [#(v, 1), ..acc])
+      }
+  }
+}
+
+fn expand_runs(runs: List(#(Int, Int)), acc: List(RleAtom)) -> List(RleAtom) {
+  case runs {
+    [] -> list.reverse(acc)
+    [#(value, count), ..rest] -> {
+      let additions = case value {
+        0 -> expand_zero_run(count, [])
+        v -> expand_non_zero_run(v, count, [])
+      }
+      expand_runs(rest, list.append(list.reverse(additions), acc))
+    }
+  }
+}
+
+// Expand a zero run.  Symbol 17 covers 3..10 entries per occurrence;
+// to avoid the run-length chaining the decoder applies to
+// consecutive code-17 emissions (RFC 7932 §3.5), we follow each
+// RepZero with a single Lit(0) that adds one extra zero and resets
+// `state.repeat_len` so the next RepZero starts fresh.
+fn expand_zero_run(count: Int, acc: List(RleAtom)) -> List(RleAtom) {
+  case count {
+    0 -> list.reverse(acc)
+    n if n < 3 -> expand_zero_run(n - 1, [RleLit(0), ..acc])
+    n if n <= 10 -> expand_zero_run(0, [RleRepZero(extra: n - 3), ..acc])
+    _ ->
+      // Take the largest unchained step (10 zeros via RepZero +
+      // 1 zero via Lit = 11 zeros per cycle).  Lit(0) doubles as
+      // the reset because `apply_single_code_length` sets
+      // `state.repeat = 0, state.repeat_len = 0` for any code < 16,
+      // including code 0.
+      expand_zero_run(count - 11, [RleLit(0), RleRepZero(extra: 7), ..acc])
+  }
+}
+
+// Expand a non-zero run.  First emit a Lit(value) so the decoder's
+// "previous non-zero code length" is set to value, then fill the
+// remaining `count - 1` entries with RepPrev codes (3..6 entries
+// per code) with Lit(value) separators that block the consecutive-
+// code-16 chaining.
+fn expand_non_zero_run(
+  value: Int,
+  count: Int,
+  acc: List(RleAtom),
+) -> List(RleAtom) {
+  case count {
+    0 -> list.reverse(acc)
+    n if n <= 3 ->
+      // Short runs: just emit `n` lits.  RepPrev's 2 extra bits
+      // would only break even at run length 3.
+      append_lits_reverse(n, value, acc)
+    n -> {
+      let acc = [RleLit(value), ..acc]
+      expand_rep_prev(value, n - 1, acc)
+    }
+  }
+}
+
+fn expand_rep_prev(
+  value: Int,
+  remaining: Int,
+  acc: List(RleAtom),
+) -> List(RleAtom) {
+  case remaining {
+    0 -> list.reverse(acc)
+    n if n < 3 -> append_lits_reverse(n, value, acc)
+    n if n <= 6 ->
+      append_lits_reverse(0, value, [RleRepPrev(extra: n - 3), ..acc])
+    _ ->
+      // RepPrev(6 entries) + Lit(value) (1 entry) = 7 entries
+      // per cycle.  Lit(value) acts as the chain reset.
+      expand_rep_prev(value, remaining - 7, [
+        RleLit(value),
+        RleRepPrev(extra: 3),
+        ..acc
+      ])
+  }
+}
+
+fn append_lits_reverse(
+  count: Int,
+  value: Int,
+  acc: List(RleAtom),
+) -> List(RleAtom) {
+  case count {
+    0 -> list.reverse(acc)
+    _ -> append_lits_reverse(count - 1, value, [RleLit(value), ..acc])
+  }
+}
+
+fn tally_cl_symbols(
+  rle: List(RleAtom),
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case rle {
+    [] -> acc
+    [atom, ..rest] -> {
+      let sym = case atom {
+        RleLit(v) -> v
+        RleRepPrev(_) -> 16
+        RleRepZero(_) -> 17
+      }
+      let cur = case dict.get(acc, sym) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      tally_cl_symbols(rest, dict.insert(acc, sym, cur + 1))
+    }
+  }
+}
+
+// Build a CL Huffman code-length table (symbols 0..17, max length 5).
+// `cl_clcl_emit` only encodes lengths 0..5 — anything deeper would
+// silently fall through to the wildcard branch (`length 5`) and
+// produce a descriptor the decoder rejects with "code-length codes
+// oversubscribe Huffman space".  We therefore length-limit to 5 by
+// constructing the depth distribution that exhausts the 32-slot
+// Huffman space exactly (Kraft equality), then assign the shortest
+// available lengths to the most-frequent symbols.
+fn build_cl_huffman_lengths(freqs: dict.Dict(Int, Int)) -> dict.Dict(Int, Int) {
+  let pairs =
+    dict.fold(freqs, [], fn(acc, sym, count) {
+      case count > 0 {
+        True -> [#(count, sym), ..acc]
+        False -> acc
+      }
+    })
+  // Sort by frequency descending so the most-frequent CL symbol
+  // pops out first and gets the shortest length.
+  let sorted = list.sort(pairs, fn(a, b) { int.compare(b.0, a.0) })
+  case sorted {
+    [] -> dict.new()
+    [#(_, single)] ->
+      // Decoder accepts a single-symbol CL code via the
+      // `num_codes == 1` branch in `validate_cl_space`, where the
+      // length is allowed to be < 1.  Use length 1 — the
+      // `cl_clcl_emit` table encodes that as `0111` (4 bits).
+      dict.from_list([#(single, 1)])
+    _ -> {
+      let leaf_count = list.length(sorted)
+      let lengths = limited_huffman_lengths(leaf_count, 5)
+      assign_lengths_to_symbols(sorted, lengths, dict.new())
+    }
+  }
+}
+
+// Compute a length-limited Huffman depth distribution for `n` leaves
+// with `max_len` maximum depth, satisfying the Kraft equality.
+// Returns the list of lengths in ascending order (shortest first)
+// — caller pairs them with frequency-sorted symbols so the most-
+// frequent get the shortest codes.
+fn limited_huffman_lengths(n: Int, max_len: Int) -> List(Int) {
+  // Counts at each depth; start with `2^max_len` leaves all at the
+  // bottom (a fully-balanced binary tree).  Iteratively merge two
+  // leaves at the deepest occupied level into one leaf one level up
+  // until total leaves equal `n`.  Net effect on the Kraft sum is
+  // zero (1/2 at level L = 1/4 + 1/4 at level L+1), so the result
+  // always satisfies Kraft equality.
+  let initial = int.bitwise_shift_left(1, max_len)
+  let counts = list_replicate(max_len + 1, 0)
+  let counts = list_replace_at(counts, max_len, initial)
+  let counts = collapse_to_n(counts, initial, n, max_len)
+  expand_counts_to_lengths(counts, 0, [])
+}
+
+fn list_replicate(count: Int, value: Int) -> List(Int) {
+  list_replicate_loop(count, value, [])
+}
+
+fn list_replicate_loop(count: Int, value: Int, acc: List(Int)) -> List(Int) {
+  case count {
+    0 -> acc
+    _ -> list_replicate_loop(count - 1, value, [value, ..acc])
+  }
+}
+
+fn list_replace_at(lst: List(Int), idx: Int, value: Int) -> List(Int) {
+  list_replace_at_loop(lst, idx, value, 0, [])
+}
+
+fn list_replace_at_loop(
+  lst: List(Int),
+  idx: Int,
+  value: Int,
+  cur: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case lst {
+    [] -> list.reverse(acc)
+    [head, ..rest] -> {
+      let new_head = case cur == idx {
+        True -> value
+        False -> head
+      }
+      list_replace_at_loop(rest, idx, value, cur + 1, [new_head, ..acc])
+    }
+  }
+}
+
+fn collapse_to_n(
+  counts: List(Int),
+  total_leaves: Int,
+  target: Int,
+  max_len: Int,
+) -> List(Int) {
+  case total_leaves <= target {
+    True -> counts
+    False -> {
+      let depth = deepest_with_pair(counts, max_len)
+      case depth < 1 {
+        True -> counts
+        False -> {
+          let counts =
+            list_replace_at(counts, depth, list_at_int(counts, depth) - 2)
+          let counts =
+            list_replace_at(
+              counts,
+              depth - 1,
+              list_at_int(counts, depth - 1) + 1,
+            )
+          collapse_to_n(counts, total_leaves - 1, target, max_len)
+        }
+      }
+    }
+  }
+}
+
+fn list_at_int(lst: List(Int), idx: Int) -> Int {
+  case lst {
+    [] -> 0
+    [head, ..rest] ->
+      case idx {
+        0 -> head
+        _ -> list_at_int(rest, idx - 1)
+      }
+  }
+}
+
+fn deepest_with_pair(counts: List(Int), max_idx: Int) -> Int {
+  deepest_with_pair_loop(counts, max_idx, 0, -1)
+}
+
+fn deepest_with_pair_loop(
+  counts: List(Int),
+  max_idx: Int,
+  cur: Int,
+  best: Int,
+) -> Int {
+  case counts {
+    [] -> best
+    [head, ..rest] -> {
+      let new_best = case cur <= max_idx && head >= 2 && cur > best {
+        True -> cur
+        False -> best
+      }
+      deepest_with_pair_loop(rest, max_idx, cur + 1, new_best)
+    }
+  }
+}
+
+fn expand_counts_to_lengths(
+  counts: List(Int),
+  depth: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case counts {
+    [] -> list.reverse(acc)
+    [head, ..rest] -> {
+      let acc = append_n(depth, head, acc)
+      expand_counts_to_lengths(rest, depth + 1, acc)
+    }
+  }
+}
+
+fn append_n(value: Int, count: Int, acc: List(Int)) -> List(Int) {
+  case count {
+    0 -> acc
+    _ -> append_n(value, count - 1, [value, ..acc])
+  }
+}
+
+fn assign_lengths_to_symbols(
+  freq_pairs: List(#(Int, Int)),
+  lengths: List(Int),
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case freq_pairs, lengths {
+    [], _ -> acc
+    _, [] -> acc
+    [#(_, sym), ..rest_pairs], [len, ..rest_lens] ->
+      assign_lengths_to_symbols(
+        rest_pairs,
+        rest_lens,
+        dict.insert(acc, sym, len),
+      )
+  }
+}
+
+type BrNode {
+  BrLeaf(symbol: Int)
+  BrInternal(left: BrNode, right: BrNode)
+}
+
+fn br_merge(nodes: List(#(Int, BrNode))) -> BrNode {
+  case nodes {
+    [#(_, single)] -> single
+    [a, b, ..rest] -> {
+      let combined = #(a.0 + b.0, BrInternal(a.1, b.1))
+      br_merge(insert_brnode_sorted(combined, rest))
+    }
+    _ -> BrLeaf(0)
+  }
+}
+
+fn insert_brnode_sorted(
+  item: #(Int, BrNode),
+  nodes: List(#(Int, BrNode)),
+) -> List(#(Int, BrNode)) {
+  case nodes {
+    [] -> [item]
+    [head, ..rest] ->
+      case item.0 <= head.0 {
+        True -> [item, head, ..rest]
+        False -> [head, ..insert_brnode_sorted(item, rest)]
+      }
+  }
+}
+
+fn br_extract_lengths(
+  node: BrNode,
+  depth: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case node {
+    BrLeaf(sym) -> {
+      let length = case depth {
+        0 -> 1
+        _ -> depth
+      }
+      dict.insert(acc, sym, length)
+    }
+    BrInternal(l, r) -> {
+      let acc = br_extract_lengths(l, depth + 1, acc)
+      br_extract_lengths(r, depth + 1, acc)
+    }
+  }
+}
+
+fn cl_length_list(d: dict.Dict(Int, Int)) -> List(Int) {
+  // 18-entry list, indices 0..17.
+  cl_length_list_loop(d, 0, [])
+}
+
+fn cl_length_list_loop(
+  d: dict.Dict(Int, Int),
+  idx: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case idx >= 18 {
+    True -> list.reverse(acc)
+    False -> {
+      let len = case dict.get(d, idx) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      cl_length_list_loop(d, idx + 1, [len, ..acc])
+    }
+  }
+}
+
+fn emit_rle_via_cl(
+  writer: BitWriter,
+  rle: List(RleAtom),
+  codes: dict.Dict(Int, #(Int, Int)),
+) -> BitWriter {
+  case rle {
+    [] -> writer
+    [atom, ..rest] -> {
+      let writer = case atom {
+        RleLit(v) -> emit_cl_code(writer, codes, v)
+        RleRepPrev(extra) -> {
+          let writer = emit_cl_code(writer, codes, 16)
+          bw_write(writer, extra, 2)
+        }
+        RleRepZero(extra) -> {
+          let writer = emit_cl_code(writer, codes, 17)
+          bw_write(writer, extra, 3)
+        }
+      }
+      emit_rle_via_cl(writer, rest, codes)
+    }
+  }
+}
+
+fn emit_cl_code(
+  writer: BitWriter,
+  codes: dict.Dict(Int, #(Int, Int)),
+  symbol: Int,
+) -> BitWriter {
+  let #(code, length) = case dict.get(codes, symbol) {
+    Ok(v) -> v
+    Error(_) -> #(0, 0)
+  }
+  bw_write_code_msb_first(writer, code, length)
+}
+
+// --- Literal Huffman code construction --------------------------------
+//
+// Computes code lengths for the 256-symbol literal alphabet via the
+// standard frequency-merge Huffman.  Returns `Error(Nil)` when the
+// payload has fewer than two distinct bytes (we handle that case
+// by falling back to the uncompressed path).
+
+fn build_literal_huffman_lengths(bytes: BitArray) -> Result(List(Int), Nil) {
+  let freqs = brotli_byte_freqs(bytes, dict.new())
+  let distinct = dict.fold(freqs, 0, fn(acc, _k, _v) { acc + 1 })
+  case distinct < 2 {
+    True -> Error(Nil)
+    False -> {
+      let pairs =
+        dict.fold(freqs, [], fn(acc, sym, count) {
+          case count > 0 {
+            True -> [#(count, sym), ..acc]
+            False -> acc
+          }
+        })
+      let sorted = list.sort(pairs, fn(a, b) { int.compare(a.0, b.0) })
+      let nodes = list.map(sorted, fn(p) { #(p.0, BrLeaf(p.1)) })
+      let root = br_merge(nodes)
+      let dict_lengths = br_extract_lengths(root, 0, dict.new())
+      Ok(build_literal_length_list(dict_lengths, 0, []))
+    }
+  }
+}
+
+fn brotli_byte_freqs(
+  bytes: BitArray,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case bytes {
+    <<b, rest:bytes>> -> {
+      let cur = case dict.get(acc, b) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      brotli_byte_freqs(rest, dict.insert(acc, b, cur + 1))
+    }
+    _ -> acc
+  }
+}
+
+fn build_literal_length_list(
+  d: dict.Dict(Int, Int),
+  idx: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case idx >= 256 {
+    True -> list.reverse(acc)
+    False -> {
+      let len = case dict.get(d, idx) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      build_literal_length_list(d, idx + 1, [len, ..acc])
+    }
+  }
+}
+
+// Canonical Huffman code assignment matching the decoder's
+// `assign_canonical`: sort by `(length asc, symbol asc)` and assign
+// codes via the standard "shift on length change, +1 per step"
+// recurrence.  Returns `dict[symbol] = #(code, length)`.
+fn assign_brotli_canonical_codes(
+  lengths: List(Int),
+) -> dict.Dict(Int, #(Int, Int)) {
+  let pairs =
+    list.index_fold(lengths, [], fn(acc, len, sym) {
+      case len > 0 {
+        True -> [#(sym, len), ..acc]
+        False -> acc
+      }
+    })
+  let by_sym =
+    list.sort(pairs, fn(a, b) {
+      let #(sa, _) = a
+      let #(sb, _) = b
+      int.compare(sa, sb)
+    })
+  let by_len =
+    list.sort(by_sym, fn(a, b) {
+      let #(_, la) = a
+      let #(_, lb) = b
+      int.compare(la, lb)
+    })
+  assign_canonical_loop(by_len, 0, 0, dict.new())
+}
+
+fn assign_canonical_loop(
+  pairs: List(#(Int, Int)),
+  next_code: Int,
+  prev_length: Int,
+  acc: dict.Dict(Int, #(Int, Int)),
+) -> dict.Dict(Int, #(Int, Int)) {
+  case pairs {
+    [] -> acc
+    [#(sym, len), ..rest] -> {
+      let shifted = int.bitwise_shift_left(next_code, len - prev_length)
+      assign_canonical_loop(
+        rest,
+        shifted + 1,
+        len,
+        dict.insert(acc, sym, #(shifted, len)),
+      )
+    }
+  }
 }
 
 /// Maximum payload bytes per uncompressed metablock.  RFC 7932 §9.2
@@ -849,6 +1898,17 @@ fn emit_literals(
   emit_literals_loop(reader, state, actual)
 }
 
+// Per-iteration outcome of the literal-emit loop.  The loop dispatches
+// on this; the recursive call stays in tail position so the Gleam JS
+// compiler emits a real `while`, avoiding the ~10 000-frame call-stack
+// limit (`use <- result.try(...)` or mutual recursion would otherwise
+// grow the stack per iteration).
+type LiteralStep {
+  LiteralDone(state: CommandState, reader: Reader)
+  LiteralContinue(state: CommandState, reader: Reader, remaining: Int)
+  LiteralFailed(error: error.CodecError)
+}
+
 fn emit_literals_loop(
   reader: Reader,
   state: CommandState,
@@ -856,23 +1916,58 @@ fn emit_literals_loop(
 ) -> Result(#(CommandState, Reader), error.CodecError) {
   case remaining {
     0 -> Ok(#(state, reader))
-    _ -> {
-      use #(block_l, reader) <- result.try(maybe_switch_block(
+    _ ->
+      case emit_one_literal_step(reader, state, remaining) {
+        LiteralFailed(e) -> Error(e)
+        LiteralDone(s, r) -> Ok(#(s, r))
+        LiteralContinue(s, r, rem) -> emit_literals_loop(r, s, rem)
+      }
+  }
+}
+
+fn emit_one_literal_step(
+  reader: Reader,
+  state: CommandState,
+  remaining: Int,
+) -> LiteralStep {
+  case maybe_switch_block(reader, state.block_l) {
+    Error(e) -> LiteralFailed(e)
+    Ok(#(block_l, reader)) ->
+      decode_one_literal(
         reader,
-        state.block_l,
-      ))
-      let state = CommandState(..state, block_l: block_l)
-      let tree =
-        pick_tree_by_index(state.literal_codes, select_literal_tree_idx(state))
-      use #(byte, reader) <- result.try(decode_prefix_symbol(reader, tree))
-      let projected = bit_array.byte_size(state.output) + 1
-      use <- bool.guard(
-        when: projected > limit.max_output_bytes(state.limits),
-        return: Error(error.CodecLimitExceeded(
-          limit: "max_output_bytes",
-          actual: projected,
-        )),
+        CommandState(..state, block_l: block_l),
+        remaining,
       )
+  }
+}
+
+fn decode_one_literal(
+  reader: Reader,
+  state: CommandState,
+  remaining: Int,
+) -> LiteralStep {
+  let tree =
+    pick_tree_by_index(state.literal_codes, select_literal_tree_idx(state))
+  case decode_prefix_symbol(reader, tree) {
+    Error(e) -> LiteralFailed(e)
+    Ok(#(byte, reader)) -> append_one_literal(reader, state, remaining, byte)
+  }
+}
+
+fn append_one_literal(
+  reader: Reader,
+  state: CommandState,
+  remaining: Int,
+  byte: Int,
+) -> LiteralStep {
+  let projected = bit_array.byte_size(state.output) + 1
+  case projected > limit.max_output_bytes(state.limits) {
+    True ->
+      LiteralFailed(error.CodecLimitExceeded(
+        limit: "max_output_bytes",
+        actual: projected,
+      ))
+    False -> {
       let new_state =
         CommandState(
           ..state,
@@ -881,7 +1976,7 @@ fn emit_literals_loop(
           prev2: state.prev1,
           prev1: byte,
         )
-      emit_literals_loop(reader, new_state, remaining - 1)
+      LiteralContinue(new_state, reader, remaining - 1)
     }
   }
 }
@@ -1871,13 +2966,21 @@ fn decode_prefix_walk(
   accumulated: Int,
   bit_count: Int,
 ) -> Result(#(Int, Reader), error.CodecError) {
+  // `use <- result.try(...)` breaks TCO on the JS target — inline the
+  // case match so the recursive call stays in tail position.  Without
+  // this, a compressed metablock with thousands of literal symbols
+  // accumulates one stack frame per `read_bits` call and blows past
+  // the JS engine's ~10 000-frame limit.
   case find_prefix_entry(entries, bit_count, accumulated) {
     Ok(symbol) -> Ok(#(symbol, reader))
-    Error(_) -> {
-      use #(bit, reader) <- result.try(read_bits(reader, 1))
-      let new_acc = int.bitwise_shift_left(accumulated, 1) + bit
-      decode_prefix_walk(reader, entries, new_acc, bit_count + 1)
-    }
+    Error(_) ->
+      case read_bits(reader, 1) {
+        Error(e) -> Error(e)
+        Ok(#(bit, reader)) -> {
+          let new_acc = int.bitwise_shift_left(accumulated, 1) + bit
+          decode_prefix_walk(reader, entries, new_acc, bit_count + 1)
+        }
+      }
   }
 }
 
