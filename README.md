@@ -124,16 +124,18 @@ The zstd encoder now emits a Compressed_Block with Huffman-coded
 literals on both the 1-stream form (≤ 1023-byte chunks) and the
 4-stream form (≤ 16 KiB chunks with a 6-byte jump table), holding
 ~50 % compression ratio on English-like text across a wide range
-of input sizes.  Inputs whose byte distribution needs > 128
-symbols still fall back to Raw / RLE — the FSE-form tree
-description for ≥ 128-symbol alphabets is future work.  The xz / 7z / ZIP
-method 14 encoders now share a real LZ77 LZMA1 encoder
+of input sizes.  The tree description picks the direct-weight
+form when the alphabet streams ≤ 127 weights and the FSE-
+compressed form (header byte 0..127 + FSE body) otherwise, so
+alphabets that use byte values above 127 are now Huffman-encoded
+instead of falling back to Raw / RLE.  The xz / 7z / ZIP method
+14 encoders share a real LZ77 LZMA1 encoder
 (`packkit/internal/lzma.encode_with_lz77`, 3-byte hash chain
 with a 32 KiB window plus LZMA rep-match and short-rep emission
 when the match distance hits the `rep0..rep3` ring) which
 delivers real compression on repetitive payloads — e.g. an 80
-KiB repeating-string xz file shrinks to ~388 bytes (0.49 % ratio),
-9 KiB of repeated pangrams to 148 bytes (1.6 %).
+KiB repeating-string xz file shrinks to ~388 bytes (0.49 %
+ratio), 9 KiB of repeated pangrams to 148 bytes (1.6 %).
 
 ## Install
 

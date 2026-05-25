@@ -169,15 +169,86 @@ pub fn encode_huffman_4stream_multi_block_roundtrips_test() -> Nil {
 }
 
 pub fn encode_falls_back_to_raw_for_full_byte_range_test() -> Nil {
-  // 1023 bytes that touch every byte > 127 would need an FSE-form
-  // tree description (header_byte < 128) — which the encoder does
-  // not emit yet.  Make sure the encoder gracefully falls back to
-  // Raw / RLE for such payloads instead of producing an invalid
-  // header.
+  // 1023 bytes that cycle bytes 128..255: the alphabet streams 255
+  // weights, which overflows the direct-weight header byte range
+  // ([128, 254]).  The encoder now routes this through the FSE-
+  // compressed tree-description form; the chunk still has to round-
+  // trip cleanly regardless of which form it ended up using.
   let payload = high_byte_cycle(0, 1023, <<>>)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
   let assert Ok(decoded) = zstd.decode(bytes: encoded)
   decoded |> should.equal(payload)
+}
+
+pub fn encode_uses_fse_huffman_for_wide_alphabet_test() -> Nil {
+  // 800 bytes drawn from a 200-symbol alphabet (bytes 0..199 cycled
+  // four times).  Direct-weight serialization can't represent this
+  // tree (num_serialized = 199 > 127), so the encoder is forced
+  // through the FSE-compressed tree-description path.  The
+  // distribution is roughly uniform so Huffman won't beat Raw, but
+  // every internal stage (FSE encoder, FSE decoder, Huffman tree
+  // reconstruction) still has to round-trip cleanly.
+  let payload = wide_alphabet_payload(0, 200, 4, <<>>)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+}
+
+pub fn encode_compresses_skewed_wide_alphabet_via_fse_huffman_test() -> Nil {
+  // 1000 bytes, alphabet of 150 distinct values, heavily skewed so
+  // Huffman + FSE-form tree description actually beats Raw_Block.
+  // Byte 0 dominates (500 occurrences); bytes 1..149 split the rest.
+  // The encoder must pick FSE-form for the tree (num_serialized = 149
+  // > 127) and produce a Compressed_Block smaller than the 1000-byte
+  // payload.
+  let payload = skewed_wide_payload()
+  let payload_size = bit_array.byte_size(payload)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+  case bit_array.byte_size(encoded) < payload_size {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
+fn wide_alphabet_payload(
+  cycle: Int,
+  alphabet: Int,
+  cycles: Int,
+  acc: BitArray,
+) -> BitArray {
+  case cycle >= cycles {
+    True -> acc
+    False ->
+      wide_alphabet_payload(
+        cycle + 1,
+        alphabet,
+        cycles,
+        append_range(0, alphabet, acc),
+      )
+  }
+}
+
+fn append_range(n: Int, target: Int, acc: BitArray) -> BitArray {
+  case n >= target {
+    True -> acc
+    False -> append_range(n + 1, target, <<acc:bits, n>>)
+  }
+}
+
+fn skewed_wide_payload() -> BitArray {
+  let dominant = repeat_byte_run(0, 500, <<>>)
+  // Bytes 1..149 each appear ~3 times = 447 bytes; one extra to land on 950.
+  let tail = wide_alphabet_payload(0, 150, 3, <<>>)
+  bit_array.concat([dominant, tail])
+}
+
+fn repeat_byte_run(byte: Int, n: Int, acc: BitArray) -> BitArray {
+  case n {
+    0 -> acc
+    _ -> repeat_byte_run(byte, n - 1, <<acc:bits, byte>>)
+  }
 }
 
 fn repeat_bytes(value: BitArray, times: Int) -> BitArray {

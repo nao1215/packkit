@@ -269,21 +269,17 @@ fn try_huffman_block(
         Ok(#(lengths, max_bits)) ->
           case max_bits > huffman_max_tree_depth {
             True -> None
-            False -> {
-              // The direct-weight tree-description header byte is
-              // `127 + N` (N = number of streamed weights = max_symbol
-              // used).  That byte must stay within [128, 254] so the
-              // decoder picks the direct-weight branch; if N > 127
-              // the header overflows out of that range and the
-              // decoder reinterprets the body as FSE weights.  Skip
-              // Huffman in that case and let the chunk fall back to
-              // Raw / RLE.
-              let max_symbol_used = highest_nonzero_index(lengths, -1, 0)
-              case max_symbol_used > 127 {
-                True -> None
-                False -> {
+            False ->
+              // The tree-description serializer picks direct form
+              // when the alphabet streams ≤ 127 weights and the FSE-
+              // compressed form (header byte 0..127 + FSE body)
+              // otherwise.  When even FSE form wouldn't fit the 127-
+              // byte body cap, drop Huffman and let the chunk fall
+              // back to Raw / RLE.
+              case serialize_huffman_tree_unified(lengths) {
+                None -> None
+                Some(tree_bytes) -> {
                   let code_table = assign_canonical_codes(lengths, max_bits)
-                  let tree_bytes = serialize_huffman_tree(lengths)
                   let bitstream = encode_huffman_bitstream(chunk, code_table)
                   let comp_size =
                     bit_array.byte_size(tree_bytes)
@@ -314,7 +310,6 @@ fn try_huffman_block(
                   }
                 }
               }
-            }
           }
       }
     }
@@ -344,13 +339,11 @@ fn try_huffman_block_4stream(
         Ok(#(lengths, max_bits)) ->
           case max_bits > huffman_max_tree_depth {
             True -> None
-            False -> {
-              let max_symbol_used = highest_nonzero_index(lengths, -1, 0)
-              case max_symbol_used > 127 {
-                True -> None
-                False -> {
+            False ->
+              case serialize_huffman_tree_unified(lengths) {
+                None -> None
+                Some(tree_bytes) -> {
                   let code_table = assign_canonical_codes(lengths, max_bits)
-                  let tree_bytes = serialize_huffman_tree(lengths)
                   let parts = split_chunk_4(chunk, chunk_size)
                   let #(p1, p2, p3, p4) = parts
                   let s1 = encode_huffman_bitstream(p1, code_table)
@@ -409,7 +402,6 @@ fn try_huffman_block_4stream(
                   }
                 }
               }
-            }
           }
       }
   }
@@ -475,17 +467,6 @@ fn build_compressed_literals_section_4stream(
     )
   let b3 = int.bitwise_and(int.bitwise_shift_right(comp_size, 6), 0xFF)
   bit_array.concat([<<b0, b1, b2, b3>>, tree_bytes, jump_table, s1, s2, s3, s4])
-}
-
-fn highest_nonzero_index(lengths: List(Int), best: Int, pos: Int) -> Int {
-  case lengths {
-    [] -> best
-    [head, ..rest] ->
-      case head > 0 {
-        True -> highest_nonzero_index(rest, pos, pos + 1)
-        False -> highest_nonzero_index(rest, best, pos + 1)
-      }
-  }
 }
 
 // -- Huffman literals support ------------------------------------------
@@ -819,13 +800,641 @@ fn flush_final_bits(buf: Int, bits: Int, out: BitArray) -> BitArray {
   }
 }
 
-/// Serialize the Huffman tree in the direct-weight form: header byte
-/// `127 + num_weights` (placing it in 128..254) followed by 4-bit
-/// weights packed two-per-byte.  The last weight is implied — it's
-/// derived from the constraint that `sum(2^(weight-1)) = 2^max_bits`.
-fn serialize_huffman_tree(lengths: List(Int)) -> BitArray {
+// ============================================================
+// FSE-form Huffman tree description encoder (RFC 8478 §4.2.1.2).
+//
+// The direct-weight form caps `num_serialized` at 127 because its
+// header byte = `127 + N` and must stay in [128, 254].  Any alphabet
+// that streams more than 127 weights (i.e. uses byte values above
+// 127) needs the FSE-compressed form, where the header byte 0..127
+// is the FSE body's size in bytes.  Each body holds:
+//   1. a forward bitstream describing the normalized weight FSE
+//      distribution (accuracy_log + per-symbol counts), padded to a
+//      byte boundary.
+//   2. a backward FSE bitstream of two interleaved state streams,
+//      terminated by zstd's standard "highest set bit of the last
+//      byte" marker.
+// We build the decoder-side state table via `fse.build_state_table`
+// (so the same code that the decoder relies on assigns positions and
+// nb_bits) and derive the encoder transition lookup by inverting it.
+// ============================================================
+
+const fse_weight_accuracy_log: Int = 6
+
+const fse_weight_table_size: Int = 64
+
+const fse_weight_max_body: Int = 127
+
+/// Try to serialize the Huffman tree as an FSE-compressed weight
+/// stream.  Returns `None` when the FSE body wouldn't fit the 127-byte
+/// cap imposed by the 1-byte tree-description header (so the chunk
+/// will fall back to Raw / RLE).
+fn try_serialize_huffman_tree_fse(serialized: List(Int)) -> Option(BitArray) {
+  case list.length(serialized) < 2 {
+    True -> None
+    False ->
+      case fse_encode_weight_stream(serialized) {
+        Error(_) -> None
+        Ok(body) -> {
+          let body_size = bit_array.byte_size(body)
+          case body_size == 0 || body_size > fse_weight_max_body {
+            True -> None
+            False -> Some(<<body_size, body:bits>>)
+          }
+        }
+      }
+  }
+}
+
+fn fse_encode_weight_stream(weights: List(Int)) -> Result(BitArray, Nil) {
+  let total = list.length(weights)
+  let counts = tally_fse_weights(weights, dict.new())
+  let max_used = highest_used_fse_weight(counts)
+  case max_used < 0 {
+    True -> Error(Nil)
+    False ->
+      case normalize_fse_weight_counts(counts, total, max_used) {
+        Error(_) -> Error(Nil)
+        Ok(normalized) -> {
+          let header = encode_fse_dist_header(normalized, max_used)
+          let state_table =
+            fse.build_state_table(normalized, fse_weight_accuracy_log)
+          let bitstream = encode_fse_weight_bitstream(weights, state_table)
+          Ok(bit_array.concat([header, bitstream]))
+        }
+      }
+  }
+}
+
+fn tally_fse_weights(
+  weights: List(Int),
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case weights {
+    [] -> acc
+    [w, ..rest] -> {
+      let curr = case dict.get(acc, w) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      tally_fse_weights(rest, dict.insert(acc, w, curr + 1))
+    }
+  }
+}
+
+fn highest_used_fse_weight(counts: dict.Dict(Int, Int)) -> Int {
+  dict.fold(counts, -1, fn(acc, sym, count) {
+    case count > 0 && sym > acc {
+      True -> sym
+      False -> acc
+    }
+  })
+}
+
+// Floor-and-give-rest-to-largest normalization.  Sufficient for the
+// weight FSE stream (small alphabet, fits at accuracy_log = 6) — and
+// every used symbol ends up with at least one state slot so the
+// resulting state table can encode any input weight.
+fn normalize_fse_weight_counts(
+  counts: dict.Dict(Int, Int),
+  total: Int,
+  max_used: Int,
+) -> Result(List(Int), Nil) {
+  case total {
+    0 -> Error(Nil)
+    _ -> {
+      let raw = build_floor_normalized(counts, total, 0, max_used, [])
+      let sum = sum_int_list(raw, 0)
+      let diff = fse_weight_table_size - sum
+      case diff {
+        0 -> Ok(raw)
+        _ -> {
+          let idx = find_largest_count_index(counts, max_used)
+          case idx < 0 {
+            True -> Error(Nil)
+            False -> Ok(adjust_normalized_at(raw, idx, diff, 0, []))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn build_floor_normalized(
+  counts: dict.Dict(Int, Int),
+  total: Int,
+  sym: Int,
+  max_used: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case sym > max_used {
+    True -> list.reverse(acc)
+    False -> {
+      let count = case dict.get(counts, sym) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      let normalized = case count {
+        0 -> 0
+        _ -> {
+          let scaled = count * fse_weight_table_size / total
+          case scaled {
+            0 -> 1
+            v -> v
+          }
+        }
+      }
+      build_floor_normalized(counts, total, sym + 1, max_used, [
+        normalized,
+        ..acc
+      ])
+    }
+  }
+}
+
+fn sum_int_list(list: List(Int), acc: Int) -> Int {
+  case list {
+    [] -> acc
+    [head, ..rest] -> sum_int_list(rest, acc + head)
+  }
+}
+
+fn find_largest_count_index(counts: dict.Dict(Int, Int), max_used: Int) -> Int {
+  find_largest_loop(counts, 0, max_used, -1, -1)
+}
+
+fn find_largest_loop(
+  counts: dict.Dict(Int, Int),
+  sym: Int,
+  max_used: Int,
+  best_idx: Int,
+  best_count: Int,
+) -> Int {
+  case sym > max_used {
+    True -> best_idx
+    False -> {
+      let count = case dict.get(counts, sym) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      case count > best_count {
+        True -> find_largest_loop(counts, sym + 1, max_used, sym, count)
+        False ->
+          find_largest_loop(counts, sym + 1, max_used, best_idx, best_count)
+      }
+    }
+  }
+}
+
+fn adjust_normalized_at(
+  normalized: List(Int),
+  target_idx: Int,
+  diff: Int,
+  cur_idx: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case normalized {
+    [] -> list.reverse(acc)
+    [head, ..rest] -> {
+      let new_head = case cur_idx == target_idx {
+        True -> head + diff
+        False -> head
+      }
+      adjust_normalized_at(rest, target_idx, diff, cur_idx + 1, [
+        new_head,
+        ..acc
+      ])
+    }
+  }
+}
+
+// Encode the FSE distribution header as a forward bitstream.
+// Layout: 4 bits accuracy_log - 5, then variable-width per-symbol
+// count codes, then padding to a byte boundary.  Mirrors the decoder
+// in `internal/huf.read_distribution` exactly.
+fn encode_fse_dist_header(normalized: List(Int), max_used: Int) -> BitArray {
+  let #(buf, bits, out) =
+    push_bits_unchecked(0, 0, <<>>, fse_weight_accuracy_log - 5, 4)
+  let table_size = fse_weight_table_size
+  let normalized_dict = list_to_indexed_dict(normalized, 0, dict.new())
+  let #(buf, bits, out) =
+    write_dist_loop(
+      normalized_dict,
+      0,
+      max_used,
+      table_size + 1,
+      table_size,
+      fse_weight_accuracy_log + 1,
+      False,
+      buf,
+      bits,
+      out,
+    )
+  pad_to_byte_boundary(buf, bits, out)
+}
+
+fn list_to_indexed_dict(
+  list: List(Int),
+  idx: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case list {
+    [] -> acc
+    [head, ..rest] ->
+      list_to_indexed_dict(rest, idx + 1, dict.insert(acc, idx, head))
+  }
+}
+
+fn write_dist_loop(
+  normalized: dict.Dict(Int, Int),
+  curr: Int,
+  max_used: Int,
+  remaining: Int,
+  threshold: Int,
+  bit_count: Int,
+  prev_is_zero: Bool,
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, BitArray) {
+  case remaining <= 1 || curr > max_used {
+    True -> #(buf, bits, out)
+    False ->
+      case prev_is_zero {
+        True -> {
+          let run = count_zero_run_from(normalized, curr, max_used, 0)
+          let #(buf, bits, out) = emit_zero_run(run, buf, bits, out)
+          write_dist_loop(
+            normalized,
+            curr + run,
+            max_used,
+            remaining,
+            threshold,
+            bit_count,
+            False,
+            buf,
+            bits,
+            out,
+          )
+        }
+        False -> {
+          let probability = case dict.get(normalized, curr) {
+            Ok(v) -> v
+            Error(_) -> 0
+          }
+          let count_wire = probability + 1
+          let max_val = 2 * threshold - 1 - remaining
+          let #(buf, bits, out) =
+            push_count_bits(
+              buf,
+              bits,
+              out,
+              count_wire,
+              max_val,
+              threshold,
+              bit_count,
+            )
+          let abs_prob = case probability < 0 {
+            True -> -probability
+            False -> probability
+          }
+          let new_remaining = remaining - abs_prob
+          let #(new_threshold, new_bit_count) =
+            fse_shrink_threshold(threshold, bit_count, new_remaining)
+          write_dist_loop(
+            normalized,
+            curr + 1,
+            max_used,
+            new_remaining,
+            new_threshold,
+            new_bit_count,
+            probability == 0,
+            buf,
+            bits,
+            out,
+          )
+        }
+      }
+  }
+}
+
+fn count_zero_run_from(
+  normalized: dict.Dict(Int, Int),
+  pos: Int,
+  max_used: Int,
+  acc: Int,
+) -> Int {
+  case pos > max_used {
+    True -> acc
+    False -> {
+      let v = case dict.get(normalized, pos) {
+        Ok(x) -> x
+        Error(_) -> 0
+      }
+      case v == 0 {
+        True -> count_zero_run_from(normalized, pos + 1, max_used, acc + 1)
+        False -> acc
+      }
+    }
+  }
+}
+
+fn emit_zero_run(
+  run: Int,
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, BitArray) {
+  case run >= 3 {
+    True -> {
+      let #(buf, bits, out) = push_bits_unchecked(buf, bits, out, 3, 2)
+      emit_zero_run(run - 3, buf, bits, out)
+    }
+    False -> push_bits_unchecked(buf, bits, out, run, 2)
+  }
+}
+
+fn push_count_bits(
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+  count_wire: Int,
+  max_val: Int,
+  threshold: Int,
+  bit_count: Int,
+) -> #(Int, Int, BitArray) {
+  case count_wire < max_val {
+    True -> push_bits_unchecked(buf, bits, out, count_wire, bit_count - 1)
+    False ->
+      case count_wire < threshold {
+        True -> push_bits_unchecked(buf, bits, out, count_wire, bit_count)
+        False ->
+          push_bits_unchecked(buf, bits, out, count_wire + max_val, bit_count)
+      }
+  }
+}
+
+fn fse_shrink_threshold(
+  threshold: Int,
+  bit_count: Int,
+  remaining: Int,
+) -> #(Int, Int) {
+  case remaining >= threshold {
+    True -> #(threshold, bit_count)
+    False ->
+      case threshold <= 1 {
+        True -> #(threshold, bit_count)
+        False -> fse_shrink_threshold(threshold / 2, bit_count - 1, remaining)
+      }
+  }
+}
+
+// Push `n` bits of `value` to `buf` (LSB-first into the buffer) and
+// flush any complete bytes that accumulate.
+fn push_bits_unchecked(
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+  value: Int,
+  n: Int,
+) -> #(Int, Int, BitArray) {
+  let new_buf = int.bitwise_or(buf, int.bitwise_shift_left(value, bits))
+  flush_full_bytes(new_buf, bits + n, out)
+}
+
+fn pad_to_byte_boundary(buf: Int, bits: Int, out: BitArray) -> BitArray {
+  case bits {
+    0 -> out
+    _ -> {
+      let byte = int.bitwise_and(buf, 0xFF)
+      <<out:bits, byte>>
+    }
+  }
+}
+
+// FSE state slot used by the encoder lookup.  `state_idx` is the
+// decoder state the encoder transitions TO (when stepping backward
+// through input symbols); `baseline`/`hi` define the half-open range
+// of encoder states from which that transition is reachable.
+type FseEncSlot {
+  FseEncSlot(state_idx: Int, baseline: Int, hi: Int, nb_bits: Int)
+}
+
+fn build_fse_enc_slots(
+  state_table: dict.Dict(Int, fse.StateEntry),
+) -> dict.Dict(Int, List(FseEncSlot)) {
+  build_fse_enc_slots_loop(state_table, 0, fse_weight_table_size, dict.new())
+}
+
+fn build_fse_enc_slots_loop(
+  state_table: dict.Dict(Int, fse.StateEntry),
+  s_idx: Int,
+  table_size: Int,
+  acc: dict.Dict(Int, List(FseEncSlot)),
+) -> dict.Dict(Int, List(FseEncSlot)) {
+  case s_idx >= table_size {
+    True -> acc
+    False -> {
+      let entry = case dict.get(state_table, s_idx) {
+        Ok(e) -> e
+        Error(_) -> fse.StateEntry(symbol: 0, nb_bits: 0, baseline: 0)
+      }
+      let span = int.bitwise_shift_left(1, entry.nb_bits)
+      let slot =
+        FseEncSlot(
+          state_idx: s_idx,
+          baseline: entry.baseline,
+          hi: entry.baseline + span,
+          nb_bits: entry.nb_bits,
+        )
+      let existing = case dict.get(acc, entry.symbol) {
+        Ok(l) -> l
+        Error(_) -> []
+      }
+      build_fse_enc_slots_loop(
+        state_table,
+        s_idx + 1,
+        table_size,
+        dict.insert(acc, entry.symbol, [slot, ..existing]),
+      )
+    }
+  }
+}
+
+fn smallest_state_for_symbol(
+  slots: dict.Dict(Int, List(FseEncSlot)),
+  symbol: Int,
+) -> Result(Int, Nil) {
+  case dict.get(slots, symbol) {
+    Error(_) -> Error(Nil)
+    Ok([]) -> Error(Nil)
+    Ok(list) -> Ok(smallest_state_idx_loop(list, fse_weight_table_size))
+  }
+}
+
+fn smallest_state_idx_loop(list: List(FseEncSlot), best: Int) -> Int {
+  case list {
+    [] -> best
+    [slot, ..rest] ->
+      case slot.state_idx < best {
+        True -> smallest_state_idx_loop(rest, slot.state_idx)
+        False -> smallest_state_idx_loop(rest, best)
+      }
+  }
+}
+
+fn find_slot_for(
+  slots: dict.Dict(Int, List(FseEncSlot)),
+  symbol: Int,
+  current_state: Int,
+) -> Result(FseEncSlot, Nil) {
+  case dict.get(slots, symbol) {
+    Error(_) -> Error(Nil)
+    Ok(list) -> find_slot_in_list(list, current_state)
+  }
+}
+
+fn find_slot_in_list(
+  list: List(FseEncSlot),
+  state: Int,
+) -> Result(FseEncSlot, Nil) {
+  case list {
+    [] -> Error(Nil)
+    [slot, ..rest] ->
+      case state >= slot.baseline && state < slot.hi {
+        True -> Ok(slot)
+        False -> find_slot_in_list(rest, state)
+      }
+  }
+}
+
+fn encode_fse_weight_bitstream(
+  weights: List(Int),
+  state_table: dict.Dict(Int, fse.StateEntry),
+) -> BitArray {
+  let n = list.length(weights)
+  let slots = build_fse_enc_slots(state_table)
+  let weights_dict = list_to_indexed_dict(weights, 0, dict.new())
+  // The decoder reaches exhaustion with `use_a` toggled (N-2) times,
+  // so for N even `active = state_a` (emits w[N-2]) and `partner =
+  // state_b` (emits w[N-1]); for N odd the roles flip.
+  let #(target_a_sym, target_b_sym) = case int.bitwise_and(n, 1) {
+    0 -> #(
+      dict_index_or_zero(weights_dict, n - 2),
+      dict_index_or_zero(weights_dict, n - 1),
+    )
+    _ -> #(
+      dict_index_or_zero(weights_dict, n - 1),
+      dict_index_or_zero(weights_dict, n - 2),
+    )
+  }
+  let state_a_init = case smallest_state_for_symbol(slots, target_a_sym) {
+    Ok(s) -> s
+    Error(_) -> 0
+  }
+  let state_b_init = case smallest_state_for_symbol(slots, target_b_sym) {
+    Ok(s) -> s
+    Error(_) -> 0
+  }
+  // Walk symbols from N-3 down to 0, pushing the bits the FORWARD
+  // decoder would have read to reach the current state after each
+  // emission.  Even indices come from state_a, odd from state_b.
+  let #(buf, bits, state_a, state_b, out) =
+    fse_encode_transitions(
+      weights_dict,
+      n - 3,
+      state_a_init,
+      state_b_init,
+      slots,
+      0,
+      0,
+      <<>>,
+    )
+  // state_a / state_b now hold the initial decoder states (read
+  // first by the decoder).  Push them in encoder-reverse order so
+  // they land at the top of the bitstream.
+  let #(buf, bits, out) =
+    push_bits_unchecked(buf, bits, out, state_b, fse_weight_accuracy_log)
+  let #(buf, bits, out) =
+    push_bits_unchecked(buf, bits, out, state_a, fse_weight_accuracy_log)
+  let buf2 = int.bitwise_or(buf, int.bitwise_shift_left(1, bits))
+  let bits2 = bits + 1
+  flush_final_bits(buf2, bits2, out)
+}
+
+fn dict_index_or_zero(d: dict.Dict(Int, Int), idx: Int) -> Int {
+  case dict.get(d, idx) {
+    Ok(v) -> v
+    Error(_) -> 0
+  }
+}
+
+fn fse_encode_transitions(
+  weights: dict.Dict(Int, Int),
+  i: Int,
+  state_a: Int,
+  state_b: Int,
+  slots: dict.Dict(Int, List(FseEncSlot)),
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, Int, Int, BitArray) {
+  case i < 0 {
+    True -> #(buf, bits, state_a, state_b, out)
+    False -> {
+      let w = dict_index_or_zero(weights, i)
+      let use_state_a = int.bitwise_and(i, 1) == 0
+      let curr_state = case use_state_a {
+        True -> state_a
+        False -> state_b
+      }
+      case find_slot_for(slots, w, curr_state) {
+        Error(_) ->
+          // Shouldn't happen — every weight value in `weights` had a
+          // positive normalized count, so its row in `slots` covers
+          // every encoder state.  Skip without producing bits.
+          fse_encode_transitions(
+            weights,
+            i - 1,
+            state_a,
+            state_b,
+            slots,
+            buf,
+            bits,
+            out,
+          )
+        Ok(slot) -> {
+          let emit_value = curr_state - slot.baseline
+          let #(buf, bits, out) =
+            push_bits_unchecked(buf, bits, out, emit_value, slot.nb_bits)
+          let prev_state = slot.state_idx
+          let #(new_a, new_b) = case use_state_a {
+            True -> #(prev_state, state_b)
+            False -> #(state_a, prev_state)
+          }
+          fse_encode_transitions(
+            weights,
+            i - 1,
+            new_a,
+            new_b,
+            slots,
+            buf,
+            bits,
+            out,
+          )
+        }
+      }
+    }
+  }
+}
+
+/// Unified Huffman tree-description serializer.  Picks the direct-
+/// weight form when the alphabet fits (≤ 127 streamed weights) and
+/// otherwise falls back to the FSE-compressed form.  Returns `None`
+/// when neither form fits — the caller drops Huffman for the chunk
+/// and emits a Raw / RLE block instead.
+fn serialize_huffman_tree_unified(lengths: List(Int)) -> Option(BitArray) {
   let max_bits = max_length_in_list(lengths, 0)
-  // weight = max_bits + 1 - length (for length > 0); 0 for unused.
   let weights =
     list.map(lengths, fn(l) {
       case l {
@@ -834,15 +1443,16 @@ fn serialize_huffman_tree(lengths: List(Int)) -> BitArray {
       }
     })
   let trimmed = trim_trailing_zero_weights(list.reverse(weights), [])
-  // Drop the last weight (it's implied by the Kraft balance check).
   let serialized = drop_last_weight(trimmed, [])
   let num_serialized = list.length(serialized)
-  // Header_byte = 127 + N where N = number of weights explicitly
-  // streamed; the (N+1)-th weight is implied by the Kraft balance the
-  // decoder reconstructs in `weights_with_implied_last`.
-  let header_byte = 127 + num_serialized
-  let packed = pack_weights_4bit(serialized, <<>>)
-  <<header_byte, packed:bits>>
+  case num_serialized <= 127 {
+    True -> {
+      let header_byte = 127 + num_serialized
+      let packed = pack_weights_4bit(serialized, <<>>)
+      Some(<<header_byte, packed:bits>>)
+    }
+    False -> try_serialize_huffman_tree_fse(serialized)
+  }
 }
 
 /// Pack the Literals_Section_Header for the 1-stream Compressed form

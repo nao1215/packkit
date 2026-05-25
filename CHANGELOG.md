@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Feature (zstd)**: the zstd Huffman literals encoder now also
+  emits the FSE-compressed tree-description form (header byte
+  0..127 + FSE body) when the direct-weight form can't carry the
+  alphabet.  Tree descriptions for byte alphabets that stream
+  more than 127 weights — i.e. anything that uses byte values
+  above 127 — are now Huffman-encoded instead of falling back to
+  Raw / RLE.  The FSE encoder builds normalised counts (floor-
+  scale at accuracy_log = 6, give the remainder to the largest
+  count), writes the distribution header forward, then inverts
+  the decoder's `fse.build_state_table` to drive a two-state
+  backward encoding loop with the standard zstd "highest set bit
+  of the last byte" marker.  A chunk whose FSE body would exceed
+  the 127-byte header cap still falls back to Raw / RLE; in
+  practice that only triggers on highly skewed inputs with > 200
+  distinct bytes.
 - **Feature (lzma1)**: literal-or-short-rep dispatch on the LZMA1
   encoder.  Whenever the byte at `pos - rep0 - 1` already matches
   the current input byte, the encoder emits the LZMA short-rep

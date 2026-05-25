@@ -134,6 +134,7 @@ unused_exports = "off"
 ]
 "src/packkit/zstd.gleam" = [
   "assert_ok_pattern",
+  "deep_nesting",
   "prefer_guard_clause",
   "short_variable_name",
   "thrown_away_error",
