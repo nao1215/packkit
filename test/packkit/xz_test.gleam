@@ -39,6 +39,54 @@ pub fn encode_roundtrip_empty_test() -> Nil {
   |> should.equal(payload)
 }
 
+pub fn encode_emits_lzma_compressed_chunks_test() -> Nil {
+  // After the switch to a real LZMA1 encoder the LZMA2 control byte
+  // of the first chunk must be in the LZMA-chunk range (>= 0x80),
+  // NOT the uncompressed-chunk range (0x01 or 0x02).  Sniff a few
+  // bytes inside the stream to make sure we did not regress to the
+  // old uncompressed-only encoder.
+  let payload = <<"the quick brown fox jumps over the lazy dog.":utf8>>
+  let assert Ok(encoded) = xz.encode(bytes: payload)
+  // The first 12 bytes are the stream header, followed by the block
+  // header (variable length).  Scan from byte 12 onward for the
+  // first byte whose value is >= 0xE0 (LZMA chunk with reset).
+  case find_lzma2_lzma_chunk(encoded, 12) {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
+fn find_lzma2_lzma_chunk(bytes: BitArray, offset: Int) -> Bool {
+  case bit_array.slice(bytes, offset, 1) {
+    Ok(<<b>>) ->
+      case b >= 0xE0 {
+        True -> True
+        False -> find_lzma2_lzma_chunk(bytes, offset + 1)
+      }
+    _ -> False
+  }
+}
+
+pub fn encode_roundtrip_multi_chunk_test() -> Nil {
+  // Anything larger than 32 KiB forces the encoder to split across
+  // multiple LZMA2 LZMA chunks.  Use 80 KiB of mixed-content data so
+  // the decoder has to glue three chunks back together; if either
+  // side's chunk framing is wrong the round-trip falls apart.
+  let unit = "PACKKIT-XZ-LZMA2-CHUNK-CROSS-TEST-PAYLOAD-"
+  let payload = repeat_bytes(<<unit:utf8>>, 1900)
+  let assert Ok(encoded) = xz.encode(bytes: payload)
+  let assert Ok(decoded) = xz.decode(bytes: encoded)
+  decoded
+  |> should.equal(payload)
+}
+
+fn repeat_bytes(value: BitArray, times: Int) -> BitArray {
+  case times {
+    0 -> <<>>
+    _ -> bit_array.concat([value, repeat_bytes(value, times - 1)])
+  }
+}
+
 pub fn decode_empty_stream_test() -> Nil {
   // `printf '' | xz -c` — empty stream is just header + empty index + footer.
   let fixture = <<

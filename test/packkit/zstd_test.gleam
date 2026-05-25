@@ -103,6 +103,100 @@ pub fn encode_roundtrip_512_test() -> Nil {
   |> should.equal(payload)
 }
 
+pub fn encode_uses_huffman_for_compressible_text_test() -> Nil {
+  // 1023 bytes of repeated text — the chunk just fits the 1-stream
+  // Huffman literals header's 10-bit regen field.  Once the new
+  // Huffman encoder picks the Compressed_Block path the encoded
+  // output must be a notable fraction smaller than the raw size.
+  let payload = repeat_bytes(<<"The quick brown fox ":utf8>>, 51)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+  // 1020 bytes of fairly redundant English text should compress to
+  // well under 80 % of the raw size — confirms the Huffman path is
+  // actually being selected over Raw_Block.
+  let encoded_size = bit_array.byte_size(encoded)
+  let payload_size = bit_array.byte_size(payload)
+  case encoded_size * 5 < payload_size * 4 {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
+pub fn encode_huffman_multi_chunk_roundtrips_test() -> Nil {
+  // Spans multiple 1023-byte Huffman chunks so the encoder has to
+  // emit multiple back-to-back Compressed_Blocks with is_last only
+  // on the final one.  Catches regressions in the chunk-splitting
+  // logic or the per-block last-bit handling.
+  let payload =
+    repeat_bytes(<<"The quick brown fox jumps over the lazy dog. ":utf8>>, 100)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+}
+
+pub fn encode_huffman_4stream_roundtrips_test() -> Nil {
+  // A ~12 KiB chunk that's above the 1-stream form's 1023-byte cap
+  // forces the encoder onto the 4-stream form (`size_format = 2`).
+  // Catches off-by-one splits, jump-table size mismatches, and the
+  // shared Huffman tree being applied incorrectly to any one of the
+  // four sub-bitstreams.
+  let payload =
+    repeat_bytes(<<"Lorem ipsum dolor sit amet, consectetur. ":utf8>>, 300)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+  // 12 KiB of repetitive English should compress to under 70 %
+  // of raw — confirms 4-stream Huffman is actually being picked.
+  let encoded_size = bit_array.byte_size(encoded)
+  let payload_size = bit_array.byte_size(payload)
+  case encoded_size * 10 < payload_size * 7 {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
+pub fn encode_huffman_4stream_multi_block_roundtrips_test() -> Nil {
+  // Multi-block + 4-stream — > 16 KiB forces the encoder to split
+  // across two 4-stream Compressed_Blocks back-to-back.  Verifies
+  // both block-level `is_last` handling and per-block 4-stream
+  // jump-table consistency.
+  let payload =
+    repeat_bytes(<<"Lorem ipsum dolor sit amet, consectetur. ":utf8>>, 700)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+}
+
+pub fn encode_falls_back_to_raw_for_full_byte_range_test() -> Nil {
+  // 1023 bytes that touch every byte > 127 would need an FSE-form
+  // tree description (header_byte < 128) — which the encoder does
+  // not emit yet.  Make sure the encoder gracefully falls back to
+  // Raw / RLE for such payloads instead of producing an invalid
+  // header.
+  let payload = high_byte_cycle(0, 1023, <<>>)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+}
+
+fn repeat_bytes(value: BitArray, times: Int) -> BitArray {
+  case times {
+    0 -> <<>>
+    _ -> bit_array.concat([value, repeat_bytes(value, times - 1)])
+  }
+}
+
+fn high_byte_cycle(n: Int, target: Int, acc: BitArray) -> BitArray {
+  case n >= target {
+    True -> acc
+    False -> {
+      let byte = 128 + n % 128
+      high_byte_cycle(n + 1, target, <<acc:bits, byte>>)
+    }
+  }
+}
+
 pub fn encode_uses_rle_block_for_uniform_runs_test() -> Nil {
   // 1000 identical bytes should compress to roughly 11 bytes
   // (magic + FHD + FCS + 3-byte block header + 1 RLE payload byte

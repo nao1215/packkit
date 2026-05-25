@@ -2,6 +2,115 @@
 
 ## Unreleased
 
+- **Feature (zstd)**: zstd encoder now emits a Compressed_Block
+  with Huffman-coded literals when it shrinks a chunk relative to
+  the raw / RLE alternatives.  Supports both the 1-stream form
+  (size_format = 0, ≤ 1023-byte chunks) and the 4-stream form
+  (size_format = 2, ≤ 16 KiB chunks with a 6-byte jump table over
+  the four sub-bitstreams).  Each chunk independently picks the
+  smallest of Raw / RLE / Huffman so the encoder never regresses
+  on incompressible payloads; inputs whose byte distribution
+  requires > 128 symbols gracefully fall back to Raw / RLE
+  because the FSE-form tree description for ≥ 128-symbol
+  alphabets is not implemented yet.  Compression ratios on
+  English-like text now hold steady at ~50 % across small and
+  large inputs (pangram x 100 → 58 %, lorem x 200 / 500 / 2000
+  → all ~51 %).
+- **Fix (internal/huf decoder)**: `decode_symbols_loop` was
+  structured around `use <- result.try` which compiled to JS
+  callbacks and prevented tail-call optimisation, so any single
+  Huffman stream larger than a few KiB blew the JavaScript
+  engine stack at ~10000 frames.  Inlining `decode_one_symbol`
+  and spelling out the case branches manually keeps every
+  recursive call literally in tail position so Gleam emits a
+  real `while` loop on the JS target and 16 KiB+ streams now
+  decode without exhausting the stack.
+- **Feature (internal/lzma)**: added `encode_with_lz77` — a real
+  LZ77 match finder for the LZMA1 encoder.  Uses the same 3-byte
+  Knuth-hash chain pattern as the deflate encoder, a 32 KiB
+  search window, max match length 273.  Emits LZMA matches
+  (`is_match=1, is_rep=0`) with the standard length / distance
+  scheme (3-tier length prefix + pos-slot distance + extra bits
+  + reverse-bit-tree alignment).  All three LZMA1 wrappers
+  (xz / 7z / ZIP method 14) now route through this path, so an
+  80 KiB repeating-string payload that used to encode to ~89 KiB
+  (literal-only 1.125x expansion) compresses to ~388 bytes
+  through `xz.encode`.
+- **Feature (internal/lzma)**: rep-match emission added on top of
+  the LZ77 encoder.  When the match distance equals one of the
+  last four distances (`rep0..rep3`), the encoder skips the full
+  pos-slot / direct-bits dance and uses LZMA's much cheaper rep
+  prefix (`is_rep=1` + a 1–3 bit slot selector) plus the
+  dedicated rep-length prob tables.  Each rep slot rotates into
+  `rep0` exactly the way the decoder expects so the ring stays
+  consistent across matches.  On the standard repeating-motif
+  benchmark this drops xz output from ~448 to ~388 bytes (an
+  additional ~13 % saving on top of the LZ77 baseline).
+- **Feature (xz)**: xz encoder now emits LZMA2 LZMA-compressed
+  chunks (control byte `0xE0`) instead of falling back to
+  uncompressed chunks for every payload.  Each 32 KiB sub-chunk
+  is encoded by the literal-only LZMA1 encoder, so the resulting
+  `.xz` file is a fully conforming LZMA-compressed stream that
+  any standard decoder (xz CLI, libarchive, ...) accepts.  Multi-
+  chunk payloads round-trip end-to-end through the existing
+  decoder.
+- **Fix (internal/lzma decoder)**: `loop_until` was structured
+  around `use <- result.try` which compiles to JS callbacks and
+  prevented tail-call optimisation, so any single LZMA chunk
+  larger than a few KiB blew the JavaScript engine stack at
+  ~10000 frames.  Manually spelling out the case branches keeps
+  every recursive call literally in tail position so Gleam emits
+  a real `while` loop on the JS target and 32 KiB chunks now
+  decode without exhausting the stack.
+- **Feature (lzma1)**: added a literal-only LZMA1 encoder in
+  `packkit/internal/lzma.encode_literal_only`.  The encoder mirrors
+  the existing decoder's range coder + literal-state machine
+  (LZMA SDK semantics including the deferred-carry cache trick) and
+  produces a fully valid LZMA1 byte stream that any conforming
+  decoder accepts.  No LZ77 match search yet so the compression
+  ratio is ~1.125x, but the encoder unblocks every wrapper format
+  that needs an LZMA1 stream (ZIP method 14, 7z, future xz LZMA2).
+- **Feature (zip)**: added `zip.lzma()` Method that emits ZIP
+  method 14 (PKWARE LZMA wrapper) on the encode side.  The
+  encoder wraps the literal-only LZMA1 stream in the standard
+  4-byte SDK preamble + 5-byte property block (lc=3 / lp=0 / pb=2,
+  64 KiB dictionary) and sets general-purpose flag bit 1 so the
+  decoder relies on the central-directory uncompressed size
+  instead of an in-stream EOS marker.
+- **Feature (7z)**: `seven_z.encode` is implemented.  Builds a
+  single-folder, single-coder 7z archive with a raw LZMA1 coder
+  for the packed stream, including `PackInfo`, `UnPackInfo`,
+  optional `SubStreamsInfo` (for multi-file archives), and
+  `FilesInfo` with UTF-16 LE file names.  Multi-file archives
+  round-trip through the existing decoder.  Restricted to `File`
+  entries for now — directories / symlinks / hardlinks would need
+  `EmptyStream` and `Attribute` block emission and are rejected
+  with `ArchiveEntryRejected`.
+- **Feature (zip)**: ZIP encoder now supports methods 12 (bzip2),
+  93 (zstd), and 95 (xz) in addition to the existing store and
+  deflate methods.  Three new `Method` constructors —
+  `zip.bzip2()`, `zip.zstd()`, `zip.xz()` — dispatch to the
+  matching packkit codec on encode; the decoder side already
+  handled these methods, so archives now round-trip in both
+  directions through `zip.encode_with_method` /  `zip.decode`.
+  `version_needed` follows APPNOTE.TXT (4.6 for bzip2, 6.3 for
+  zstd / xz).
+- **Feature (zip)**: ZIP decoder now reads method 14 (PKWARE
+  LZMA wrapper).  Parses the 4-byte SDK preamble + 5-byte
+  property block (lc/lp/pb byte + 4-byte LE dictionary size),
+  hands the range-coded payload to `packkit/internal/lzma`, and
+  honours the central-directory uncompressed size as the decode
+  limit.  Read-only; encode is still future work because we do
+  not have an LZMA1 range-coder writer.
+- **Feature (xz)**: block-check field is now verified for
+  `check_type = 4` (CRC-64-XZ) and `check_type = 10` (SHA-256).
+  Previously both branches only checked that the field length
+  matched the expected size — a corrupted payload with the
+  right number of trailing bytes would pass undetected.  CRC-64
+  is implemented in `checksum.crc64_xz` using a `#(low_u32,
+  high_u32)` pair so the implementation stays exact on the
+  JavaScript target.  SHA-256 is a pure-Gleam FIPS 180-4
+  implementation in `checksum.sha256`.
 - **Fix (correctness)**: cpio decoder now also accepts the `crc`
   format (magic `070702`).  newc (`070701`) and crc share the same
   on-disk layout; only the optional 32-bit body checksum differs.

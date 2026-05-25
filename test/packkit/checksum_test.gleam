@@ -35,6 +35,55 @@ pub fn crc32_iso_3309_check_value_test() -> Nil {
   |> should.equal(0xCBF43926)
 }
 
+pub fn crc64_xz_empty_test() -> Nil {
+  // crc64_init XOR crc64_init = 0 for an empty input.  The result is
+  // a `#(low_u32, high_u32)` pair to stay exact on the JS target.
+  checksum.crc64_xz(<<>>)
+  |> should.equal(#(0, 0))
+}
+
+pub fn crc64_xz_check_value_test() -> Nil {
+  // The canonical CRC-64/XZ check value for "123456789" is
+  // 0x995DC9BBDF1939FA, split into low / high 32-bit halves.
+  checksum.crc64_xz(<<"123456789":utf8>>)
+  |> should.equal(#(0xDF1939FA, 0x995DC9BB))
+}
+
+pub fn sha256_empty_test() -> Nil {
+  // FIPS 180-4 test vector: SHA-256 of empty input is the canonical
+  // e3b0c442... digest.
+  checksum.sha256(<<>>)
+  |> should.equal(<<
+    0xE3, 0xB0, 0xC4, 0x42, 0x98, 0xFC, 0x1C, 0x14, 0x9A, 0xFB, 0xF4, 0xC8, 0x99,
+    0x6F, 0xB9, 0x24, 0x27, 0xAE, 0x41, 0xE4, 0x64, 0x9B, 0x93, 0x4C, 0xA4, 0x95,
+    0x99, 0x1B, 0x78, 0x52, 0xB8, 0x55,
+  >>)
+}
+
+pub fn sha256_abc_test() -> Nil {
+  // FIPS 180-4 Appendix B test vector for "abc".
+  checksum.sha256(<<"abc":utf8>>)
+  |> should.equal(<<
+    0xBA, 0x78, 0x16, 0xBF, 0x8F, 0x01, 0xCF, 0xEA, 0x41, 0x41, 0x40, 0xDE, 0x5D,
+    0xAE, 0x22, 0x23, 0xB0, 0x03, 0x61, 0xA3, 0x96, 0x17, 0x7A, 0x9C, 0xB4, 0x10,
+    0xFF, 0x61, 0xF2, 0x00, 0x15, 0xAD,
+  >>)
+}
+
+pub fn sha256_two_block_test() -> Nil {
+  // The classic 56-byte input that forces an extra padding block
+  // ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq").
+  let input = <<
+    "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq":utf8,
+  >>
+  checksum.sha256(input)
+  |> should.equal(<<
+    0x24, 0x8D, 0x6A, 0x61, 0xD2, 0x06, 0x38, 0xB8, 0xE5, 0xC0, 0x26, 0x93, 0x0C,
+    0x3E, 0x60, 0x39, 0xA3, 0x3C, 0xE4, 0x59, 0x64, 0xFF, 0x21, 0x67, 0xF6, 0xEC,
+    0xED, 0xD4, 0x19, 0xDB, 0x06, 0xC1,
+  >>)
+}
+
 pub fn crc32_continue_matches_single_pass_test() -> Nil {
   let full = <<"The quick brown fox jumps over the lazy dog":utf8>>
   let prefix = <<"The quick brown fox ":utf8>>

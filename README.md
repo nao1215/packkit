@@ -19,8 +19,12 @@ recipes just because they may compress their members internally.
 
 Implemented codecs and archive families:
 
-- **checksum**: Adler-32, CRC-32 (reflected), CRC-32C (Castagnoli),
-  bzip2 CRC-32 (non-reflected)
+- **checksum**: Adler-32, CRC-32 (reflected), CRC-32C
+  (Castagnoli), bzip2 CRC-32 (non-reflected), CRC-64 (xz / ECMA
+  reflected, returned as a `#(low_u32, high_u32)` pair for
+  cross-target precision), and SHA-256 (FIPS 180-4); the latter
+  two back the xz block-check field for `check_type = 4` and
+  `check_type = 10` respectively
 - **tar**: USTAR encode/decode (regular files, directories, symlinks,
   hardlinks, prefix/name split)
 - **cpio**: newc encode/decode
@@ -32,11 +36,26 @@ Implemented codecs and archive families:
   plus Zip64 extensions (EOCD locator/record + per-entry header_id
   0x0001 extra field) so archives with > 65535 entries, > 4 GiB
   central directories, or > 4 GiB entries / offsets round-trip
-  through any conforming Zip64 reader.  The decoder additionally
-  reads methods 12 (bzip2), 93 (zstd), and 95 (xz) by dispatching
-  to the corresponding packkit codec
+  through any conforming Zip64 reader.  Methods 12 (bzip2), 93
+  (zstd), and 95 (xz) round-trip in both directions: the encoder
+  exposes `zip.bzip2()` / `zip.zstd()` / `zip.xz()` `Method`
+  constructors that dispatch to the matching packkit codec, and
+  the decoder reads the same methods back.  Method 14 (PKWARE
+  LZMA wrapper around a raw LZMA1 stream) round-trips in both
+  directions: the encoder is exposed as `zip.lzma()` and emits a
+  literal-only LZMA1 stream (`packkit/internal/lzma.encode_literal_only`)
+  with general-purpose flag bit 1 set so the decoder uses the
+  central-directory uncompressed size instead of looking for an
+  in-stream EOS marker.  The decoder side reads the 4-byte SDK
+  preamble + 5-byte property block and hands the range-coded
+  payload to the internal LZMA decoder
 - **7z**: single-folder LZMA / LZMA2 reader (covers the common
-  `7z a` single-file case)
+  `7z a` single-file case).  The encoder builds a single-folder,
+  single-coder archive with a raw LZMA1 coder, emitting the
+  `PackInfo` / `UnPackInfo` / optional `SubStreamsInfo` blocks
+  plus the `FilesInfo` UTF-16 LE name table.  Multi-file archives
+  round-trip; non-`File` entries are rejected because the encoder
+  does not emit `EmptyStream` / `Attribute` blocks yet
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
   LZ77 encoder (3-byte hash chain, 32 KiB window) with fixed-Huffman
   (`deflate.encode`) and dynamic-Huffman (`deflate.encode_dynamic`)
@@ -67,7 +86,14 @@ Implemented codecs and archive families:
   with 4-byte-aligned stream padding decode end-to-end.  Multi-filter
   chains terminating in LZMA2 are honoured with delta + the full
   BCJ pre-processor family (x86, PowerPC, IA-64, ARM, ARM-Thumb,
-  SPARC, ARM64, RISC-V) inverted in reverse chain order
+  SPARC, ARM64, RISC-V) inverted in reverse chain order.  All four
+  RFC-defined block-check types are honoured: None (`0`), CRC-32
+  (`1`), CRC-64 (`4`), and SHA-256 (`10`); the latter three
+  verify the digest against the decoded payload rather than just
+  asserting field length.  The encoder splits the payload across
+  32 KiB LZMA2 LZMA chunks (control byte `0xE0`) and runs each
+  through the literal-only LZMA1 encoder so the output is a fully
+  conforming `.xz` file
 - **zstd**: frame envelope + raw + RLE + FSE-compressed blocks
   with Raw / RLE literals, **Huffman-compressed literals** (both
   direct-weight and FSE-weight tree descriptions; both 1-stream
@@ -93,10 +119,21 @@ verifies the RFC 1950 check bits, bzip2 requires the block-size
 digit, ...).
 
 Still pending: brotli LZ77/Huffman compression in the encoder,
-and zstd / xz / 7z encoders that do full LZ-based compression.
-The zstd encoder currently picks the cheapest of Raw_Block and
-RLE_Block per chunk, which already shrinks uniform runs but
-does no LZ77 or Huffman compression yet.
+and a zstd encoder that also does LZ77 sequence emission.
+The zstd encoder now emits a Compressed_Block with Huffman-coded
+literals on both the 1-stream form (≤ 1023-byte chunks) and the
+4-stream form (≤ 16 KiB chunks with a 6-byte jump table), holding
+~50 % compression ratio on English-like text across a wide range
+of input sizes.  Inputs whose byte distribution needs > 128
+symbols still fall back to Raw / RLE — the FSE-form tree
+description for ≥ 128-symbol alphabets is future work.  The xz / 7z / ZIP
+method 14 encoders now share a real LZ77 LZMA1 encoder
+(`packkit/internal/lzma.encode_with_lz77`, 3-byte hash chain
+with a 32 KiB window plus LZMA rep-match emission when the
+match distance hits the `rep0..rep3` ring) which delivers real
+compression on repetitive payloads — e.g. an 80 KiB
+repeating-string xz file shrinks to ~388 bytes (0.49 % ratio),
+9 KiB of repeated pangrams to 148 bytes (1.6 %).
 
 ## Install
 

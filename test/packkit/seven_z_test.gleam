@@ -12,9 +12,69 @@ pub fn format_marker_test() -> Nil {
   |> should.equal("7z")
 }
 
-pub fn encode_reports_not_implemented_test() -> Nil {
-  seven_z.encode(archive: seven_z.new())
-  |> should.equal(Error(error.ArchiveNotImplemented(feature: "seven_z.encode")))
+pub fn encode_rejects_empty_archive_test() -> Nil {
+  // 7z requires MainStreamsInfo to be present once the Header NID
+  // exists; emitting it for a 0-entry archive would produce a header
+  // the standard decoder rejects, so the encoder refuses up front.
+  case seven_z.encode(archive: seven_z.new()) {
+    Error(error.ArchiveEntryRejected(path: "<archive>", reason: _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn encode_rejects_non_file_entries_test() -> Nil {
+  let assert Ok(dir_entry) = entry.directory_checked(path: "docs")
+  let archive_value = archive.add(seven_z.new(), entry: dir_entry)
+  case seven_z.encode(archive: archive_value) {
+    Error(error.ArchiveEntryRejected(path: "docs", reason: _)) -> Nil
+    _ -> should.fail()
+  }
+}
+
+pub fn encode_single_file_roundtrips_test() -> Nil {
+  let payload = <<"hello from packkit 7z encoder":utf8>>
+  let assert Ok(file_entry) =
+    entry.file_checked(path: "hello.txt", body: payload)
+  let archive_value = archive.add(seven_z.new(), entry: file_entry)
+  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
+  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
+  let entries = archive.entries(decoded)
+  case entries {
+    [single] -> {
+      entry.path(single) |> entry.to_string |> should.equal("hello.txt")
+      entry.body(single) |> should.equal(payload)
+    }
+    _ -> should.fail()
+  }
+}
+
+pub fn encode_multi_file_roundtrips_test() -> Nil {
+  let body_a = <<"first file body":utf8>>
+  let body_b = <<"second file body, slightly longer":utf8>>
+  let body_c = <<"third file":utf8>>
+  let assert Ok(a) = entry.file_checked(path: "a.txt", body: body_a)
+  let assert Ok(b) = entry.file_checked(path: "b.txt", body: body_b)
+  let assert Ok(c) = entry.file_checked(path: "c.txt", body: body_c)
+  let archive_value =
+    seven_z.new()
+    |> archive.add(entry: a)
+    |> archive.add(entry: b)
+    |> archive.add(entry: c)
+  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
+  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
+  let entries = archive.entries(decoded)
+  list.length(entries) |> should.equal(3)
+  case entries {
+    [restored_a, restored_b, restored_c] -> {
+      entry.path(restored_a) |> entry.to_string |> should.equal("a.txt")
+      entry.body(restored_a) |> should.equal(body_a)
+      entry.path(restored_b) |> entry.to_string |> should.equal("b.txt")
+      entry.body(restored_b) |> should.equal(body_b)
+      entry.path(restored_c) |> entry.to_string |> should.equal("c.txt")
+      entry.body(restored_c) |> should.equal(body_c)
+    }
+    _ -> should.fail()
+  }
 }
 
 pub fn decode_single_uncompressed_file_test() -> Nil {

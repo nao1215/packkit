@@ -17,7 +17,9 @@ import gleam/bool
 import gleam/int
 import gleam/list
 import gleam/result
+import gleam/string
 import packkit/archive as archives
+import packkit/checksum
 import packkit/entry
 import packkit/error
 import packkit/internal/lzma
@@ -94,11 +96,288 @@ pub fn new() -> archives.Archive {
   archives.new(format: format())
 }
 
-/// Encode a logical archive to a 7z byte stream.  Not yet implemented.
+/// Encode a logical archive to a 7z byte stream.
+///
+/// The encoder produces a single-folder, single-coder archive that
+/// uses a raw LZMA1 coder for the packed stream.  All file bodies are
+/// concatenated into one logical substream which is then fed to
+/// `packkit/internal/lzma.encode_literal_only`; if the archive holds
+/// more than one entry, the per-substream sizes are emitted via
+/// `SubStreamsInfo` so the standard decoder can split the decompressed
+/// bytes back into individual entries.
+///
+/// Restrictions: only `File` entries are accepted (no directories,
+/// symlinks, or hardlinks — these would require the `EmptyStream` /
+/// `Attribute` / `WinAttributes` blocks the reader does not yet
+/// validate).  Empty archives are rejected because the 7z format
+/// requires `MainStreamsInfo` to be present once a `Header` block
+/// exists.
 pub fn encode(
-  archive _archive_value: archives.Archive,
+  archive archive_value: archives.Archive,
 ) -> Result(BitArray, error.ArchiveError) {
-  Error(error.ArchiveNotImplemented(feature: "seven_z.encode"))
+  let entries = archives.entries(archive_value)
+  case entries {
+    [] ->
+      Error(error.ArchiveEntryRejected(
+        path: "<archive>",
+        reason: "7z encoder requires at least one entry",
+      ))
+    _ -> encode_entries(entries)
+  }
+}
+
+fn encode_entries(
+  entries: List(entry.Entry),
+) -> Result(BitArray, error.ArchiveError) {
+  use _ <- result.try(validate_entries_for_encode(entries))
+
+  let bodies = list.map(entries, entry.body)
+  let names = list.map(entries, fn(e) { entry.to_string(entry.path(e)) })
+  let unpack_sizes = list.map(bodies, bit_array.byte_size)
+  let total_unpack = sum_list(unpack_sizes, 0)
+  let concatenated = bit_array.concat(bodies)
+
+  // LZMA1 properties + dictionary size that mirror the standard 7z
+  // archive defaults (`lc=3 / lp=0 / pb=2`, 64 KiB dictionary).
+  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
+  let compressed = lzma.encode_with_lz77(bytes: concatenated, props: props)
+  let pack_size = bit_array.byte_size(compressed)
+
+  // -- PackInfo ----------------------------------------------------
+  let pack_info_body =
+    bit_array.concat([
+      write_varint(0),
+      write_varint(1),
+      <<nid_size>>,
+      write_varint(pack_size),
+      <<nid_end>>,
+    ])
+  let pack_info = <<nid_pack_info, pack_info_body:bits>>
+
+  // -- CodersInfo / UnPackInfo -------------------------------------
+  let prop_byte = lzma.properties_to_byte(props)
+  let dict_size_bytes = <<0x10000:little-size(32)>>
+  let coder_attrs = <<prop_byte, dict_size_bytes:bits>>
+  let folder_def =
+    bit_array.concat([
+      // num_folders = 1, external = inline.
+      write_varint(1),
+      <<0x00>>,
+      // num_coders = 1.
+      write_varint(1),
+      // Coder flags: id_size=3, simple, has_attrs.
+      <<0x23>>,
+      <<lzma_coder_id_high, lzma_coder_id_mid, lzma_coder_id_low>>,
+      write_varint(5),
+      coder_attrs,
+    ])
+  let unpack_info_body =
+    bit_array.concat([
+      <<nid_folder>>,
+      folder_def,
+      <<nid_coders_unpack_size>>,
+      write_varint(total_unpack),
+      <<nid_end>>,
+    ])
+  let unpack_info = <<nid_unpack_info, unpack_info_body:bits>>
+
+  // -- SubStreamsInfo (only when more than one file) ---------------
+  let sub_streams_info = case entries {
+    [_] -> <<>>
+    _ -> build_sub_streams_info(unpack_sizes)
+  }
+
+  // -- MainStreamsInfo ---------------------------------------------
+  let main_streams =
+    bit_array.concat([
+      <<nid_main_streams_info>>,
+      pack_info,
+      unpack_info,
+      sub_streams_info,
+      <<nid_end>>,
+    ])
+
+  // -- FilesInfo ---------------------------------------------------
+  use names_block <- result.try(encode_names_block(names))
+  let num_files = list.length(entries)
+  let files_info =
+    bit_array.concat([
+      <<nid_files_info>>,
+      write_varint(num_files),
+      <<nid_name>>,
+      write_varint(bit_array.byte_size(names_block)),
+      names_block,
+      <<nid_end>>,
+    ])
+
+  // -- Header block ------------------------------------------------
+  let next_header =
+    bit_array.concat([
+      <<nid_header>>,
+      main_streams,
+      files_info,
+      <<nid_end>>,
+    ])
+
+  let next_header_size = bit_array.byte_size(next_header)
+  let next_header_crc = checksum.crc32(next_header)
+  let next_header_offset = pack_size
+
+  // -- Signature header --------------------------------------------
+  let post_signature_20 = <<
+    next_header_offset:little-size(64),
+    next_header_size:little-size(64),
+    next_header_crc:little-size(32),
+  >>
+  let start_crc = checksum.crc32(post_signature_20)
+  let signature_header =
+    bit_array.concat([
+      <<0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C>>,
+      <<0x00, 0x04>>,
+      <<start_crc:little-size(32)>>,
+      post_signature_20,
+    ])
+
+  Ok(bit_array.concat([signature_header, compressed, next_header]))
+}
+
+fn validate_entries_for_encode(
+  entries: List(entry.Entry),
+) -> Result(Nil, error.ArchiveError) {
+  case entries {
+    [] -> Ok(Nil)
+    [head, ..rest] ->
+      case entry.kind(head) {
+        entry.File -> validate_entries_for_encode(rest)
+        _ ->
+          Error(error.ArchiveEntryRejected(
+            path: entry.to_string(entry.path(head)),
+            reason: "7z encoder currently supports File entries only",
+          ))
+      }
+  }
+}
+
+fn build_sub_streams_info(unpack_sizes: List(Int)) -> BitArray {
+  // 7z encodes the first N-1 substream sizes explicitly; the final
+  // size is implied (folder_total - sum_of_explicit).  Skip the last
+  // entry when emitting.
+  let explicit_sizes = drop_last(unpack_sizes, [])
+  let size_block =
+    list.fold(explicit_sizes, <<>>, fn(acc, n) {
+      bit_array.concat([acc, write_varint(n)])
+    })
+  let num_files = list.length(unpack_sizes)
+  bit_array.concat([
+    <<nid_sub_streams_info>>,
+    // kNumUnPackStream
+    <<0x0D>>,
+    write_varint(num_files),
+    <<nid_size>>,
+    size_block,
+    <<nid_end>>,
+  ])
+}
+
+fn drop_last(values: List(a), acc: List(a)) -> List(a) {
+  case values {
+    [] -> list.reverse(acc)
+    [_] -> list.reverse(acc)
+    [head, ..rest] -> drop_last(rest, [head, ..acc])
+  }
+}
+
+fn encode_names_block(
+  names: List(String),
+) -> Result(BitArray, error.ArchiveError) {
+  // External-flag byte (0 = inline) followed by NUL-terminated
+  // UTF-16 LE strings, one per file.
+  use bodies <- result.try(encode_names_loop(names, <<>>))
+  Ok(<<0x00, bodies:bits>>)
+}
+
+fn encode_names_loop(
+  names: List(String),
+  acc: BitArray,
+) -> Result(BitArray, error.ArchiveError) {
+  case names {
+    [] -> Ok(acc)
+    [name, ..rest] -> {
+      use encoded <- result.try(encode_utf16_le_name(name))
+      encode_names_loop(rest, bit_array.concat([acc, encoded]))
+    }
+  }
+}
+
+fn encode_utf16_le_name(name: String) -> Result(BitArray, error.ArchiveError) {
+  let codepoints = string.to_utf_codepoints(name)
+  use body <- result.try(encode_utf16_le_codepoints(codepoints, <<>>, name))
+  // NUL terminator (two zero bytes for UTF-16 LE).
+  Ok(<<body:bits, 0, 0>>)
+}
+
+fn encode_utf16_le_codepoints(
+  codepoints: List(UtfCodepoint),
+  acc: BitArray,
+  full_name: String,
+) -> Result(BitArray, error.ArchiveError) {
+  case codepoints {
+    [] -> Ok(acc)
+    [cp, ..rest] -> {
+      let value = string.utf_codepoint_to_int(cp)
+      case value < 0x10000 {
+        True -> {
+          let low = int.bitwise_and(value, 0xFF)
+          let high = int.bitwise_shift_right(value, 8)
+          encode_utf16_le_codepoints(rest, <<acc:bits, low, high>>, full_name)
+        }
+        False ->
+          Error(error.ArchiveEntryRejected(
+            path: full_name,
+            reason: "7z encoder requires BMP-only file names (no UTF-16 surrogate pairs yet)",
+          ))
+      }
+    }
+  }
+}
+
+/// 7z-style 1..5 byte varint.  The first byte's leading 1-bits encode
+/// the total length; the trailing bytes carry the lower bytes of the
+/// value little-endian.  Cap is 2^35 - 1 which comfortably covers
+/// every size field the encoder will produce in practice.
+fn write_varint(value: Int) -> BitArray {
+  let #(num_bytes, header_top) = case value {
+    n if n < 0x80 -> #(1, 0x00)
+    n if n < 0x4000 -> #(2, 0x80)
+    n if n < 0x200000 -> #(3, 0xC0)
+    n if n < 0x10000000 -> #(4, 0xE0)
+    _ -> #(5, 0xF0)
+  }
+  let trailers = num_bytes - 1
+  let divisor = int_pow(256, trailers)
+  let high_value = value / divisor
+  let low_value = value - high_value * divisor
+  let first_byte = int.bitwise_or(header_top, high_value)
+  let trailer_bytes = encode_le_bytes(low_value, trailers, <<>>)
+  <<first_byte, trailer_bytes:bits>>
+}
+
+fn encode_le_bytes(value: Int, count: Int, acc: BitArray) -> BitArray {
+  case count {
+    0 -> acc
+    _ -> {
+      let byte = value - { value / 256 } * 256
+      let shifted = value / 256
+      encode_le_bytes(shifted, count - 1, <<acc:bits, byte>>)
+    }
+  }
+}
+
+fn int_pow(base: Int, exp: Int) -> Int {
+  case exp {
+    0 -> 1
+    _ -> base * int_pow(base, exp - 1)
+  }
 }
 
 /// Decode a 7z byte stream using the default limits.

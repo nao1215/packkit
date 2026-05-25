@@ -41,6 +41,7 @@ import packkit/codec as codecs
 import packkit/deflate
 import packkit/entry
 import packkit/error
+import packkit/internal/lzma
 import packkit/level
 import packkit/limit
 import packkit/xz
@@ -64,10 +65,11 @@ const method_deflate: Int = 8
 
 const method_bzip2: Int = 12
 
-// ZIP method 14 (LZMA) would use the PKWARE LZMA stream wrapper —
-// not the same as standalone `.lzma` or `.xz` — and we don't
-// have a raw-LZMA1 decoder yet, so it intentionally falls into
-// the generic "ZIP method N" not-implemented path.
+// ZIP method 14 is the PKWARE LZMA wrapper around a raw LZMA1
+// stream (NOT the same as standalone `.lzma` or `.xz`).  The wrapper
+// adds a 4-byte preamble (SDK version + properties length) before
+// the 5-byte LZMA1 property block and the range-coded payload.
+const method_lzma: Int = 14
 
 const method_zstd: Int = 93
 
@@ -77,6 +79,7 @@ fn is_supported_method(method: Int) -> Bool {
   method == method_store
   || method == method_deflate
   || method == method_bzip2
+  || method == method_lzma
   || method == method_zstd
   || method == method_xz
 }
@@ -88,6 +91,12 @@ const version_needed_zip64: Int = 45
 const version_made_by_unix: Int = 0x0314
 
 const version_needed_store: Int = 10
+
+const version_needed_deflate: Int = 20
+
+const version_needed_bzip2: Int = 46
+
+const version_needed_lzma_family: Int = 63
 
 const external_attr_dir: Int = 0x4000_0000
 
@@ -125,6 +134,33 @@ pub fn deflate(level level: level.Level) -> Method {
   )
 }
 
+/// Bzip2-compressed ZIP member method (PKZIP method 12).
+pub fn bzip2() -> Method {
+  Method(name: "bzip2", inner_codec: Some(codecs.bzip2()))
+}
+
+/// Zstd-compressed ZIP member method (PKZIP method 93).
+pub fn zstd() -> Method {
+  Method(name: "zstd", inner_codec: Some(codecs.zstd()))
+}
+
+/// xz-compressed ZIP member method (PKZIP method 95).
+pub fn xz() -> Method {
+  Method(name: "xz", inner_codec: Some(codecs.xz()))
+}
+
+/// PKWARE LZMA ZIP member method (PKZIP method 14).  Wraps a raw
+/// LZMA1 range-coded stream in the 4-byte SDK preamble + 5-byte
+/// property block (`lc=3 / lp=0 / pb=2`, dict size 64 KiB).  The
+/// encoder emits the stream with general-purpose flag bit 1 set so
+/// the decoder relies on the central-directory uncompressed size
+/// instead of an in-stream EOS marker.
+pub fn lzma() -> Method {
+  // No public packkit codec for LZMA1 yet — keep inner_codec as None
+  // so the accessor stays accurate.
+  Method(name: "lzma", inner_codec: None)
+}
+
 /// Stable method name.
 pub fn name(method: Method) -> String {
   method.name
@@ -144,7 +180,8 @@ pub fn encode(
 }
 
 /// Encode a logical archive into a ZIP byte stream using a chosen
-/// per-entry method.  Currently `store` and `deflate` are supported.
+/// per-entry method.  Supports `store`, `deflate`, `bzip2`, `zstd`,
+/// and `xz`.
 pub fn encode_with_method(
   archive archive_value: archives.Archive,
   method method: Method,
@@ -482,6 +519,19 @@ fn encode_entry(
       deflate_with_level(raw_body, entry_method.inner_codec)
       |> result.map(fn(b) { #(method_deflate, b) })
       |> result.map_error(codec_to_archive_error(_, canonical_path))
+    "bzip2" ->
+      bzip2.encode(bytes: raw_body)
+      |> result.map(fn(b) { #(method_bzip2, b) })
+      |> result.map_error(codec_to_archive_error(_, canonical_path))
+    "lzma" -> Ok(#(method_lzma, encode_pkware_lzma(raw_body)))
+    "zstd" ->
+      zstd.encode(bytes: raw_body)
+      |> result.map(fn(b) { #(method_zstd, b) })
+      |> result.map_error(codec_to_archive_error(_, canonical_path))
+    "xz" ->
+      xz.encode(bytes: raw_body)
+      |> result.map(fn(b) { #(method_xz, b) })
+      |> result.map_error(codec_to_archive_error(_, canonical_path))
     other -> Error(error.ArchiveNotImplemented(feature: "ZIP method " <> other))
   })
 
@@ -554,15 +604,29 @@ fn encode_entry(
     method_code
   {
     True, _ -> version_needed_zip64
-    False, m if m == method_deflate -> 20
+    False, m if m == method_deflate -> version_needed_deflate
+    False, m if m == method_bzip2 -> version_needed_bzip2
+    False, m if m == method_lzma -> version_needed_lzma_family
+    False, m if m == method_zstd -> version_needed_lzma_family
+    False, m if m == method_xz -> version_needed_lzma_family
     False, _ -> version_needed_store
+  }
+
+  // PKZIP general purpose flag bit 1 means "the LZMA stream omits the
+  // EOS marker and the decoder must rely on the central-directory
+  // uncompressed size to know when to stop."  Our LZMA encoder is
+  // literal-only and never emits an EOS marker so we always set the
+  // bit when the method is LZMA.
+  let gp_flag = case method_code {
+    m if m == method_lzma -> 0x02
+    _ -> 0
   }
 
   let local_header =
     bit_array.concat([
       le32(local_file_signature),
       le16(version_needed),
-      le16(0),
+      le16(gp_flag),
       le16(method_code),
       le16(default_mtime_dos),
       le16(default_mdate_dos),
@@ -583,7 +647,7 @@ fn encode_entry(
       le32(central_directory_signature),
       le16(version_made_by_unix),
       le16(version_needed),
-      le16(0),
+      le16(gp_flag),
       le16(method_code),
       le16(default_mtime_dos),
       le16(default_mdate_dos),
@@ -1026,6 +1090,11 @@ fn read_local_entry(
       bzip2.decode_with_limits(bytes: compressed, limits: limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
+    m if m == method_lzma -> {
+      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      decode_pkware_lzma(compressed, uncomp_size, limits)
+      |> result.map_error(codec_to_archive_error(_, name))
+    }
     m if m == method_zstd -> {
       use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
       zstd.decode_with_limits(bytes: compressed, limits: limits)
@@ -1071,6 +1140,125 @@ fn read_local_entry(
         }
       })
   }
+}
+
+/// Decode a ZIP method 14 PKWARE LZMA payload to its plain bytes.
+///
+/// PKZIP APPNOTE.TXT §5.8 lays the wrapper out as:
+///   +0  1 byte    LZMA SDK major version
+///   +1  1 byte    LZMA SDK minor version
+///   +2  2 bytes   Size of the LZMA property block (LE, normally 5)
+///   +4  N bytes   LZMA1 property block (1 properties byte + 4 little-
+///                 endian dictionary-size bytes when N == 5)
+///   +4+N         Raw LZMA1 range-coded payload (the byte stream
+///                 expected by `packkit/internal/lzma.new`)
+///
+/// We forward the property byte to `lzma.properties_of_byte`, the
+/// remaining range-coded bytes to `lzma.new`, and ask the decoder
+/// for exactly the central-directory uncompressed size — the EOS
+/// marker (when present in payload-bit-1 = 0 streams) terminates
+/// inside the range coder and the size-limited loop covers the
+/// payload-bit-1 = 1 case.  The dictionary-size field is informational
+/// for the wrapper; the LZMA decoder allocates its window lazily.
+fn decode_pkware_lzma(
+  compressed: BitArray,
+  uncomp_size: Int,
+  limits: limit.Limits,
+) -> Result(BitArray, error.CodecError) {
+  use #(prop_size, prop_block, payload) <- result.try(parse_pkware_lzma_header(
+    compressed,
+  ))
+  use <- bool.guard(
+    when: prop_size != 5,
+    return: Error(error.CodecInvalidData(
+      message: "PKWARE LZMA wrapper property size must be 5",
+    )),
+  )
+  use props <- result.try(parse_pkware_lzma_props(prop_block))
+  use <- bool.guard(
+    when: uncomp_size > limit.max_output_bytes(limits),
+    return: Error(error.CodecLimitExceeded(
+      limit: "max_output_bytes",
+      actual: uncomp_size,
+    )),
+  )
+  use decoder <- result.try(lzma.new(
+    payload,
+    props,
+    limit.max_output_bytes(limits),
+  ))
+  use #(decoded, _state) <- result.try(lzma.decode_into(decoder, uncomp_size))
+  Ok(decoded)
+}
+
+fn parse_pkware_lzma_header(
+  compressed: BitArray,
+) -> Result(#(Int, BitArray, BitArray), error.CodecError) {
+  case compressed {
+    <<_major, _minor, prop_size:little-unsigned-size(16), rest:bytes>> -> {
+      let rest_size = bit_array.byte_size(rest)
+      use <- bool.guard(
+        when: rest_size < prop_size,
+        return: Error(error.CodecInvalidData(
+          message: "PKWARE LZMA wrapper truncated property block",
+        )),
+      )
+      let prop_slice = bit_array.slice(rest, 0, prop_size)
+      let payload_slice =
+        bit_array.slice(rest, prop_size, rest_size - prop_size)
+      case prop_slice, payload_slice {
+        Ok(prop_block), Ok(payload) -> Ok(#(prop_size, prop_block, payload))
+        _, _ ->
+          Error(error.CodecInvalidData(
+            message: "PKWARE LZMA wrapper slice out of range",
+          ))
+      }
+    }
+    _ ->
+      Error(error.CodecInvalidData(
+        message: "PKWARE LZMA wrapper missing header",
+      ))
+  }
+}
+
+fn parse_pkware_lzma_props(
+  prop_block: BitArray,
+) -> Result(lzma.Properties, error.CodecError) {
+  case prop_block {
+    <<prop_byte, _dict_size:little-unsigned-size(32)>> ->
+      lzma.properties_of_byte(prop_byte)
+    _ ->
+      Error(error.CodecInvalidData(
+        message: "PKWARE LZMA wrapper property block has wrong length",
+      ))
+  }
+}
+
+/// Build a PKWARE method-14 payload by gluing the 4-byte SDK preamble
+/// + 5-byte property block in front of an LZMA1 raw range-coded
+/// stream produced by `packkit/internal/lzma.encode_literal_only`.
+/// The general-purpose flag bit 1 (set in the entry's local + central
+/// headers) tells the reader to use the uncompressed size from the
+/// central directory instead of looking for an in-stream EOS marker —
+/// which our literal-only encoder never emits.
+fn encode_pkware_lzma(plain: BitArray) -> BitArray {
+  // Standard LZMA defaults (matching what `xz`/`7z` ship for new
+  // archives): lc=3, lp=0, pb=2.  Dictionary size is 64 KiB; the
+  // encoder does not allocate a dictionary in literal-only mode but
+  // the value is part of the wrapper for downstream tools.
+  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
+  let stream = lzma.encode_with_lz77(bytes: plain, props: props)
+  let prop_byte = lzma.properties_to_byte(props)
+  let dict_size_bytes = <<0x10000:little-size(32)>>
+  let preamble = <<
+    // SDK version (major.minor); 20.0 (decimal) = 0x14 0x00 mirrors
+    // what `xz`/`7z` emit and what the corresponding decode test
+    // fixture carries.
+    0x14, 0x00,
+    // Property block size, always 5 for canonical LZMA1.
+    0x05, 0x00,
+  >>
+  bit_array.concat([preamble, <<prop_byte>>, dict_size_bytes, stream])
 }
 
 fn strip_trailing_slash(value: String) -> String {

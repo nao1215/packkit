@@ -26,6 +26,7 @@ import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/result
 import packkit/codec as codecs
 import packkit/error
@@ -40,7 +41,30 @@ pub fn codec() -> codecs.Codec {
   codecs.zstd()
 }
 
-const max_block_size: Int = 0x20_000
+// Upper bound for any single block this encoder emits.  16 KiB - 1
+// is the largest `regenerated_size` and `compressed_size` the
+// size_format = 2 literals header (4 streams, 14-bit fields) can
+// carry, and keeping all chunks under that one cap lets every block
+// pick its own representation independently — Raw, RLE, 1-stream
+// Huffman (small chunks), or 4-stream Huffman (larger chunks).
+const max_block_chunk: Int = 16_383
+
+// Single-stream Huffman literals header (`size_format = 0`) caps
+// regenerated_size at 10 bits = 1023 bytes.  Above that we switch to
+// the 4-stream form (`size_format = 2`, 14-bit fields).
+const huffman_1stream_max_regen: Int = 1023
+
+const huffman_max_block_compressed: Int = 1024
+
+// 4-stream form's compressed_size limit (14 bits = 16383).  The +6
+// jump table and shared Huffman tree count toward it.
+const huffman_4stream_max_compressed: Int = 16_383
+
+const huffman_max_tree_depth: Int = 11
+
+// Skip the Huffman path for very small chunks: the ~129-byte tree
+// description never amortises below a few hundred input bytes.
+const huffman_min_input_size: Int = 64
 
 /// Encode `bytes` as a Zstandard frame.  The encoder picks the
 /// cheapest of `Raw_Block` and `RLE_Block` per chunk — a chunk that
@@ -132,8 +156,11 @@ fn emit_raw_blocks_loop(
   case remaining_size {
     0 -> acc
     n -> {
-      let chunk_size = case n > max_block_size {
-        True -> max_block_size
+      // Cap each chunk to the Huffman-eligible 1 KiB size whenever the
+      // remaining input is big enough that splitting helps; otherwise
+      // fall back to the 128 KiB raw/RLE chunk size.
+      let chunk_size = case n > max_block_chunk {
+        True -> max_block_chunk
         False -> n
       }
       let is_last = chunk_size == n
@@ -144,14 +171,7 @@ fn emit_raw_blocks_loop(
           chunk_size,
           bit_array.byte_size(remaining_bytes) - chunk_size,
         )
-      // Pick RLE when the whole chunk is one repeating byte and the
-      // run is long enough that the 1-byte RLE payload beats N raw
-      // bytes (always true for chunk_size >= 2).
-      let chunk_block = case chunk_size >= 2, peek_uniform_byte(chunk) {
-        True, Ok(byte) ->
-          bit_array.concat([block_header(chunk_size, 1, is_last), <<byte>>])
-        _, _ -> bit_array.concat([block_header(chunk_size, 0, is_last), chunk])
-      }
+      let chunk_block = pick_best_block(chunk, chunk_size, is_last)
       emit_raw_blocks_loop(
         rest,
         remaining_size - chunk_size,
@@ -159,6 +179,707 @@ fn emit_raw_blocks_loop(
       )
     }
   }
+}
+
+/// Encode one ≤ 1 KiB chunk and return whichever block representation
+/// is the smallest: Raw, RLE (when the chunk is one repeating byte),
+/// or a Compressed_Block whose Literals_Section is Huffman-coded.
+/// The Sequences_Section always carries `Number_of_Sequences = 0` so
+/// literals ARE the output — no LZ77, no sequences.  Picking the
+/// smallest of the three keeps the encoder strictly non-regressing on
+/// uncompressible payloads.
+fn pick_best_block(chunk: BitArray, chunk_size: Int, is_last: Bool) -> BitArray {
+  let raw_block =
+    bit_array.concat([
+      block_header(chunk_size, 0, is_last),
+      chunk,
+    ])
+  let raw_size = bit_array.byte_size(raw_block)
+
+  let rle_block = case chunk_size >= 2, peek_uniform_byte(chunk) {
+    True, Ok(byte) ->
+      Some(bit_array.concat([block_header(chunk_size, 1, is_last), <<byte>>]))
+    _, _ -> None
+  }
+
+  let huff_block = case
+    chunk_size >= huffman_min_input_size
+    && chunk_size <= huffman_1stream_max_regen
+  {
+    True -> try_huffman_block(chunk, chunk_size, is_last)
+    False -> None
+  }
+
+  let huff_4stream_block = case
+    chunk_size > huffman_1stream_max_regen && chunk_size >= 4
+  {
+    True -> try_huffman_block_4stream(chunk, chunk_size, is_last)
+    False -> None
+  }
+
+  let candidates = [
+    #(raw_size, raw_block),
+    ..case rle_block {
+      Some(rle) -> [#(bit_array.byte_size(rle), rle)]
+      None -> []
+    }
+  ]
+  let candidates = case huff_block {
+    Some(h) -> [#(bit_array.byte_size(h), h), ..candidates]
+    None -> candidates
+  }
+  let candidates = case huff_4stream_block {
+    Some(h) -> [#(bit_array.byte_size(h), h), ..candidates]
+    None -> candidates
+  }
+  pick_smallest_block(candidates)
+}
+
+fn pick_smallest_block(candidates: List(#(Int, BitArray))) -> BitArray {
+  case candidates {
+    [#(_, only)] -> only
+    [first, ..rest] ->
+      list.fold(rest, first, fn(acc, item) {
+        case item.0 < acc.0 {
+          True -> item
+          False -> acc
+        }
+      }).1
+    [] -> <<>>
+  }
+}
+
+/// Try to encode `chunk` as a Huffman-compressed literals block.
+/// Returns None when the chunk has fewer than two distinct bytes (a
+/// trivial RLE case), when the resulting code would exceed zstd's
+/// 11-bit tree-depth limit, or when the encoded form would not fit in
+/// the 10-bit compressed-size field of the 1-stream literals header.
+fn try_huffman_block(
+  chunk: BitArray,
+  chunk_size: Int,
+  is_last: Bool,
+) -> Option(BitArray) {
+  let freqs = count_byte_frequencies(chunk)
+  let distinct = list.length(list.filter(freqs, fn(p) { p.1 > 0 }))
+  case distinct < 2 {
+    True -> None
+    False -> {
+      case build_canonical_lengths(freqs) {
+        Error(_) -> None
+        Ok(#(lengths, max_bits)) ->
+          case max_bits > huffman_max_tree_depth {
+            True -> None
+            False -> {
+              // The direct-weight tree-description header byte is
+              // `127 + N` (N = number of streamed weights = max_symbol
+              // used).  That byte must stay within [128, 254] so the
+              // decoder picks the direct-weight branch; if N > 127
+              // the header overflows out of that range and the
+              // decoder reinterprets the body as FSE weights.  Skip
+              // Huffman in that case and let the chunk fall back to
+              // Raw / RLE.
+              let max_symbol_used = highest_nonzero_index(lengths, -1, 0)
+              case max_symbol_used > 127 {
+                True -> None
+                False -> {
+                  let code_table = assign_canonical_codes(lengths, max_bits)
+                  let tree_bytes = serialize_huffman_tree(lengths)
+                  let bitstream = encode_huffman_bitstream(chunk, code_table)
+                  let comp_size =
+                    bit_array.byte_size(tree_bytes)
+                    + bit_array.byte_size(bitstream)
+                  case comp_size >= huffman_max_block_compressed {
+                    True -> None
+                    False -> {
+                      let literals_section =
+                        build_compressed_literals_section(
+                          chunk_size,
+                          comp_size,
+                          tree_bytes,
+                          bitstream,
+                        )
+                      // Sequences_Section_Header for 0 sequences is a
+                      // single 0x00 byte; no symbol-mode byte, no FSE
+                      // descriptions, no bitstream.
+                      let block_body =
+                        bit_array.concat([literals_section, <<0x00>>])
+                      let block_body_size = bit_array.byte_size(block_body)
+                      Some(
+                        bit_array.concat([
+                          block_header(block_body_size, 2, is_last),
+                          block_body,
+                        ]),
+                      )
+                    }
+                  }
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+/// Same as `try_huffman_block`, but uses the 4-stream form (literals
+/// header `size_format = 2`, 4-byte header, 14-bit regen / compressed
+/// fields, 6-byte jump table before the four sub-bitstreams).  Lets
+/// the encoder Huffman-code blocks above the 1-stream 1023-byte cap,
+/// up to 16 383 bytes per block.  Splits the chunk into four parts
+/// using zstd's `(N+3)/4, (N+2)/4, (N+1)/4, N/4` formula and runs the
+/// existing 1-stream bitstream encoder once per part with the shared
+/// Huffman code table.
+fn try_huffman_block_4stream(
+  chunk: BitArray,
+  chunk_size: Int,
+  is_last: Bool,
+) -> Option(BitArray) {
+  let freqs = count_byte_frequencies(chunk)
+  let distinct = list.length(list.filter(freqs, fn(p) { p.1 > 0 }))
+  case distinct < 2 {
+    True -> None
+    False ->
+      case build_canonical_lengths(freqs) {
+        Error(_) -> None
+        Ok(#(lengths, max_bits)) ->
+          case max_bits > huffman_max_tree_depth {
+            True -> None
+            False -> {
+              let max_symbol_used = highest_nonzero_index(lengths, -1, 0)
+              case max_symbol_used > 127 {
+                True -> None
+                False -> {
+                  let code_table = assign_canonical_codes(lengths, max_bits)
+                  let tree_bytes = serialize_huffman_tree(lengths)
+                  let parts = split_chunk_4(chunk, chunk_size)
+                  let #(p1, p2, p3, p4) = parts
+                  let s1 = encode_huffman_bitstream(p1, code_table)
+                  let s2 = encode_huffman_bitstream(p2, code_table)
+                  let s3 = encode_huffman_bitstream(p3, code_table)
+                  let s4 = encode_huffman_bitstream(p4, code_table)
+                  let s1_size = bit_array.byte_size(s1)
+                  let s2_size = bit_array.byte_size(s2)
+                  let s3_size = bit_array.byte_size(s3)
+                  let s4_size = bit_array.byte_size(s4)
+                  // Jump table sizes must each fit in 16 bits so the
+                  // decoder can read them as little-endian u16s.
+                  case
+                    s1_size > 0xFFFF || s2_size > 0xFFFF || s3_size > 0xFFFF
+                  {
+                    True -> None
+                    False -> {
+                      let jump_table = <<
+                        s1_size:little-size(16),
+                        s2_size:little-size(16),
+                        s3_size:little-size(16),
+                      >>
+                      let comp_size =
+                        bit_array.byte_size(tree_bytes)
+                        + 6
+                        + s1_size
+                        + s2_size
+                        + s3_size
+                        + s4_size
+                      case comp_size > huffman_4stream_max_compressed {
+                        True -> None
+                        False -> {
+                          let literals_section =
+                            build_compressed_literals_section_4stream(
+                              chunk_size,
+                              comp_size,
+                              tree_bytes,
+                              jump_table,
+                              s1,
+                              s2,
+                              s3,
+                              s4,
+                            )
+                          let block_body =
+                            bit_array.concat([literals_section, <<0x00>>])
+                          let block_body_size = bit_array.byte_size(block_body)
+                          Some(
+                            bit_array.concat([
+                              block_header(block_body_size, 2, is_last),
+                              block_body,
+                            ]),
+                          )
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+      }
+  }
+}
+
+fn split_chunk_4(
+  chunk: BitArray,
+  chunk_size: Int,
+) -> #(BitArray, BitArray, BitArray, BitArray) {
+  // The zstd reference and our `decode_four_streams` decoder both use
+  // `per_stream = (N+3)/4` for EACH of the first three substreams,
+  // with stream 4 getting the remainder.  The varying RFC formulas
+  // `(N+3)/4, (N+2)/4, (N+1)/4, N/4` describe equivalent splits for
+  // N divisible by 4 but diverge otherwise — we follow the reference
+  // implementation to keep the encoder and decoder in lockstep.
+  let per_stream = { chunk_size + 3 } / 4
+  let s4_len = chunk_size - per_stream * 3
+  let assert Ok(p1) = bit_array.slice(chunk, 0, per_stream)
+  let assert Ok(p2) = bit_array.slice(chunk, per_stream, per_stream)
+  let assert Ok(p3) = bit_array.slice(chunk, per_stream * 2, per_stream)
+  let assert Ok(p4) = bit_array.slice(chunk, per_stream * 3, s4_len)
+  #(p1, p2, p3, p4)
+}
+
+/// Build the 4-stream literals section: 4-byte header (size_format = 2,
+/// 14-bit regen / 14-bit compressed) followed by the Huffman tree,
+/// the 6-byte jump table (`stream1_size`, `stream2_size`,
+/// `stream3_size` each as LE u16; stream 4's size is derived by the
+/// decoder from `total - 6 - sum`), and the four sub-bitstreams.
+fn build_compressed_literals_section_4stream(
+  regen_size: Int,
+  comp_size: Int,
+  tree_bytes: BitArray,
+  jump_table: BitArray,
+  s1: BitArray,
+  s2: BitArray,
+  s3: BitArray,
+  s4: BitArray,
+) -> BitArray {
+  // Header layout (matches `parse_compressed_literals_header`
+  // size_format = 2):
+  //   b0: bits 0-1 = block_type=2, bits 2-3 = size_format=2,
+  //       bits 4-7 = regen_size[0..3]
+  //   b1: bits 0-7 = regen_size[4..11]
+  //   b2: bits 0-1 = regen_size[12..13], bits 2-7 = comp_size[0..5]
+  //   b3: bits 0-7 = comp_size[6..13]
+  let b0 =
+    int.bitwise_and(
+      int.bitwise_or(
+        int.bitwise_or(2, int.bitwise_shift_left(2, 2)),
+        int.bitwise_shift_left(int.bitwise_and(regen_size, 0xF), 4),
+      ),
+      0xFF,
+    )
+  let b1 = int.bitwise_and(int.bitwise_shift_right(regen_size, 4), 0xFF)
+  let regen_high_2 =
+    int.bitwise_and(int.bitwise_shift_right(regen_size, 12), 0x3)
+  let comp_low_6 = int.bitwise_and(comp_size, 0x3F)
+  let b2 =
+    int.bitwise_and(
+      int.bitwise_or(regen_high_2, int.bitwise_shift_left(comp_low_6, 2)),
+      0xFF,
+    )
+  let b3 = int.bitwise_and(int.bitwise_shift_right(comp_size, 6), 0xFF)
+  bit_array.concat([<<b0, b1, b2, b3>>, tree_bytes, jump_table, s1, s2, s3, s4])
+}
+
+fn highest_nonzero_index(lengths: List(Int), best: Int, pos: Int) -> Int {
+  case lengths {
+    [] -> best
+    [head, ..rest] ->
+      case head > 0 {
+        True -> highest_nonzero_index(rest, pos, pos + 1)
+        False -> highest_nonzero_index(rest, best, pos + 1)
+      }
+  }
+}
+
+// -- Huffman literals support ------------------------------------------
+
+/// Count `chunk`'s byte frequencies as a list of `#(symbol, count)`
+/// pairs for symbols 0..255 in ascending order.  Symbols with zero
+/// occurrences are kept (they're filtered before tree building) so the
+/// caller can iterate the full 0..255 range without separate handling.
+fn count_byte_frequencies(chunk: BitArray) -> List(#(Int, Int)) {
+  let initial = empty_freq_dict(0, dict.new())
+  let table = collect_frequencies(chunk, initial)
+  count_freqs_to_list(table, 0, [])
+}
+
+fn empty_freq_dict(symbol: Int, acc: dict.Dict(Int, Int)) -> dict.Dict(Int, Int) {
+  case symbol {
+    256 -> acc
+    _ -> empty_freq_dict(symbol + 1, dict.insert(acc, symbol, 0))
+  }
+}
+
+fn collect_frequencies(
+  chunk: BitArray,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case chunk {
+    <<byte, rest:bytes>> -> {
+      let current = case dict.get(acc, byte) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      collect_frequencies(rest, dict.insert(acc, byte, current + 1))
+    }
+    _ -> acc
+  }
+}
+
+fn count_freqs_to_list(
+  table: dict.Dict(Int, Int),
+  symbol: Int,
+  acc: List(#(Int, Int)),
+) -> List(#(Int, Int)) {
+  case symbol {
+    256 -> list.reverse(acc)
+    _ -> {
+      let count = case dict.get(table, symbol) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      count_freqs_to_list(table, symbol + 1, [#(symbol, count), ..acc])
+    }
+  }
+}
+
+type HuffNode {
+  HuffLeaf(symbol: Int)
+  HuffInternal(left: HuffNode, right: HuffNode)
+}
+
+/// Build canonical Huffman code lengths for `freqs`, returning a list
+/// of 256 lengths (0 for unused symbols).  Standard Huffman tree
+/// construction via insertion-sort; bails out with `Error(Nil)` when
+/// the resulting tree exceeds the 11-bit depth limit so the caller
+/// can fall back to Raw / RLE.
+fn build_canonical_lengths(
+  freqs: List(#(Int, Int)),
+) -> Result(#(List(Int), Int), Nil) {
+  let active =
+    list.filter_map(freqs, fn(p) {
+      case p.1 > 0 {
+        True -> Ok(#(p.1, HuffLeaf(p.0)))
+        False -> Error(Nil)
+      }
+    })
+  let sorted = list.sort(active, fn(a, b) { int.compare(a.0, b.0) })
+  case sorted {
+    [] -> Error(Nil)
+    [#(_, single_node)] -> {
+      // Single distinct symbol — emit a 1-bit code so the canonical
+      // assignment has at least one bit to allocate.
+      let single = case single_node {
+        HuffLeaf(s) -> s
+        _ -> 0
+      }
+      let lengths = build_length_list(dict.insert(dict.new(), single, 1), 0, [])
+      Ok(#(lengths, 1))
+    }
+    _ -> {
+      let root = huffman_merge(sorted)
+      let lengths_dict = extract_lengths(root, 0, dict.new())
+      let max_bits = max_length_in_dict(lengths_dict)
+      let lengths = build_length_list(lengths_dict, 0, [])
+      Ok(#(lengths, max_bits))
+    }
+  }
+}
+
+fn huffman_merge(nodes: List(#(Int, HuffNode))) -> HuffNode {
+  case nodes {
+    [#(_, single)] -> single
+    [a, b, ..rest] -> {
+      let combined = #(a.0 + b.0, HuffInternal(a.1, b.1))
+      huffman_merge(insert_node_sorted(combined, rest))
+    }
+    _ -> HuffLeaf(0)
+  }
+}
+
+fn insert_node_sorted(
+  item: #(Int, HuffNode),
+  nodes: List(#(Int, HuffNode)),
+) -> List(#(Int, HuffNode)) {
+  case nodes {
+    [] -> [item]
+    [head, ..rest] ->
+      case item.0 <= head.0 {
+        True -> [item, head, ..rest]
+        False -> [head, ..insert_node_sorted(item, rest)]
+      }
+  }
+}
+
+fn extract_lengths(
+  node: HuffNode,
+  depth: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
+  case node {
+    HuffLeaf(sym) -> {
+      let d = case depth {
+        0 -> 1
+        _ -> depth
+      }
+      dict.insert(acc, sym, d)
+    }
+    HuffInternal(l, r) -> {
+      let acc = extract_lengths(l, depth + 1, acc)
+      extract_lengths(r, depth + 1, acc)
+    }
+  }
+}
+
+fn max_length_in_dict(lengths: dict.Dict(Int, Int)) -> Int {
+  dict.fold(lengths, 0, fn(acc, _key, value) {
+    case value > acc {
+      True -> value
+      False -> acc
+    }
+  })
+}
+
+fn build_length_list(
+  lengths: dict.Dict(Int, Int),
+  symbol: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case symbol {
+    256 -> list.reverse(acc)
+    _ -> {
+      let len = case dict.get(lengths, symbol) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      build_length_list(lengths, symbol + 1, [len, ..acc])
+    }
+  }
+}
+
+/// Build the encoder's `symbol → #(code_value, num_bits)` table from
+/// the canonical lengths.  zstd's lookup table is filled in order
+/// (length DESC, symbol ASC), so the encoder's code values are simply
+/// the table slot indices, right-shifted by `max_bits - num_bits` to
+/// drop the table's low-order bits (which the decoder treats as
+/// "don't care" once it has consumed `num_bits` bits).
+fn assign_canonical_codes(
+  lengths: List(Int),
+  max_bits: Int,
+) -> dict.Dict(Int, #(Int, Int)) {
+  let with_index =
+    list.index_map(lengths, fn(len, sym) { #(sym, len) })
+    |> list.filter(fn(p) { p.1 > 0 })
+  let sorted =
+    list.sort(with_index, fn(a, b) {
+      // Mirror the decoder's fill_lookup order: length DESC, symbol ASC.
+      case int.compare(b.1, a.1) {
+        order.Eq -> int.compare(a.0, b.0)
+        ord -> ord
+      }
+    })
+  assign_codes_loop(sorted, max_bits, 0, dict.new())
+}
+
+fn assign_codes_loop(
+  sorted: List(#(Int, Int)),
+  max_bits: Int,
+  slot: Int,
+  acc: dict.Dict(Int, #(Int, Int)),
+) -> dict.Dict(Int, #(Int, Int)) {
+  case sorted {
+    [] -> acc
+    [#(sym, len), ..rest] -> {
+      let span = int.bitwise_shift_left(1, max_bits - len)
+      let code = int.bitwise_shift_right(slot, max_bits - len)
+      assign_codes_loop(
+        rest,
+        max_bits,
+        slot + span,
+        dict.insert(acc, sym, #(code, len)),
+      )
+    }
+  }
+}
+
+fn max_length_in_list(lengths: List(Int), acc: Int) -> Int {
+  case lengths {
+    [] -> acc
+    [head, ..rest] ->
+      case head > acc {
+        True -> max_length_in_list(rest, head)
+        False -> max_length_in_list(rest, acc)
+      }
+  }
+}
+
+fn trim_trailing_zero_weights(reversed: List(Int), acc: List(Int)) -> List(Int) {
+  case reversed, acc {
+    [], _ -> acc
+    [0, ..rest], [] -> trim_trailing_zero_weights(rest, [])
+    [head, ..rest], _ -> trim_trailing_zero_weights(rest, [head, ..acc])
+  }
+}
+
+fn drop_last_weight(weights: List(Int), acc: List(Int)) -> List(Int) {
+  case weights {
+    [] -> list.reverse(acc)
+    [_last] -> list.reverse(acc)
+    [head, ..rest] -> drop_last_weight(rest, [head, ..acc])
+  }
+}
+
+fn pack_weights_4bit(weights: List(Int), acc: BitArray) -> BitArray {
+  case weights {
+    [] -> acc
+    [single] -> {
+      // Odd weight count — pad low nibble with 0.
+      let byte = int.bitwise_shift_left(single, 4)
+      <<acc:bits, byte>>
+    }
+    [high, low, ..rest] -> {
+      let byte = int.bitwise_or(int.bitwise_shift_left(high, 4), low)
+      pack_weights_4bit(rest, <<acc:bits, byte>>)
+    }
+  }
+}
+
+/// Build the bitstream a zstd Huffman decoder reads from the END
+/// backward.  We iterate input in REVERSE order, push each code into a
+/// shift register from the LOW end, flush low bytes when full, and
+/// finally append a 1-bit terminator that the decoder finds via
+/// "highest set bit of the last byte".
+fn encode_huffman_bitstream(
+  chunk: BitArray,
+  codes: dict.Dict(Int, #(Int, Int)),
+) -> BitArray {
+  let bytes = bit_array_to_list_forward(chunk, [])
+  let reversed = list.reverse(bytes)
+  let #(buf, bits, out) = emit_codes_reverse(reversed, codes, 0, 0, <<>>)
+  // Append the terminator at the next position.
+  let buf2 = int.bitwise_or(buf, int.bitwise_shift_left(1, bits))
+  let bits2 = bits + 1
+  flush_final_bits(buf2, bits2, out)
+}
+
+fn bit_array_to_list_forward(bytes: BitArray, acc: List(Int)) -> List(Int) {
+  case bytes {
+    <<byte, rest:bytes>> -> bit_array_to_list_forward(rest, [byte, ..acc])
+    _ -> list.reverse(acc)
+  }
+}
+
+fn emit_codes_reverse(
+  bytes_rev: List(Int),
+  codes: dict.Dict(Int, #(Int, Int)),
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, BitArray) {
+  case bytes_rev {
+    [] -> #(buf, bits, out)
+    [byte, ..rest] -> {
+      let #(code, len) = case dict.get(codes, byte) {
+        Ok(v) -> v
+        Error(_) -> #(0, 0)
+      }
+      let new_buf = int.bitwise_or(buf, int.bitwise_shift_left(code, bits))
+      let new_bits = bits + len
+      let #(flushed_buf, flushed_bits, flushed_out) =
+        flush_full_bytes(new_buf, new_bits, out)
+      emit_codes_reverse(rest, codes, flushed_buf, flushed_bits, flushed_out)
+    }
+  }
+}
+
+fn flush_full_bytes(buf: Int, bits: Int, out: BitArray) -> #(Int, Int, BitArray) {
+  case bits >= 8 {
+    True -> {
+      let byte = int.bitwise_and(buf, 0xFF)
+      let new_buf = int.bitwise_shift_right(buf, 8)
+      flush_full_bytes(new_buf, bits - 8, <<out:bits, byte>>)
+    }
+    False -> #(buf, bits, out)
+  }
+}
+
+fn flush_final_bits(buf: Int, bits: Int, out: BitArray) -> BitArray {
+  case bits {
+    0 -> out
+    _ -> {
+      // Whatever bits remain become the LAST byte, with the
+      // terminator's `1` bit at the highest occupied position.  The
+      // unused high bits stay 0 so the decoder finds the terminator
+      // at the right spot.
+      let byte = int.bitwise_and(buf, 0xFF)
+      let new_buf = int.bitwise_shift_right(buf, 8)
+      let new_bits = case bits > 8 {
+        True -> bits - 8
+        False -> 0
+      }
+      flush_final_bits(new_buf, new_bits, <<out:bits, byte>>)
+    }
+  }
+}
+
+/// Serialize the Huffman tree in the direct-weight form: header byte
+/// `127 + num_weights` (placing it in 128..254) followed by 4-bit
+/// weights packed two-per-byte.  The last weight is implied — it's
+/// derived from the constraint that `sum(2^(weight-1)) = 2^max_bits`.
+fn serialize_huffman_tree(lengths: List(Int)) -> BitArray {
+  let max_bits = max_length_in_list(lengths, 0)
+  // weight = max_bits + 1 - length (for length > 0); 0 for unused.
+  let weights =
+    list.map(lengths, fn(l) {
+      case l {
+        0 -> 0
+        _ -> max_bits + 1 - l
+      }
+    })
+  let trimmed = trim_trailing_zero_weights(list.reverse(weights), [])
+  // Drop the last weight (it's implied by the Kraft balance check).
+  let serialized = drop_last_weight(trimmed, [])
+  let num_serialized = list.length(serialized)
+  // Header_byte = 127 + N where N = number of weights explicitly
+  // streamed; the (N+1)-th weight is implied by the Kraft balance the
+  // decoder reconstructs in `weights_with_implied_last`.
+  let header_byte = 127 + num_serialized
+  let packed = pack_weights_4bit(serialized, <<>>)
+  <<header_byte, packed:bits>>
+}
+
+/// Pack the Literals_Section_Header for the 1-stream Compressed form
+/// (`size_format = 0`): 3 bytes carrying block_type=2, size_format=0,
+/// 10-bit regenerated_size, and 10-bit compressed_size; followed by
+/// the Huffman tree description and the bitstream.
+fn build_compressed_literals_section(
+  regenerated_size: Int,
+  compressed_size: Int,
+  tree_bytes: BitArray,
+  bitstream: BitArray,
+) -> BitArray {
+  // Header layout (low bit first):
+  //   bits 0-1  : block_type = 2
+  //   bits 2-3  : size_format = 0
+  //   bits 4-13 : regenerated_size (10 bits)
+  //   bits 14-23: compressed_size (10 bits)
+  let b0 =
+    int.bitwise_and(
+      int.bitwise_or(
+        int.bitwise_or(2, 0),
+        int.bitwise_shift_left(int.bitwise_and(regenerated_size, 0xF), 4),
+      ),
+      0xFF,
+    )
+  let regen_high = int.bitwise_shift_right(regenerated_size, 4)
+  let comp_low = int.bitwise_and(compressed_size, 0x3F)
+  let b1 =
+    int.bitwise_and(
+      int.bitwise_or(
+        int.bitwise_and(regen_high, 0x3F),
+        int.bitwise_shift_left(comp_low, 6),
+      ),
+      0xFF,
+    )
+  let b2 = int.bitwise_and(int.bitwise_shift_right(compressed_size, 2), 0xFF)
+  bit_array.concat([<<b0, b1, b2>>, tree_bytes, bitstream])
 }
 
 /// Returns the single byte the whole chunk repeats, or Error if the

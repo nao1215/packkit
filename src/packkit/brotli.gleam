@@ -34,11 +34,13 @@
 ////   `packkit.compress(..., with: codec.brotli())` round-trip
 ////   end-to-end with `packkit.decompress`.
 ////
-//// What still returns a typed `CodecNotImplemented`:
-////
-//// * The `SHIFT_FIRST` / `SHIFT_ALL` transforms used by the
-////   shared-dictionary extension (the basic RFC 7932 transform set
-////   never selects them).
+//// The `SHIFT_FIRST` / `SHIFT_ALL` transforms used by the
+//// shared-dictionary extension (RFC 8478) are deliberately omitted
+//// because the basic RFC 7932 transform set never selects them and
+//// this decoder does not accept a custom shared dictionary in the
+//// first place.  Implementing them in isolation would create dead
+//// code; they will be added together with full shared-dictionary
+//// support if and when that feature lands.
 
 import gleam/bit_array
 import gleam/bool
@@ -337,8 +339,8 @@ fn decode_sized_metablock(
 //
 // Parses the full header, builds the three prefix codes, then enters
 // the command loop in `run_commands`.  Block switching (NBLTYPES > 1),
-// context maps (NTREES > 1), and static-dictionary references are
-// still surfaced as `CodecNotImplemented`.
+// context maps (NTREES > 1), and static-dictionary references with
+// the full RFC 7932 transform set are all handled here.
 
 fn decode_compressed_metablock(
   reader: Reader,

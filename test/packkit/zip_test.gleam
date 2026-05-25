@@ -145,6 +145,89 @@ pub fn encode_deflate_method_rejects_non_default_level_test() -> Nil {
   }
 }
 
+pub fn encode_bzip2_method_roundtrip_test() -> Nil {
+  // The bzip2 ZIP method (PKZIP method 12) round-trips through the
+  // standard decoder by dispatching to the packkit bzip2 codec.
+  let payload = repeat_bytes(<<"bzip2 zip body ":utf8>>, 20)
+  let original = zip.new() |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(archive: original, method: zip.bzip2())
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.body(restored) |> should.equal(payload)
+}
+
+pub fn encode_zstd_method_roundtrip_test() -> Nil {
+  // The zstd ZIP method (PKZIP method 93) round-trips through the
+  // standard decoder by dispatching to the packkit zstd codec.
+  let payload = repeat_bytes(<<"zstd zip body ":utf8>>, 20)
+  let original = zip.new() |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(archive: original, method: zip.zstd())
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.body(restored) |> should.equal(payload)
+}
+
+pub fn encode_xz_method_roundtrip_test() -> Nil {
+  // The xz ZIP method (PKZIP method 95) round-trips through the
+  // standard decoder by dispatching to the packkit xz codec.
+  let payload = repeat_bytes(<<"xz zip body ":utf8>>, 20)
+  let original = zip.new() |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(archive: original, method: zip.xz())
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.body(restored) |> should.equal(payload)
+}
+
+pub fn encode_lzma_method_roundtrip_test() -> Nil {
+  // The PKWARE LZMA ZIP method (PKZIP method 14) round-trips through
+  // the standard decoder.  The encoder wraps the literal-only LZMA1
+  // range-coded stream in the standard 4-byte SDK preamble + 5-byte
+  // property block, and sets general-purpose flag bit 1 so the
+  // decoder relies on the central-directory uncompressed size rather
+  // than an in-stream EOS marker.
+  let payload = repeat_bytes(<<"lzma zip body ":utf8>>, 20)
+  let original = zip.new() |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(archive: original, method: zip.lzma())
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.body(restored) |> should.equal(payload)
+}
+
+pub fn encode_lzma_method_short_payload_test() -> Nil {
+  // Single-byte payload exercises the range coder's bootstrap path
+  // (only one literal encoded before finish flushes the cache).
+  let payload = <<0x42>>
+  let original = zip.new() |> archive_add_file("x.bin", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(archive: original, method: zip.lzma())
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.body(restored) |> should.equal(payload)
+}
+
+pub fn encode_mixed_methods_with_directory_test() -> Nil {
+  // Directories ignore the chosen method and stay stored, so an
+  // archive with directories + files using a compressed method must
+  // still round-trip.
+  let payload = <<"compressed-body":utf8>>
+  let original =
+    zip.new()
+    |> archive_add_directory("doc")
+    |> archive_add_file("doc/notes.txt", payload)
+  let assert Ok(bytes) =
+    zip.encode_with_method(archive: original, method: zip.zstd())
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let entries = archive.entries(decoded)
+  list.map(entries, entry.kind)
+  |> should.equal([entry.Directory, entry.File])
+  let assert [_, notes] = entries
+  entry.body(notes) |> should.equal(payload)
+}
+
 pub fn archive_comment_round_trips_through_eocd_test() -> Nil {
   // The ZIP EOCD record has a comment slot; `archive.with_comment`
   // must be encoded there and restored on decode.  Previously the
@@ -250,6 +333,40 @@ pub fn decodes_xz_compressed_entry_test() -> Nil {
   let payload = <<"xz-inside-zip":utf8>>
   let assert Ok(compressed) = xz.encode(bytes: payload)
   zip_method_round_trip(method: 95, payload: payload, body: compressed)
+}
+
+pub fn decodes_pkware_lzma_method_14_entry_test() -> Nil {
+  // ZIP method 14 (PKWARE LZMA wrapper) fixture generated from
+  // Python's `lzma` module: LZMA1 raw stream wrapped in the
+  // PKWARE 4-byte preamble + 5-byte property block.  Payload is
+  // the ASCII string "PKWARE LZMA test payload inside ZIP method 14".
+  let bytes = <<
+    0x50, 0x4B, 0x03, 0x04, 0x3F, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x9D, 0x8F, 0x55, 0x7E, 0x41, 0x00, 0x00, 0x00, 0x2D, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x6C, 0x7A, 0x6D, 0x61, 0x2E, 0x74, 0x78, 0x74, 0x14,
+    0x00, 0x05, 0x00, 0x5D, 0x00, 0x00, 0x01, 0x00, 0x00, 0x28, 0x12, 0xC7, 0x33,
+    0x5C, 0x05, 0x46, 0xB2, 0x10, 0xD9, 0x37, 0xF7, 0x0E, 0xE9, 0x12, 0x77, 0xD8,
+    0x56, 0x9E, 0xDE, 0x0A, 0x3C, 0xBD, 0x15, 0x2B, 0x00, 0x88, 0xB7, 0x44, 0x8D,
+    0xC6, 0xB3, 0x6D, 0x86, 0x41, 0xF1, 0xAA, 0x48, 0xF3, 0x13, 0xBE, 0x11, 0xFD,
+    0x58, 0x2F, 0x2F, 0x55, 0x16, 0x91, 0x7F, 0x7F, 0xFB, 0x96, 0xE0, 0x00, 0x50,
+    0x4B, 0x01, 0x02, 0x14, 0x03, 0x3F, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x9D, 0x8F, 0x55, 0x7E, 0x41, 0x00, 0x00, 0x00, 0x2D, 0x00, 0x00,
+    0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6C, 0x7A, 0x6D, 0x61, 0x2E, 0x74, 0x78,
+    0x74, 0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x36, 0x00, 0x00, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00,
+  >>
+  let assert Ok(arch) = zip.decode(bytes: bytes)
+  case archive.entries(arch) {
+    [e] -> {
+      entry.to_string(entry.path(e)) |> should.equal("lzma.txt")
+      entry.body(e)
+      |> should.equal(<<
+        "PKWARE LZMA test payload inside ZIP method 14":utf8,
+      >>)
+    }
+    _ -> should.fail()
+  }
 }
 
 fn zip_method_round_trip(

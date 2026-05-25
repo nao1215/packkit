@@ -233,6 +233,17 @@ pub fn decode_stream(
   decode_symbols_loop(tree, reader, num_symbols, <<>>)
 }
 
+// The decode loop runs once per emitted symbol, so its recursive tail
+// call must compile to a real while loop on every target.  The
+// `use <- result.try` sugar would compile to JS callbacks (the
+// recursive call ends up inside the callback's body, not at the
+// function's tail position) and accumulate a stack frame per
+// iteration — JS engines blow the stack at ~10000 frames, which
+// limits any single Huffman bitstream to a few KiB on the JavaScript
+// target.  Spelling the case branches out manually keeps every
+// `decode_symbols_loop` call literally in tail position so Gleam
+// emits a while loop and we can decode 16 KiB streams without
+// exhausting the stack.
 fn decode_symbols_loop(
   tree: Tree,
   reader: fse.BackwardReader,
@@ -241,7 +252,32 @@ fn decode_symbols_loop(
 ) -> Result(BitArray, HufError) {
   case remaining {
     0 -> Ok(acc)
-    _ -> decode_one_symbol(tree, reader, remaining, acc)
+    _ ->
+      case
+        fse.read_backward_bits_padded(reader, tree.max_bits)
+        |> result.map_error(HufBitstreamError)
+      {
+        Error(e) -> Error(e)
+        Ok(#(index, _)) ->
+          case dict.get(tree.lookup, index) {
+            Error(_) ->
+              Error(HufInvalidWeights(
+                message: "huf: bitstream index out of table",
+              ))
+            Ok(#(sym, used_bits)) ->
+              case
+                fse.read_backward_bits_padded(reader, used_bits)
+                |> result.map_error(HufBitstreamError)
+              {
+                Error(e) -> Error(e)
+                Ok(#(_, reader_consumed)) ->
+                  decode_symbols_loop(tree, reader_consumed, remaining - 1, <<
+                    acc:bits,
+                    sym,
+                  >>)
+              }
+          }
+      }
   }
 }
 
@@ -669,36 +705,7 @@ fn repeat_zeros(n: Int, acc: List(Int)) -> List(Int) {
     _ -> repeat_zeros(n - 1, [0, ..acc])
   }
 }
-
 // -- end forward bit reader / FSE distribution parser -----------------
 
-fn decode_one_symbol(
-  tree: Tree,
-  reader: fse.BackwardReader,
-  remaining: Int,
-  acc: BitArray,
-) -> Result(BitArray, HufError) {
-  // Peek `max_bits` bits to index the lookup table, then re-consume
-  // only the bits that the matched code actually uses.  Per RFC 8478
-  // §4.2.1.3 the end of the Huffman bitstream is implicitly padded
-  // with zeros for the last symbol(s), so we use the padded reader
-  // for both peek and consume.
-  use #(index, _) <- result.try(
-    fse.read_backward_bits_padded(reader, tree.max_bits)
-    |> result.map_error(HufBitstreamError),
-  )
-  case dict.get(tree.lookup, index) {
-    Error(_) ->
-      Error(HufInvalidWeights(message: "huf: bitstream index out of table"))
-    Ok(#(sym, used_bits)) -> {
-      use #(_, reader_consumed) <- result.try(
-        fse.read_backward_bits_padded(reader, used_bits)
-        |> result.map_error(HufBitstreamError),
-      )
-      decode_symbols_loop(tree, reader_consumed, remaining - 1, <<
-        acc:bits,
-        sym,
-      >>)
-    }
-  }
-}
+// `decode_one_symbol` is now inlined into `decode_symbols_loop` above
+// so the recursive tail call stays TCO-eligible on the JS target.

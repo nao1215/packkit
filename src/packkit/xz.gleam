@@ -25,16 +25,18 @@ pub fn codec() -> codecs.Codec {
   codecs.xz()
 }
 
-/// Encode `bytes` as an xz stream.  The encoder always emits a single
-/// block with an LZMA2 filter chain that contains only uncompressed
-/// chunks — every conforming xz decoder accepts the output, but the
-/// payload is preserved verbatim rather than compressed.  A
-/// compression-aware encoder (LZMA range coder) is intentionally future
-/// work.
+/// Encode `bytes` as an xz stream.  The encoder produces a single
+/// block whose LZMA2 filter chain contains real LZMA1-compressed
+/// chunks — each chunk routes through the literal-only LZMA1 encoder
+/// in `packkit/internal/lzma`, so the output is a fully conforming
+/// `.xz` file that any decoder accepts.  Compression ratio is bounded
+/// by the literal-only LZMA1 encoder (no LZ77 match search yet);
+/// plugging in a hash-chain match finder is the next obvious
+/// incremental improvement.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let size = bit_array.byte_size(bytes)
   let stream_header = encode_stream_header()
-  let lzma2_payload = encode_lzma2_uncompressed(bytes, size)
+  let lzma2_payload = encode_lzma2_compressed(bytes, size)
   let block_header =
     encode_block_header(bit_array.byte_size(lzma2_payload), size)
   let block_check = <<checksum.crc32(bytes):size(32)-little>>
@@ -88,44 +90,73 @@ fn encode_block_header(compressed_size: Int, uncompressed_size: Int) -> BitArray
   bit_array.concat([body_with_size, <<crc:size(32)-little>>])
 }
 
-fn encode_lzma2_uncompressed(bytes: BitArray, size: Int) -> BitArray {
+// Maximum uncompressed bytes per LZMA-compressed LZMA2 chunk.  The
+// chunk header carries a 16-bit (compressed_size - 1) field, capping
+// the compressed payload at 64 KiB; with our literal-only LZMA1
+// encoder hitting ~1.125x expansion in the worst case, an input chunk
+// of 32 KiB encodes to at most ~37 KiB — well within the cap and
+// leaving room for the eventual LZ77 / Huffman uplift.
+const lzma2_lzma_chunk_max: Int = 0x8000
+
+fn encode_lzma2_compressed(bytes: BitArray, size: Int) -> BitArray {
   case size {
     0 -> <<0x00>>
-    _ -> emit_uncompressed_chunks(bytes, size, <<>>)
+    _ -> {
+      let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
+      emit_lzma_chunks(bytes, size, props, <<>>)
+    }
   }
 }
 
-const lzma2_uncompressed_chunk_max: Int = 0x1_0000
-
-fn emit_uncompressed_chunks(
+fn emit_lzma_chunks(
   remaining: BitArray,
   remaining_size: Int,
+  props: lzma.Properties,
   acc: BitArray,
 ) -> BitArray {
   case remaining_size {
     0 -> bit_array.concat([acc, <<0x00>>])
     n -> {
-      let chunk = case n > lzma2_uncompressed_chunk_max {
-        True -> lzma2_uncompressed_chunk_max
+      let chunk_size = case n > lzma2_lzma_chunk_max {
+        True -> lzma2_lzma_chunk_max
         False -> n
       }
-      let assert Ok(payload) = bit_array.slice(remaining, 0, chunk)
+      let assert Ok(payload) = bit_array.slice(remaining, 0, chunk_size)
       let assert Ok(rest) =
         bit_array.slice(
           remaining,
-          chunk,
-          bit_array.byte_size(remaining) - chunk,
+          chunk_size,
+          bit_array.byte_size(remaining) - chunk_size,
         )
-      let size_minus_1 = chunk - 1
+      let compressed = lzma.encode_with_lz77(bytes: payload, props: props)
+      let csize = bit_array.byte_size(compressed)
+      let prop_byte = lzma.properties_to_byte(props)
+      let usize_minus_1 = chunk_size - 1
+      let csize_minus_1 = csize - 1
+      // Control byte: 0xE0 reset everything (state + properties +
+      // dictionary) and pack the top 5 bits of (usize - 1) in the
+      // bottom 5 bits.  Resetting per chunk is wasteful for an LZMA
+      // encoder with LZ77 history, but our literal-only encoder has
+      // no history to carry between chunks anyway, so the simpler
+      // form is exactly equivalent.
+      let control =
+        int.bitwise_or(
+          0xE0,
+          int.bitwise_and(int.bitwise_shift_right(usize_minus_1, 16), 0x1F),
+        )
       let header = <<
-        0x01,
-        int.bitwise_and(int.bitwise_shift_right(size_minus_1, 8), 0xFF),
-        int.bitwise_and(size_minus_1, 0xFF),
+        control,
+        int.bitwise_and(int.bitwise_shift_right(usize_minus_1, 8), 0xFF),
+        int.bitwise_and(usize_minus_1, 0xFF),
+        int.bitwise_and(int.bitwise_shift_right(csize_minus_1, 8), 0xFF),
+        int.bitwise_and(csize_minus_1, 0xFF),
+        prop_byte,
       >>
-      emit_uncompressed_chunks(
+      emit_lzma_chunks(
         rest,
-        remaining_size - chunk,
-        bit_array.concat([acc, header, payload]),
+        remaining_size - chunk_size,
+        props,
+        bit_array.concat([acc, header, compressed]),
       )
     }
   }
@@ -295,6 +326,20 @@ fn bit_array_to_u32_le(bytes: BitArray) -> Int {
   case bytes {
     <<value:little-unsigned-size(32)>> -> value
     _ -> 0
+  }
+}
+
+/// Decode 8 little-endian bytes as a `#(low_u32, high_u32)` pair.
+/// Kept separate from a single-Int return so the JavaScript target's
+/// 53-bit safe-integer ceiling does not silently corrupt the high
+/// bytes; CRC-64 verification needs every bit to be exact.
+fn bit_array_to_u64_le_pair(bytes: BitArray) -> #(Int, Int) {
+  case bytes {
+    <<low:little-unsigned-size(32), high:little-unsigned-size(32)>> -> #(
+      low,
+      high,
+    )
+    _ -> #(0, 0)
   }
 }
 
@@ -880,15 +925,30 @@ fn verify_block_check(
       }
     }
     4 ->
-      // CRC64 verification not implemented; trust the check.  We still
-      // confirm the field exists with the expected length.
+      // CRC64-ECMA (reflected polynomial 0xC96C5795D7870F42) per the
+      // xz format §2.1.1.2.  Compared as a `#(low, high)` pair so the
+      // check is exact on the JS target as well.
       case bit_array.byte_size(check_bytes) {
-        8 -> Ok(Nil)
+        8 -> {
+          let expected = checksum.crc64_xz(plain)
+          case expected == bit_array_to_u64_le_pair(check_bytes) {
+            True -> Ok(Nil)
+            False ->
+              Error(error.CodecInvalidData(message: "xz block CRC64 mismatch"))
+          }
+        }
         _ -> Error(error.CodecInvalidData(message: "xz block CRC64 length"))
       }
     10 ->
       case bit_array.byte_size(check_bytes) {
-        32 -> Ok(Nil)
+        32 -> {
+          let expected = checksum.sha256(plain)
+          case expected == check_bytes {
+            True -> Ok(Nil)
+            False ->
+              Error(error.CodecInvalidData(message: "xz block SHA-256 mismatch"))
+          }
+        }
         _ -> Error(error.CodecInvalidData(message: "xz block SHA-256 length"))
       }
     _ ->
