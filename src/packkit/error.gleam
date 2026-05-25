@@ -1,6 +1,8 @@
 //// Shared public error families for the `packkit` facade and the
 //// early scaffold modules.
 
+import gleam/int
+
 /// Errors returned by byte-to-byte codec APIs.
 pub type CodecError {
   CodecInvalidData(message: String)
@@ -58,4 +60,94 @@ pub type RecipeError {
 pub type DetectError {
   DetectUnknownFormat(input: String)
   DetectNotImplemented(feature: String)
+}
+
+// -- human-friendly formatters ----------------------------------------
+
+/// Format a `CodecError` as a single user-facing line.  Hides the
+/// constructor names and field labels that `string.inspect` would
+/// expose, so the output is suitable for CLI error reporting.
+pub fn format_codec_error(err: CodecError) -> String {
+  case err {
+    CodecInvalidData(message) -> "codec: invalid data — " <> message
+    CodecLimitExceeded(limit, actual) ->
+      "codec: limit \""
+      <> limit
+      <> "\" exceeded (actual="
+      <> int.to_string(actual)
+      <> ")"
+    CodecDictionaryRequired(name) ->
+      "codec: " <> name <> " requires a preset dictionary"
+    CodecDictionaryMismatch(name) ->
+      "codec: " <> name <> " preset-dictionary id mismatch"
+    CodecOptionUnsupported(option, codec_name) ->
+      "codec: "
+      <> codec_name
+      <> " does not support the requested option \""
+      <> option
+      <> "\""
+    CodecNotImplemented(feature) ->
+      "codec: not yet implemented — " <> feature
+  }
+}
+
+/// Format an `ArchiveError` as a single user-facing line.  Nested
+/// `CodecError` (under `ArchiveCodecFailed`) is rendered through
+/// `format_codec_error` so the user sees one continuous sentence.
+pub fn format_archive_error(err: ArchiveError) -> String {
+  case err {
+    ArchiveUnsupported(name) -> "archive: unsupported format \"" <> name <> "\""
+    ArchiveInvalid(message) -> "archive: invalid — " <> message
+    ArchiveEntryRejected(path, reason) ->
+      "archive: entry \"" <> path <> "\" rejected — " <> reason
+    ArchiveLimitExceeded(limit, actual) ->
+      "archive: limit \""
+      <> limit
+      <> "\" exceeded (actual="
+      <> int.to_string(actual)
+      <> ")"
+    ArchiveNotImplemented(feature) ->
+      "archive: not yet implemented — " <> feature
+    ArchiveCodecFailed(step, cause) ->
+      "archive: " <> step <> " step — " <> format_codec_error(cause)
+    ArchiveFormatMismatch(archive, requested) ->
+      "archive: format mismatch (archive was built as \""
+      <> archive
+      <> "\" but \""
+      <> requested
+      <> "\" was requested)"
+    ArchiveFieldOverflow(field, value, max) ->
+      "archive: field \""
+      <> field
+      <> "\" overflow (value="
+      <> int.to_string(value)
+      <> ", max="
+      <> int.to_string(max)
+      <> ")"
+    ArchiveCommentUnsupported(format) ->
+      "archive: format \"" <> format <> "\" does not carry archive comments"
+  }
+}
+
+/// Format a `DetectError` as a single user-facing line.
+pub fn format_detect_error(err: DetectError) -> String {
+  case err {
+    DetectUnknownFormat(input) ->
+      "detect: could not classify input \"" <> input <> "\""
+    DetectNotImplemented(feature) ->
+      "detect: not yet implemented — " <> feature
+  }
+}
+
+/// Format a `RecipeError` as a single user-facing line.
+pub fn format_recipe_error(err: RecipeError) -> String {
+  case err {
+    RecipeArchiveAlreadySet(current) ->
+      "recipe: archive layer is already set to \"" <> current <> "\""
+    RecipeEmptyCodecChain -> "recipe: codec chain is empty"
+    RecipeUnsupportedComposition(description) ->
+      "recipe: unsupported composition — " <> description
+    RecipeNotImplemented(feature) ->
+      "recipe: not yet implemented — " <> feature
+  }
 }
