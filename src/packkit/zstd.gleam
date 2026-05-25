@@ -1824,10 +1824,73 @@ fn ml_to_code(length: Int) -> Int {
   }
 }
 
-// OF code from a raw_offset (real_distance + 3 in the simple encoder
-// that never emits rep matches).  OF_code == high_bit(raw_offset).
+// OF code from a raw_offset.  OF_code == high_bit(raw_offset);
+// raw_offset 1..3 encode rep-match references (see `compute_seq_codes`
+// for the LL=0 / LL>0 split), 4+ encodes (real_distance + 3).
 fn of_to_code(raw_offset: Int) -> Int {
   fse.high_bit_position(raw_offset)
+}
+
+// Walk `sequences` in input order, threading the running rep-offset
+// triple (per RFC 8478 §3.1.1.5 — initial `(1, 4, 8)` per frame),
+// and produce the per-sequence FSE code + extra-bits tuples ready
+// for the backward bitstream loop.  Each match's real distance is
+// reduced to `raw_offset = 1/2/3` when it matches an entry in the
+// rep ring; otherwise it falls back to `real_distance + 3`.  The
+// rotation rules are split by `literal_length == 0` because that
+// case shifts the rep semantics so `raw_offset = 1` references
+// `rep[1]`, `raw_offset = 2` references `rep[2]`, and
+// `raw_offset = 3` references `rep[0] - 1`.
+fn compute_seq_codes(
+  sequences: List(ZstdSequence),
+  rep: #(Int, Int, Int),
+  acc: List(#(Int, Int, Int, Int, Int, Int)),
+) -> List(#(Int, Int, Int, Int, Int, Int)) {
+  case sequences {
+    [] -> list.reverse(acc)
+    [seq, ..rest] -> {
+      let ll_code = ll_to_code(seq.literal_length)
+      let ml_code = ml_to_code(seq.match_length)
+      let #(raw_offset, next_rep) =
+        rep_aware_raw_offset(seq.offset, seq.literal_length, rep)
+      let of_code = of_to_code(raw_offset)
+      let ll_extra_val = seq.literal_length - fse.ll_base(ll_code)
+      let ml_extra_val = seq.match_length - fse.ml_base(ml_code)
+      let of_extra_val = raw_offset - int.bitwise_shift_left(1, of_code)
+      compute_seq_codes(rest, next_rep, [
+        #(ll_code, ml_code, of_code, ll_extra_val, ml_extra_val, of_extra_val),
+        ..acc
+      ])
+    }
+  }
+}
+
+// Picks the smallest `raw_offset` value that resolves to the
+// requested match distance under the current rep ring, then rotates
+// the ring the same way the decoder would (mirroring
+// `resolve_offset` so the encoder and decoder stay in lockstep).
+fn rep_aware_raw_offset(
+  distance: Int,
+  literal_length: Int,
+  rep: #(Int, Int, Int),
+) -> #(Int, #(Int, Int, Int)) {
+  let #(r0, r1, r2) = rep
+  case literal_length > 0 {
+    True ->
+      case distance {
+        d if d == r0 -> #(1, #(r0, r1, r2))
+        d if d == r1 -> #(2, #(r1, r0, r2))
+        d if d == r2 -> #(3, #(r2, r0, r1))
+        d -> #(d + 3, #(d, r0, r1))
+      }
+    False ->
+      case distance {
+        d if d == r1 -> #(1, #(r1, r0, r2))
+        d if d == r2 -> #(2, #(r2, r0, r1))
+        d if r0 > 1 && d == r0 - 1 -> #(3, #(r0 - 1, r0, r1))
+        d -> #(d + 3, #(d, r0, r1))
+      }
+  }
 }
 
 // --- predefined-mode FSE sequence encoder -----------------------------
@@ -1907,24 +1970,12 @@ fn encode_sequence_fse_bitstream(sequences: List(ZstdSequence)) -> BitArray {
   let of_slots = build_seq_enc_slots(of_table, of_size)
   let ml_slots = build_seq_enc_slots(ml_table, ml_size)
 
-  // Walk sequences in reverse, computing per-sequence (code, extra)
-  // triples for LL/ML/OF.  Then push bits in reverse decoder-read
-  // order: per-seq updates (OF, ML, LL) for transitions, per-seq
-  // extras (LL, ML, OF) — the LAST sequence has no update, so its
-  // extras alone seed the bitstream.
-  let seq_codes =
-    list.map(sequences, fn(seq) {
-      let ll_code = ll_to_code(seq.literal_length)
-      let ml_code = ml_to_code(seq.match_length)
-      // raw_offset = distance + 3 (no rep-match optimisation yet)
-      let raw_offset = seq.offset + 3
-      let of_code = of_to_code(raw_offset)
-      let ll_extra_val = seq.literal_length - fse.ll_base(ll_code)
-      let ml_extra_val = seq.match_length - fse.ml_base(ml_code)
-      let of_extra_val = raw_offset - int.bitwise_shift_left(1, of_code)
-      #(ll_code, ml_code, of_code, ll_extra_val, ml_extra_val, of_extra_val)
-    })
-  let reversed = list.reverse(seq_codes)
+  // Walk sequences in input order to compute (code, extra) triples
+  // for LL/ML/OF, threading the rep-offset triple (rep[0..2]) so
+  // recurring match distances collapse onto `raw_offset` 1, 2, or 3.
+  // The bit-emission loop below consumes the result in reverse.
+  let seq_codes_forward = compute_seq_codes(sequences, #(1, 4, 8), [])
+  let reversed = list.reverse(seq_codes_forward)
 
   case reversed {
     [] -> <<>>

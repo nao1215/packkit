@@ -194,6 +194,26 @@ pub fn encode_uses_fse_huffman_for_wide_alphabet_test() -> Nil {
   decoded |> should.equal(payload)
 }
 
+pub fn encode_uses_zstd_rep_match_for_recurring_distance_test() -> Nil {
+  // A 4-byte motif repeated 200 times in a row: every match has the
+  // same distance (4), so after the first emit every subsequent
+  // sequence collapses onto `raw_offset = 1` (rep[0]).  That drops
+  // the per-match offset cost from ~5 of_code bits to 0, which
+  // shows up as a meaningfully smaller encoded block than what
+  // raw_offset = distance + 3 would have produced.  The strong
+  // assertion below — encoded < 5 % of payload — only holds if the
+  // rep-match path is engaged.
+  let payload = repeat_bytes(<<"ABCD":utf8>>, 200)
+  let payload_size = bit_array.byte_size(payload)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+  case bit_array.byte_size(encoded) * 20 < payload_size {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
 pub fn encode_emits_lz77_sequences_block_for_repetitive_text_test() -> Nil {
   // 800 bytes of a 16-byte motif repeated 50 times.  An encoder that
   // only does literals-level compression (Huffman) gets at most ~4-5

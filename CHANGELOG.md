@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Feature (zstd)**: the LZ77 sequences encoder now threads the
+  three-entry rep-offset ring (per RFC 8478 §3.1.1.5 — initial
+  `(1, 4, 8)`) through every chunk, so matches whose real
+  distance hits one of the recent offsets collapse onto
+  `raw_offset = 1`, `2`, or `3` instead of `distance + 3`.  The
+  `literal_length == 0` branch is also honoured (raw_offset 1
+  selects rep[1], 2 selects rep[2], 3 selects rep[0] - 1), and
+  the encoder rotates the ring the same way the decoder's
+  `resolve_offset` does so encoder and decoder stay in
+  lockstep.  Payloads that hit the same distance over and over
+  now compress dramatically further — a 4-byte motif repeated
+  200 times shrinks below 5 % of its raw size.
 - **Feature (zstd)**: the zstd encoder now optionally emits a
   Compressed_Block whose Sequences_Section carries real LZ77
   sequences in addition to the existing literals-only path.  A
@@ -16,8 +28,7 @@
   repetitive payloads now compress dramatically below the
   literals-only floor — e.g. a 16-byte motif repeated 50 times
   (800 bytes) drops to well under 200 bytes through the
-  sequences path.  Rep-match (`raw_offset` 1/2/3) optimisation
-  is still future work; every match emits a fresh raw offset.
+  sequences path.
 - **Feature (zip)**: ZIP decoder now reads entries protected by the
   PKWARE "traditional" / "ZipCrypto" encryption scheme via two new
   public entry points — `zip.decode_with_password` and
