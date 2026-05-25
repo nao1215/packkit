@@ -129,10 +129,10 @@ symbols still fall back to Raw / RLE — the FSE-form tree
 description for ≥ 128-symbol alphabets is future work.  The xz / 7z / ZIP
 method 14 encoders now share a real LZ77 LZMA1 encoder
 (`packkit/internal/lzma.encode_with_lz77`, 3-byte hash chain
-with a 32 KiB window plus LZMA rep-match emission when the
-match distance hits the `rep0..rep3` ring) which delivers real
-compression on repetitive payloads — e.g. an 80 KiB
-repeating-string xz file shrinks to ~388 bytes (0.49 % ratio),
+with a 32 KiB window plus LZMA rep-match and short-rep emission
+when the match distance hits the `rep0..rep3` ring) which
+delivers real compression on repetitive payloads — e.g. an 80
+KiB repeating-string xz file shrinks to ~388 bytes (0.49 % ratio),
 9 KiB of repeated pangrams to 148 bytes (1.6 %).
 
 ## Install

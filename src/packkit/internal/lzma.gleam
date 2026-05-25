@@ -1170,10 +1170,11 @@ fn lz77_main_loop(
     False ->
       case pos + lzma_lz77_min_match > size {
         // Too few bytes left for a 3-byte hash — emit remaining as
-        // literals.
+        // literals (or short-reps when rep0 already aligns).
         True -> {
           let byte = byte_at_input(bytes, pos)
-          let encoder = emit_lzma_literal(encoder, bytes, pos, byte)
+          let encoder =
+            emit_lzma_literal_or_short_rep(encoder, bytes, pos, byte)
           lz77_main_loop(bytes, pos + 1, size, encoder, hashes)
         }
         False -> {
@@ -1183,7 +1184,8 @@ fn lz77_main_loop(
           let key = lzma_hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) -> {
-              let encoder = emit_lzma_literal(encoder, bytes, pos, b0)
+              let encoder =
+                emit_lzma_literal_or_short_rep(encoder, bytes, pos, b0)
               let hashes = dict.insert(hashes, key, pos)
               lz77_main_loop(bytes, pos + 1, size, encoder, hashes)
             }
@@ -1191,7 +1193,8 @@ fn lz77_main_loop(
               let distance = pos - prev
               case distance <= 0 || distance > lzma_lz77_max_distance {
                 True -> {
-                  let encoder = emit_lzma_literal(encoder, bytes, pos, b0)
+                  let encoder =
+                    emit_lzma_literal_or_short_rep(encoder, bytes, pos, b0)
                   let hashes = dict.insert(hashes, key, pos)
                   lz77_main_loop(bytes, pos + 1, size, encoder, hashes)
                 }
@@ -1218,7 +1221,8 @@ fn lz77_main_loop(
                       lz77_main_loop(bytes, pos + m_len, size, encoder, hashes)
                     }
                     False -> {
-                      let encoder = emit_lzma_literal(encoder, bytes, pos, b0)
+                      let encoder =
+                        emit_lzma_literal_or_short_rep(encoder, bytes, pos, b0)
                       let hashes = dict.insert(hashes, key, pos)
                       lz77_main_loop(bytes, pos + 1, size, encoder, hashes)
                     }
@@ -1292,6 +1296,59 @@ fn update_hashes_in_range(
         size,
       )
     }
+  }
+}
+
+// Pick between a literal and the LZMA short-rep packet (length-1
+// rep0).  Short-rep costs only the four prefix prob bits — no
+// literal-byte coding, no length encoding — so whenever the byte at
+// `pos - rep0 - 1` already equals the current byte it's a strict
+// win over emitting a literal.  rep0/rep1/rep2/rep3 are *not*
+// rotated by short-rep (the decoder leaves the rep ring untouched on
+// the short-rep branch), so this only changes the encoder state via
+// `lzma_short_rep_next_state` and the output length.
+fn emit_lzma_literal_or_short_rep(
+  encoder: Encoder,
+  bytes: BitArray,
+  pos: Int,
+  byte: Int,
+) -> Encoder {
+  let back = pos - encoder.rep0 - 1
+  case back >= 0 && byte_at_input(bytes, back) == byte {
+    True -> {
+      let pos_state = int.bitwise_and(pos, mask_for(encoder.props.pb))
+      emit_lzma_short_rep(encoder, pos_state)
+    }
+    False -> emit_lzma_literal(encoder, bytes, pos, byte)
+  }
+}
+
+fn emit_lzma_short_rep(encoder: Encoder, pos_state: Int) -> Encoder {
+  let encoder =
+    encode_bit(
+      encoder,
+      prob_key(t_is_match, encoder.state * num_pos_states_max + pos_state),
+      1,
+    )
+  let encoder = encode_bit(encoder, prob_key(t_is_rep, encoder.state), 1)
+  let encoder = encode_bit(encoder, prob_key(t_is_rep_g0, encoder.state), 0)
+  let encoder =
+    encode_bit(
+      encoder,
+      prob_key(t_is_rep0_long, encoder.state * num_pos_states_max + pos_state),
+      0,
+    )
+  Encoder(
+    ..encoder,
+    state: lzma_short_rep_next_state(encoder.state),
+    output_len: encoder.output_len + 1,
+  )
+}
+
+fn lzma_short_rep_next_state(state: Int) -> Int {
+  case state < 7 {
+    True -> 9
+    False -> 11
   }
 }
 

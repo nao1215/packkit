@@ -130,6 +130,37 @@ pub fn encode_with_lz77_rep_matches_beat_new_distance_test() -> Nil {
   }
 }
 
+pub fn encode_with_lz77_short_rep_beats_literal_test() -> Nil {
+  // Payload designed to exercise the LZMA short-rep packet (a
+  // length-1 rep0 with the byte at `pos - rep0 - 1` already
+  // matching the current byte): a 3-byte motif "XYZ" repeated and
+  // separated by a single filler letter the LZ77 finder won't pick
+  // up.  After the first real match sets rep0 to 2 (distance 3
+  // back), every later "X"/"Y"/"Z" that lines up with that distance
+  // is emittable as a 4-prob-bit short-rep instead of a full
+  // literal — so the encoded output must shrink below what the
+  // literal-only encoder produces and still round-trip cleanly.
+  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
+  let payload =
+    bit_array.concat([
+      repeat_bytes(<<"XYZ":utf8>>, 4),
+      <<"q":utf8>>,
+      repeat_bytes(<<"XYZ":utf8>>, 4),
+      <<"q":utf8>>,
+      repeat_bytes(<<"XYZ":utf8>>, 4),
+    ])
+  let lz77 = lzma.encode_with_lz77(bytes: payload, props: props)
+  let literal_only = lzma.encode_literal_only(bytes: payload, props: props)
+  let assert Ok(decoder) = lzma.new(lz77, props, 1024)
+  let assert Ok(#(decoded, _state)) =
+    lzma.decode_into(decoder, bit_array.byte_size(payload))
+  decoded |> should.equal(payload)
+  case bit_array.byte_size(lz77) < bit_array.byte_size(literal_only) {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
 pub fn encode_with_lz77_roundtrips_incompressible_test() -> Nil {
   // Bytes 0..255 cycling — no internal repetition until position 256,
   // which is also right at the 3-byte hash window edge.  LZ77 will

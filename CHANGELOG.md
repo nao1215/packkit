@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Feature (lzma1)**: literal-or-short-rep dispatch on the LZMA1
+  encoder.  Whenever the byte at `pos - rep0 - 1` already matches
+  the current input byte, the encoder emits the LZMA short-rep
+  packet (`is_match=1, is_rep=1, is_rep_g0=0, is_rep0_long=0` —
+  four prob bits, no literal-byte coding, no length encoding)
+  instead of a full literal.  Strict win over the literal path
+  whenever the rep0 ring is already aligned with the input.
 - **Feature (zstd)**: zstd encoder now emits a Compressed_Block
   with Huffman-coded literals when it shrinks a chunk relative to
   the raw / RLE alternatives.  Supports both the 1-stream form
@@ -9,13 +16,9 @@
   (size_format = 2, ≤ 16 KiB chunks with a 6-byte jump table over
   the four sub-bitstreams).  Each chunk independently picks the
   smallest of Raw / RLE / Huffman so the encoder never regresses
-  on incompressible payloads; inputs whose byte distribution
-  requires > 128 symbols gracefully fall back to Raw / RLE
-  because the FSE-form tree description for ≥ 128-symbol
-  alphabets is not implemented yet.  Compression ratios on
-  English-like text now hold steady at ~50 % across small and
-  large inputs (pangram x 100 → 58 %, lorem x 200 / 500 / 2000
-  → all ~51 %).
+  on incompressible payloads.  Compression ratios on English-like
+  text now hold steady at ~50 % across small and large inputs
+  (pangram x 100 → 58 %, lorem x 200 / 500 / 2000 → all ~51 %).
 - **Fix (internal/huf decoder)**: `decode_symbols_loop` was
   structured around `use <- result.try` which compiled to JS
   callbacks and prevented tail-call optimisation, so any single
