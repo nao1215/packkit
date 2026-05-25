@@ -103,6 +103,43 @@ pub fn cpio_zstd() -> Recipe {
   archive_with(format: archive.cpio_newc(), wrapped_by: codec.zstd())
 }
 
+/// Convenience constructor for a bare `tar` archive (no outer codec).
+/// Equivalent to `archive_only(format: archive.tar())`; provided so
+/// the same `packkit.pack` / `packkit.unpack` entrypoints serve both
+/// uncompressed tar and codec-wrapped tar without the caller switching
+/// to `packkit.write` / `packkit.read`.
+pub fn tar() -> Recipe {
+  archive_only(format: archive.tar())
+}
+
+/// Convenience constructor for a bare ZIP archive.  ZIP carries its
+/// own per-entry compression internally, so there's no recipe-level
+/// codec to wrap it in — but exposing `recipe.zip()` lets callers use
+/// the same `packkit.pack` / `packkit.unpack` API they use for tar
+/// recipes, instead of switching to `packkit.write` / `packkit.read`.
+pub fn zip() -> Recipe {
+  archive_only(format: archive.zip())
+}
+
+/// Convenience constructor for a bare 7z archive.  Like ZIP, 7z
+/// applies its own internal compression and does not take a recipe
+/// codec wrapper; this constructor keeps the API symmetric across
+/// archive families.
+pub fn seven_z() -> Recipe {
+  archive_only(format: archive.seven_z())
+}
+
+/// Convenience constructor for a bare `ar` archive (BSD long-name
+/// format on encode; GNU string-table form also accepted on decode).
+pub fn ar() -> Recipe {
+  archive_only(format: archive.ar())
+}
+
+/// Convenience constructor for a bare cpio (newc) archive.
+pub fn cpio() -> Recipe {
+  archive_only(format: archive.cpio_newc())
+}
+
 /// Read the archive format the recipe was constructed with.
 pub fn archive_format(recipe: Recipe) -> archive.ArchiveFormat {
   recipe.format

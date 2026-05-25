@@ -149,6 +149,43 @@ pub fn facade_pack_unpack_tar_gzip_test() -> Nil {
   |> should.equal(2)
 }
 
+pub fn facade_pack_unpack_via_recipe_zip_test() -> Nil {
+  // `recipe.zip()` is the bare-archive convenience shortcut introduced
+  // so callers can stay on the `packkit.pack` / `packkit.unpack` API
+  // when targeting ZIP instead of switching to `packkit.write` /
+  // `packkit.read`.  The same archive value must round-trip through
+  // both paths byte-for-byte.
+  let archive_value =
+    zip.new()
+    |> archive.add(entry: entry.file(path: "hello.txt", body: <<"hello":utf8>>))
+    |> archive.add(entry: entry.file(path: "world.txt", body: <<"world":utf8>>))
+
+  let assert Ok(bytes) =
+    packkit.pack(archive_value: archive_value, using: recipe.zip())
+  let assert Ok(decoded) =
+    packkit.unpack(bytes: bytes, using: recipe.zip())
+
+  archive.entry_count(decoded)
+  |> should.equal(2)
+}
+
+pub fn facade_pack_unpack_via_recipe_tar_bare_test() -> Nil {
+  // `recipe.tar()` covers the uncompressed-tar case via the same
+  // pack/unpack API.  Without the convenience shortcut callers had to
+  // either write `recipe.archive_only(format: archive.tar())` or fall
+  // through to `packkit.write` / `packkit.read`.
+  let archive_value =
+    tar.new()
+    |> tar.add_file(path: "a.txt", body: <<"a":utf8>>)
+    |> tar.add_file(path: "b.txt", body: <<"b":utf8>>)
+  let assert Ok(bytes) =
+    packkit.pack(archive_value: archive_value, using: recipe.tar())
+  let assert Ok(decoded) =
+    packkit.unpack(bytes: bytes, using: recipe.tar())
+  archive.entry_count(decoded)
+  |> should.equal(2)
+}
+
 pub fn facade_bzip2_roundtrip_test() -> Nil {
   let payload = <<"facade-level bzip2 round trip":utf8>>
   let assert Ok(compressed) =
