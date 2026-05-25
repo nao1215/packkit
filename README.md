@@ -48,7 +48,10 @@ Implemented codecs and archive families:
   central-directory uncompressed size instead of looking for an
   in-stream EOS marker.  The decoder side reads the 4-byte SDK
   preamble + 5-byte property block and hands the range-coded
-  payload to the internal LZMA decoder
+  payload to the internal LZMA decoder.  Entries protected by
+  PKWARE traditional ("ZipCrypto") encryption decode via
+  `zip.decode_with_password` (the strong-encryption gp flag bit
+  is rejected explicitly rather than decoded as ZipCrypto)
 - **7z**: single-folder LZMA / LZMA2 reader (covers the common
   `7z a` single-file case).  The encoder builds a single-folder,
   single-coder archive with a raw LZMA1 coder, emitting the

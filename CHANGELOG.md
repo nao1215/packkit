@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Feature (zip)**: ZIP decoder now reads entries protected by the
+  PKWARE "traditional" / "ZipCrypto" encryption scheme via two new
+  public entry points — `zip.decode_with_password` and
+  `zip.decode_with_password_and_limits`.  The decoder seeds the
+  three-key cipher state from the supplied password, decrypts each
+  entry's 12-byte encryption header, verifies the trailing byte
+  against the high byte of the entry's CRC-32 (APPNOTE §6.0), and
+  hands the resulting plaintext to the matching method (`store`,
+  `deflate`, `bzip2`, `zstd`, `xz`, `lzma`).  Encrypted entries
+  reached by the plain `zip.decode` API surface a typed
+  `ArchiveNotImplemented` so the missing password is never silently
+  ignored; wrong passwords come back as `ArchiveInvalid` rather than
+  passing garbage to the codec.  Strong-encryption (gp flag bit 6)
+  is rejected with a typed not-implemented error rather than
+  decoded as ZipCrypto.
 - **Feature (zstd)**: the zstd Huffman literals encoder now also
   emits the FSE-compressed tree-description form (header byte
   0..127 + FSE body) when the direct-weight form can't carry the

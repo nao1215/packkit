@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/int
 import gleam/list
 import gleam/option
 import gleam/string
@@ -280,6 +281,200 @@ fn python_deflate_zip() -> BitArray {
     0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x70,
     0x00, 0x00, 0x00, 0x7a, 0x00, 0x00, 0x00, 0x00, 0x00,
   >>
+}
+
+pub fn decode_pkware_encrypted_zip_with_correct_password_test() -> Nil {
+  // Build an encrypted ZIP fixture in-process using the same PKWARE
+  // cipher the decoder expects, then verify `decode_with_password`
+  // recovers the original bytes.  The test cipher implementation
+  // below is the reference encryption side; the production code
+  // never builds encrypted entries (encrypt-on-encode is out of
+  // scope for now) so we exercise the decode path against a known
+  // round-trippable fixture.
+  let body = <<"hello, pkware!":utf8>>
+  let bytes = build_zipcrypto_fixture("hello.txt", body, "secret")
+  let assert Ok(archive_value) =
+    zip.decode_with_password(bytes: bytes, password: "secret")
+  let entries = archive.entries(archive_value)
+  list.length(entries) |> should.equal(1)
+  let assert [decoded] = entries
+  entry.to_string(entry.path(decoded)) |> should.equal("hello.txt")
+  entry.body(decoded) |> should.equal(body)
+}
+
+pub fn decode_pkware_encrypted_zip_wrong_password_rejected_test() -> Nil {
+  let body = <<"hello, pkware!":utf8>>
+  let bytes = build_zipcrypto_fixture("hello.txt", body, "secret")
+  let result = zip.decode_with_password(bytes: bytes, password: "wrong")
+  case result {
+    Error(error.ArchiveInvalid(message: msg)) ->
+      case string.contains(msg, "wrong password") {
+        True -> Nil
+        False -> should.fail()
+      }
+    _ -> should.fail()
+  }
+}
+
+pub fn decode_pkware_encrypted_zip_without_password_surfaces_typed_error_test() -> Nil {
+  let body = <<"hello, pkware!":utf8>>
+  let bytes = build_zipcrypto_fixture("hello.txt", body, "secret")
+  let result = zip.decode(bytes: bytes)
+  case result {
+    Error(error.ArchiveNotImplemented(feature: feature)) ->
+      case string.contains(feature, "encrypted ZIP entry") {
+        True -> Nil
+        False -> should.fail()
+      }
+    _ -> should.fail()
+  }
+}
+
+// ============================================================
+// Test-only PKWARE traditional ZIP encryption helpers
+// ============================================================
+
+type ZcKeys {
+  ZcKeys(k0: Int, k1: Int, k2: Int)
+}
+
+fn zc_init() -> ZcKeys {
+  ZcKeys(k0: 0x12345678, k1: 0x23456789, k2: 0x34567890)
+}
+
+fn zc_from_password(password: String) -> ZcKeys {
+  zc_seed_loop(zc_init(), bit_array.from_string(password))
+}
+
+fn zc_seed_loop(keys: ZcKeys, password: BitArray) -> ZcKeys {
+  case password {
+    <<b, rest:bytes>> -> zc_seed_loop(zc_update(keys, b), rest)
+    _ -> keys
+  }
+}
+
+fn zc_update(keys: ZcKeys, byte: Int) -> ZcKeys {
+  let k0 = zc_crc32_byte(keys.k0, byte)
+  let added = int.bitwise_and(k0, 0xFF) + keys.k1
+  let mixed = added * 134_775_813 + 1
+  let k1 = int.bitwise_and(mixed, 0xFFFFFFFF)
+  let top = int.bitwise_and(int.bitwise_shift_right(k1, 24), 0xFF)
+  let k2 = zc_crc32_byte(keys.k2, top)
+  ZcKeys(k0: k0, k1: k1, k2: k2)
+}
+
+fn zc_crc32_byte(crc: Int, byte: Int) -> Int {
+  let idx = int.bitwise_and(int.bitwise_exclusive_or(crc, byte), 0xFF)
+  let folded = zc_crc32_fold(idx, 8)
+  int.bitwise_exclusive_or(int.bitwise_shift_right(crc, 8), folded)
+}
+
+fn zc_crc32_fold(value: Int, rounds: Int) -> Int {
+  case rounds {
+    0 -> value
+    _ -> {
+      let next = case int.bitwise_and(value, 1) {
+        1 ->
+          int.bitwise_exclusive_or(
+            int.bitwise_shift_right(value, 1),
+            0xEDB88320,
+          )
+        _ -> int.bitwise_shift_right(value, 1)
+      }
+      zc_crc32_fold(next, rounds - 1)
+    }
+  }
+}
+
+fn zc_encrypt(
+  keys: ZcKeys,
+  plain: BitArray,
+  acc: BitArray,
+) -> #(BitArray, ZcKeys) {
+  case plain {
+    <<b, rest:bytes>> -> {
+      let temp = int.bitwise_or(keys.k2, 2)
+      let prod = temp * int.bitwise_exclusive_or(temp, 1)
+      let mask = int.bitwise_and(int.bitwise_shift_right(prod, 8), 0xFF)
+      let cipher = int.bitwise_exclusive_or(b, mask)
+      let next_keys = zc_update(keys, b)
+      zc_encrypt(next_keys, rest, <<acc:bits, cipher>>)
+    }
+    _ -> #(acc, keys)
+  }
+}
+
+fn build_zipcrypto_fixture(
+  name: String,
+  body: BitArray,
+  password: String,
+) -> BitArray {
+  let name_bytes = bit_array.from_string(name)
+  let name_size = bit_array.byte_size(name_bytes)
+  let body_size = bit_array.byte_size(body)
+  let crc = checksum.crc32(body)
+  // 12-byte encryption header: 11 deterministic bytes + (crc >> 24)
+  // in the trailing slot per APPNOTE §6.0.  Any 11 bytes work; the
+  // check is on the 12th alone.
+  let check_byte = int.bitwise_and(int.bitwise_shift_right(crc, 24), 0xFF)
+  let plain_header = <<
+    0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, check_byte,
+  >>
+  let plaintext = bit_array.concat([plain_header, body])
+  let keys = zc_from_password(password)
+  let #(cipher, _keys) = zc_encrypt(keys, plaintext, <<>>)
+  let comp_size = bit_array.byte_size(cipher)
+
+  // ZIP local file header
+  let local_header = <<
+    0x50, 0x4B, 0x03, 0x04,
+    // version_needed: 2.0
+    20:size(16)-little,
+    // gp flag: bit 0 = encrypted
+    1:size(16)-little,
+    // method: stored
+    0:size(16)-little,
+    // mod time / mod date
+    0:size(16)-little, 0:size(16)-little,
+    // crc32
+    crc:size(32)-little,
+    // comp_size, uncomp_size
+    comp_size:size(32)-little, body_size:size(32)-little,
+    // name length, extra length
+    name_size:size(16)-little, 0:size(16)-little,
+  >>
+
+  let local_offset = 0
+  let local = bit_array.concat([local_header, name_bytes, cipher])
+  let central_size_offset = bit_array.byte_size(local)
+
+  // Central directory header
+  let central_header = <<
+    0x50, 0x4B, 0x01, 0x02,
+    // version made by, version needed
+    20:size(16)-little, 20:size(16)-little, 1:size(16)-little,
+    // method, mod time, mod date
+    0:size(16)-little, 0:size(16)-little, 0:size(16)-little,
+    // crc32, comp/uncomp size
+    crc:size(32)-little, comp_size:size(32)-little, body_size:size(32)-little,
+    // name, extra, comment lengths
+    name_size:size(16)-little, 0:size(16)-little, 0:size(16)-little,
+    // disk start, internal/external attrs
+    0:size(16)-little, 0:size(16)-little, 0:size(32)-little,
+    // local-header offset
+    local_offset:size(32)-little,
+  >>
+
+  let central = bit_array.concat([central_header, name_bytes])
+  let central_size = bit_array.byte_size(central)
+
+  let eocd = <<
+    0x50, 0x4B, 0x05, 0x06, 0:size(16)-little, 0:size(16)-little,
+    1:size(16)-little, 1:size(16)-little, central_size:size(32)-little,
+    central_size_offset:size(32)-little, 0:size(16)-little,
+  >>
+
+  bit_array.concat([local, central, eocd])
 }
 
 pub fn entry_with_mode_checked_rejects_overflow_test() -> Nil {

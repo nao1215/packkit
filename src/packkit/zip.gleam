@@ -367,13 +367,44 @@ fn check_u32(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
 pub fn decode(
   bytes bytes: BitArray,
 ) -> Result(archives.Archive, error.ArchiveError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
+  decode_internal(bytes, None, limit.default())
 }
 
 /// Decode a ZIP archive using explicit limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
+) -> Result(archives.Archive, error.ArchiveError) {
+  decode_internal(bytes, None, limits)
+}
+
+/// Decode a ZIP archive whose entries may be protected by the
+/// PKWARE traditional ("ZipCrypto") encryption scheme.  The
+/// password is applied to every encrypted entry; entries without
+/// the gp-flag encryption bit decode unchanged.  Wrong-password
+/// detection relies on the 12-byte encryption header check byte
+/// (the high byte of the entry's CRC-32), so a wrong password
+/// surfaces as `ArchiveInvalid`.
+pub fn decode_with_password(
+  bytes bytes: BitArray,
+  password password: String,
+) -> Result(archives.Archive, error.ArchiveError) {
+  decode_internal(bytes, Some(password), limit.default())
+}
+
+/// Same as `decode_with_password` but with explicit limits.
+pub fn decode_with_password_and_limits(
+  bytes bytes: BitArray,
+  password password: String,
+  limits limits: limit.Limits,
+) -> Result(archives.Archive, error.ArchiveError) {
+  decode_internal(bytes, Some(password), limits)
+}
+
+fn decode_internal(
+  bytes: BitArray,
+  password: Option(String),
+  limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
   use <- bool.guard(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
@@ -407,6 +438,7 @@ pub fn decode_with_limits(
     bytes,
     0,
     limits,
+    password,
   ))
 
   let base =
@@ -877,6 +909,7 @@ fn parse_central_directory(
   full: BitArray,
   accumulated_body_bytes: Int,
   limits: limit.Limits,
+  password: Option(String),
 ) -> Result(List(entry.Entry), error.ArchiveError) {
   case remaining {
     0 -> Ok(acc)
@@ -889,6 +922,7 @@ fn parse_central_directory(
         )),
       )
 
+      use gp_flag <- result.try(read_le16_at(bytes, 8))
       use method <- result.try(read_le16_at(bytes, 10))
       use crc <- result.try(read_le32_at(bytes, 16))
       use comp_size <- result.try(read_le32_at(bytes, 20))
@@ -972,6 +1006,8 @@ fn parse_central_directory(
         comp_size,
         external_attrs,
         limits,
+        gp_flag,
+        password,
       ))
 
       // Adversarial archives can pack many independently-bounded
@@ -1011,6 +1047,7 @@ fn parse_central_directory(
         full,
         next_total,
         limits,
+        password,
       )
     }
   }
@@ -1025,12 +1062,23 @@ fn read_local_entry(
   comp_size: Int,
   external_attrs: Int,
   limits: limit.Limits,
+  gp_flag: Int,
+  password: Option(String),
 ) -> Result(entry.Entry, error.ArchiveError) {
   use signature <- result.try(read_le32_at(full, local_offset))
   use <- bool.guard(
     when: signature != local_file_signature,
     return: Error(error.ArchiveInvalid(
       message: "missing local file header signature",
+    )),
+  )
+
+  let encrypted = int.bitwise_and(gp_flag, 1) == 1
+  let strong_encrypted = int.bitwise_and(gp_flag, 0x40) != 0
+  use <- bool.guard(
+    when: strong_encrypted,
+    return: Error(error.ArchiveNotImplemented(
+      feature: "ZIP strong-encryption (gp flag bit 6)",
     )),
   )
 
@@ -1078,30 +1126,70 @@ fn read_local_entry(
 
   let data_offset = local_offset + 30 + local_name_length + local_extra_length
 
+  // Resolve any PKWARE traditional encryption layer up-front so the
+  // method-specific branch always sees the plain compressed bytes.
+  // `comp_size` already accounts for the 12-byte encryption header
+  // for encrypted entries (and equals `uncomp_size` for unencrypted
+  // stored entries), so it's the right total-size value to hand to
+  // the resolver in every case.
+  use plain_slice <- result.try(resolve_pkware_decryption(
+    full,
+    data_offset,
+    comp_size,
+    encrypted,
+    expected_crc,
+    password,
+    name,
+  ))
+  let data_offset = plain_slice.0
+  let comp_size = plain_slice.1
+  let body_source = plain_slice.2
+
   use body <- result.try(case method {
-    m if m == method_store -> slice_or_error(full, data_offset, uncomp_size)
+    m if m == method_store ->
+      slice_or_error(body_source, data_offset, uncomp_size)
     m if m == method_deflate -> {
-      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      use compressed <- result.try(slice_or_error(
+        body_source,
+        data_offset,
+        comp_size,
+      ))
       deflate.decode_with_limits(bytes: compressed, limits: limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
     m if m == method_bzip2 -> {
-      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      use compressed <- result.try(slice_or_error(
+        body_source,
+        data_offset,
+        comp_size,
+      ))
       bzip2.decode_with_limits(bytes: compressed, limits: limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
     m if m == method_lzma -> {
-      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      use compressed <- result.try(slice_or_error(
+        body_source,
+        data_offset,
+        comp_size,
+      ))
       decode_pkware_lzma(compressed, uncomp_size, limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
     m if m == method_zstd -> {
-      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      use compressed <- result.try(slice_or_error(
+        body_source,
+        data_offset,
+        comp_size,
+      ))
       zstd.decode_with_limits(bytes: compressed, limits: limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
     m if m == method_xz -> {
-      use compressed <- result.try(slice_or_error(full, data_offset, comp_size))
+      use compressed <- result.try(slice_or_error(
+        body_source,
+        data_offset,
+        comp_size,
+      ))
       xz.decode_with_limits(bytes: compressed, limits: limits)
       |> result.map_error(codec_to_archive_error(_, name))
     }
@@ -1139,6 +1227,186 @@ fn read_local_entry(
           _ -> entry.with_mode(e, mode: mode)
         }
       })
+  }
+}
+
+// ============================================================
+// PKWARE "traditional" ZIP encryption (a.k.a. ZipCrypto)
+//
+// Each encrypted entry has a 12-byte encryption header prepended to
+// its compressed payload.  The cipher is a stream cipher seeded by
+// three 32-bit keys; the keys are mixed by the password byte-by-byte
+// at init, then by each plaintext byte during streaming.  The 12th
+// decrypted header byte must equal the high byte of the entry's
+// CRC-32 (per APPNOTE §6.0).  We use that check to surface a typed
+// "wrong password" error rather than handing the codec random bytes.
+// ============================================================
+
+type PkwareKeys {
+  PkwareKeys(key0: Int, key1: Int, key2: Int)
+}
+
+fn pkware_initial_keys() -> PkwareKeys {
+  PkwareKeys(key0: 0x12345678, key1: 0x23456789, key2: 0x34567890)
+}
+
+// Derive the per-entry key state from a password.  Equivalent to
+// running `update_keys` over every password byte with the initial
+// triple.
+fn pkware_keys_from_password(password: String) -> PkwareKeys {
+  pkware_seed_loop(pkware_initial_keys(), bit_array.from_string(password))
+}
+
+fn pkware_seed_loop(keys: PkwareKeys, password: BitArray) -> PkwareKeys {
+  case password {
+    <<b, rest:bytes>> -> pkware_seed_loop(pkware_update_keys(keys, b), rest)
+    _ -> keys
+  }
+}
+
+fn pkware_update_keys(keys: PkwareKeys, byte: Int) -> PkwareKeys {
+  let new_key0 = pkware_crc32_byte(keys.key0, byte)
+  // key1 = (key1 + (key0 & 0xFF)) * 134775813 + 1 mod 2^32
+  let added = int.bitwise_and(new_key0, 0xFF) + keys.key1
+  let mixed = added * 134_775_813 + 1
+  let new_key1 = int.bitwise_and(mixed, 0xFFFFFFFF)
+  let top = int.bitwise_and(int.bitwise_shift_right(new_key1, 24), 0xFF)
+  let new_key2 = pkware_crc32_byte(keys.key2, top)
+  PkwareKeys(key0: new_key0, key1: new_key1, key2: new_key2)
+}
+
+// `(crc >> 8) ^ crc32_table[(crc ^ byte) & 0xFF]`, where the lookup
+// is the IEEE 802.3 / PNG / ZIP CRC-32 table (reflected polynomial
+// 0xEDB88320).  Computed on the fly rather than memoised — the cipher
+// only runs once per encrypted byte and the table builder is 8 small
+// iterations so the per-byte cost stays bounded.
+fn pkware_crc32_byte(crc: Int, byte: Int) -> Int {
+  let idx = int.bitwise_and(int.bitwise_exclusive_or(crc, byte), 0xFF)
+  let folded = pkware_crc32_fold(idx, 8)
+  int.bitwise_exclusive_or(int.bitwise_shift_right(crc, 8), folded)
+}
+
+fn pkware_crc32_fold(value: Int, rounds: Int) -> Int {
+  case rounds {
+    0 -> value
+    _ -> {
+      let next = case int.bitwise_and(value, 1) {
+        1 ->
+          int.bitwise_exclusive_or(
+            int.bitwise_shift_right(value, 1),
+            0xEDB88320,
+          )
+        _ -> int.bitwise_shift_right(value, 1)
+      }
+      pkware_crc32_fold(next, rounds - 1)
+    }
+  }
+}
+
+fn pkware_decrypt_byte(keys: PkwareKeys, cipher: Int) -> #(Int, PkwareKeys) {
+  // temp = key2 | 2; plain = cipher ^ ((temp * (temp ^ 1)) >> 8) & 0xFF
+  let temp = int.bitwise_or(keys.key2, 2)
+  let prod = temp * int.bitwise_exclusive_or(temp, 1)
+  let mask = int.bitwise_and(int.bitwise_shift_right(prod, 8), 0xFF)
+  let plain = int.bitwise_exclusive_or(cipher, mask)
+  let next_keys = pkware_update_keys(keys, plain)
+  #(plain, next_keys)
+}
+
+fn pkware_decrypt_bytes(
+  keys: PkwareKeys,
+  cipher: BitArray,
+  acc: BitArray,
+) -> #(BitArray, PkwareKeys) {
+  case cipher {
+    <<b, rest:bytes>> -> {
+      let #(plain, keys) = pkware_decrypt_byte(keys, b)
+      pkware_decrypt_bytes(keys, rest, <<acc:bits, plain>>)
+    }
+    _ -> #(acc, keys)
+  }
+}
+
+// Resolve any PKWARE-encrypted entry to its plain compressed bytes.
+// Returns a triple `#(data_offset, comp_size, source_buffer)` so the
+// caller can keep slicing through the existing helpers without
+// caring whether the buffer is the original archive or a fresh
+// plaintext buffer.  For unencrypted entries the original archive
+// is returned unchanged; for encrypted entries the leading 12-byte
+// header is consumed, verified, and stripped.
+fn resolve_pkware_decryption(
+  full: BitArray,
+  data_offset: Int,
+  total_size: Int,
+  encrypted: Bool,
+  expected_crc: Int,
+  password: Option(String),
+  name: String,
+) -> Result(#(Int, Int, BitArray), error.ArchiveError) {
+  case encrypted, password {
+    False, _ -> Ok(#(data_offset, total_size, full))
+    True, None ->
+      Error(error.ArchiveNotImplemented(
+        feature: "encrypted ZIP entry \""
+        <> name
+        <> "\" (use decode_with_password)",
+      ))
+    True, Some(pwd) -> {
+      use raw <- result.try(slice_or_error(full, data_offset, total_size))
+      use #(header_cipher, payload_cipher) <- result.try(split_enc_header(
+        raw,
+        total_size,
+      ))
+      let keys = pkware_keys_from_password(pwd)
+      let #(header_plain, keys) =
+        pkware_decrypt_bytes(keys, header_cipher, <<>>)
+      let check = pkware_last_byte(header_plain)
+      let expected_check =
+        int.bitwise_and(int.bitwise_shift_right(expected_crc, 24), 0xFF)
+      use <- bool.guard(
+        when: check != expected_check,
+        return: Error(error.ArchiveInvalid(
+          message: "ZIP wrong password or corrupt encryption header for \""
+          <> name
+          <> "\"",
+        )),
+      )
+      let #(payload_plain, _keys) =
+        pkware_decrypt_bytes(keys, payload_cipher, <<>>)
+      Ok(#(0, total_size - 12, payload_plain))
+    }
+  }
+}
+
+// Split the encrypted slice into its 12-byte header and the payload
+// that follows.  Pulled out so `resolve_pkware_decryption` doesn't
+// stack `case bit_array.slice` branches and trip the deep-nesting
+// lint.
+fn split_enc_header(
+  raw: BitArray,
+  total_size: Int,
+) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+  case bit_array.slice(raw, 0, 12), bit_array.slice(raw, 12, total_size - 12) {
+    Ok(h), Ok(p) -> Ok(#(h, p))
+    Error(_), _ ->
+      Error(error.ArchiveInvalid(
+        message: "ZIP encryption header truncated (need ≥ 12 bytes)",
+      ))
+    _, Error(_) ->
+      Error(error.ArchiveInvalid(
+        message: "ZIP encrypted entry payload truncated",
+      ))
+  }
+}
+
+fn pkware_last_byte(bytes: BitArray) -> Int {
+  pkware_last_byte_loop(bytes, 0)
+}
+
+fn pkware_last_byte_loop(bytes: BitArray, last: Int) -> Int {
+  case bytes {
+    <<b, rest:bytes>> -> pkware_last_byte_loop(rest, b)
+    _ -> last
   }
 }
 
