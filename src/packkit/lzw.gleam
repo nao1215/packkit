@@ -204,7 +204,18 @@ fn dictionary_key(prefix: Int, byte: Int) -> Int {
 fn max_code_for(n_bits: Int, max_bits: Int) -> Int {
   case n_bits >= max_bits {
     True -> max_max_code(max_bits)
-    False -> int.bitwise_shift_left(1, n_bits) - 1
+    // Intermediate widths: BSD compress(1) uses `MAXCODE(n_bits) + 1`
+    // as the encoder's extcode (test `free_ent >= extcode`) and
+    // `MAXCODE(n_bits) - 1` as the decoder's maxcode (test
+    // `free_ent > maxcode`).  Both promote when free_ent crosses
+    // `(1 << n_bits) + 1` / `(1 << n_bits)` respectively — i.e. one
+    // step apart, with the decoder one iteration earlier.  Storing
+    // `(1 << n_bits)` here and using `>` for the encoder / `>=` for
+    // the decoder reproduces both boundaries exactly.  The historic
+    // `(1 << n_bits) - 1` was off-by-one in both directions and made
+    // packkit's `.Z` output undecodable by `uncompress(1)` once any
+    // width promotion was needed (visible at >= 256-byte payloads).
+    False -> int.bitwise_shift_left(1, n_bits)
   }
 }
 
