@@ -505,6 +505,12 @@ type ParsedHeader {
     substream_sizes: List(Int),
     file_names: List(String),
     empty_streams: List(Bool),
+    /// One bit per `empty_streams == True` entry: True means "empty
+    /// regular file", False means "directory".  The 7z EmptyFile NID
+    /// (0x0F) carries these bits; when the NID is absent the list is
+    /// empty and every empty-stream entry is treated as a directory
+    /// (the historical default before EmptyFile was honoured).
+    empty_files: List(Bool),
   )
 }
 
@@ -551,7 +557,11 @@ type HeaderStreams {
 
 type HeaderFiles {
   HeaderFilesNone
-  HeaderFilesParsed(names: List(String), empty_streams: List(Bool))
+  HeaderFilesParsed(
+    names: List(String),
+    empty_streams: List(Bool),
+    empty_files: List(Bool),
+  )
 }
 
 fn parse_header_body(
@@ -588,7 +598,7 @@ fn finalize_parsed_header(
 ) -> Result(ParsedHeader, error.ArchiveError) {
   case parser.streams, parser.files {
     HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
-      HeaderFilesParsed(names, empty_streams)
+      HeaderFilesParsed(names, empty_streams, empty_files)
     ->
       Ok(ParsedHeader(
         pack_pos: pack_pos,
@@ -598,6 +608,7 @@ fn finalize_parsed_header(
         substream_sizes: sub,
         file_names: names,
         empty_streams: empty_streams,
+        empty_files: empty_files,
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
       HeaderFilesNone
@@ -611,6 +622,7 @@ fn finalize_parsed_header(
           substream_sizes: sub,
           file_names: [],
           empty_streams: [],
+          empty_files: [],
         ),
       )
     _, _ ->
@@ -923,7 +935,7 @@ fn parse_files_info(
   bytes: BitArray,
 ) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
   use #(num_files, rest) <- result.try(read_number(bytes))
-  parse_files_loop(rest, num_files, [], [])
+  parse_files_loop(rest, num_files, [], [], [])
 }
 
 fn parse_files_loop(
@@ -931,6 +943,7 @@ fn parse_files_loop(
   num_files: Int,
   names: List(String),
   empty_streams: List(Bool),
+  empty_files: List(Bool),
 ) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
@@ -946,6 +959,7 @@ fn parse_files_loop(
                 [] -> list.repeat(False, num_files)
                 es -> es
               },
+              empty_files: empty_files,
             ),
             rest,
           ))
@@ -969,6 +983,7 @@ fn parse_files_loop(
             num_files,
             parsed_names,
             empty_streams,
+            empty_files,
           )
         }
         n if n == nid_empty_stream -> {
@@ -986,7 +1001,44 @@ fn parse_files_loop(
               bit_array.byte_size(after_size) - size,
             )
           let flags = bit_array_to_bool_list(payload, num_files, [])
-          parse_files_loop(after_payload, num_files, names, flags)
+          parse_files_loop(
+            after_payload,
+            num_files,
+            names,
+            flags,
+            empty_files,
+          )
+        }
+        n if n == nid_empty_file -> {
+          // EmptyFile's bit list has one bit per EmptyStream-flagged
+          // entry (i.e. per True value already collected into
+          // `empty_streams`).  Bit=1 means "empty regular file";
+          // bit=0 means "directory".  The payload itself is
+          // ceil(count/8) bytes when count > 0.  Per 7z spec the
+          // EmptyStream block always precedes EmptyFile, so
+          // `empty_streams` is populated by this point.
+          use #(size, after_size) <- result.try(read_number(rest))
+          use payload <- result.try(slice_required(
+            after_size,
+            0,
+            size,
+            "7z empty-file payload",
+          ))
+          let assert Ok(after_payload) =
+            bit_array.slice(
+              after_size,
+              size,
+              bit_array.byte_size(after_size) - size,
+            )
+          let empty_count = count_true(empty_streams)
+          let flags = bit_array_to_bool_list(payload, empty_count, [])
+          parse_files_loop(
+            after_payload,
+            num_files,
+            names,
+            empty_streams,
+            flags,
+          )
         }
         n
           if n == nid_dummy
@@ -994,7 +1046,6 @@ fn parse_files_loop(
           || n == nid_atime
           || n == nid_mtime
           || n == nid_win_attributes
-          || n == nid_empty_file
           || n == nid_anti
           || n == nid_start_pos
           || n == nid_comment
@@ -1006,7 +1057,13 @@ fn parse_files_loop(
               size,
               bit_array.byte_size(after_size) - size,
             )
-          parse_files_loop(after_payload, num_files, names, empty_streams)
+          parse_files_loop(
+            after_payload,
+            num_files,
+            names,
+            empty_streams,
+            empty_files,
+          )
         }
         _ ->
           Error(error.ArchiveInvalid(
@@ -1014,6 +1071,14 @@ fn parse_files_loop(
           ))
       }
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z FilesInfo"))
+  }
+}
+
+fn count_true(bits: List(Bool)) -> Int {
+  case bits {
+    [] -> 0
+    [True, ..rest] -> 1 + count_true(rest)
+    [False, ..rest] -> count_true(rest)
   }
 }
 
@@ -1587,6 +1652,7 @@ fn build_archive_entries(
     plain,
     parsed.file_names,
     parsed.empty_streams,
+    parsed.empty_files,
     parsed.substream_sizes,
     0,
     [],
@@ -1601,6 +1667,7 @@ fn build_entries_loop(
   plain: BitArray,
   names: List(String),
   empties: List(Bool),
+  empty_files: List(Bool),
   sizes: List(Int),
   consumed: Int,
   acc: List(entry.Entry),
@@ -1610,25 +1677,40 @@ fn build_entries_loop(
     [], _ -> Ok(list.reverse(acc))
     [name, ..rest_names], [is_empty, ..rest_empties] ->
       case is_empty {
-        True ->
-          add_directory(name, acc, limits)
+        True -> {
+          // EmptyFile bit (when present) flips the default classification
+          // from directory to empty regular file.  When EmptyFile is
+          // absent the list is exhausted and we keep the historical
+          // "directory" default.
+          let #(is_file, rest_empty_files) = case empty_files {
+            [bit, ..rest] -> #(bit, rest)
+            [] -> #(False, [])
+          }
+          let adder = case is_file {
+            True -> add_file(name, <<>>, acc, limits)
+            False -> add_directory(name, acc, limits)
+          }
+          adder
           |> result.try(fn(new_acc) {
             build_entries_loop(
               plain,
               rest_names,
               rest_empties,
+              rest_empty_files,
               sizes,
               consumed,
               new_acc,
               limits,
             )
           })
+        }
         False ->
           consume_one_file_body(
             plain,
             name,
             rest_names,
             rest_empties,
+            empty_files,
             sizes,
             consumed,
             acc,
@@ -1641,6 +1723,7 @@ fn build_entries_loop(
         name,
         rest_names,
         [],
+        empty_files,
         sizes,
         consumed,
         acc,
@@ -1654,6 +1737,7 @@ fn consume_one_file_body(
   name: String,
   rest_names: List(String),
   rest_empties: List(Bool),
+  empty_files: List(Bool),
   sizes: List(Int),
   consumed: Int,
   acc: List(entry.Entry),
@@ -1673,6 +1757,7 @@ fn consume_one_file_body(
       plain,
       rest_names,
       rest_empties,
+      empty_files,
       next_sizes,
       consumed + this_size,
       new_acc,
