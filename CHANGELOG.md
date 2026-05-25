@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Feature (zstd)**: the sequences encoder now also emits
+  `FSE_Compressed_Mode` for LL/OF/ML tables whenever the per-chunk
+  symbol distribution is biased enough that a chunk-specific FSE
+  distribution beats the predefined one.  Once a chunk has ≥ 32
+  sequences the encoder tallies the LL/ML/OF codes, normalises
+  each alphabet to a power-of-2 table size (accuracy_log chosen
+  per RFC 8478 §3.1.1.3.2.2.1.1 — capped at 9 / 8 / 9
+  respectively), builds the encoder state tables via the
+  decoder-side `fse.build_state_table` (so encoder and decoder
+  see identical layouts), and emits a distribution header
+  followed by the FSE bitstream.  When the resulting section
+  beats the Predefined_Mode candidate, the encoder switches to
+  the `0xA8` mode byte (all three alphabets at value 2 =
+  `FSE_Compressed_Mode`); otherwise it falls back to the
+  predefined-tables path with the original `0x00` mode byte.
+  Highly-biased inputs (e.g. an `ABCDX` motif x 100) now
+  compress to ~3 % of raw size; uniform inputs incur no overhead
+  because the comparison stage rejects the FSE-compressed
+  candidate whenever it would be larger.
 - **Feature (zstd)**: the LZ77 sequences encoder now threads the
   three-entry rep-offset ring (per RFC 8478 §3.1.1.5 — initial
   `(1, 4, 8)`) through every chunk, so matches whose real

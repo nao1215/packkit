@@ -1025,9 +1025,21 @@ fn adjust_normalized_at(
 // count codes, then padding to a byte boundary.  Mirrors the decoder
 // in `internal/huf.read_distribution` exactly.
 fn encode_fse_dist_header(normalized: List(Int), max_used: Int) -> BitArray {
-  let #(buf, bits, out) =
-    push_bits_unchecked(0, 0, <<>>, fse_weight_accuracy_log - 5, 4)
-  let table_size = fse_weight_table_size
+  encode_fse_dist_header_with_log(normalized, max_used, fse_weight_accuracy_log)
+}
+
+/// Generalised distribution-header writer.  `accuracy_log` chooses
+/// the table size (`1 << accuracy_log`) and the 4-bit `accuracy_log
+/// - 5` prefix; the rest mirrors the decoder's symmetric reader
+/// (variable-width per-symbol counts with the 2-bit zero-run codes
+/// when consecutive symbols have probability 0).
+fn encode_fse_dist_header_with_log(
+  normalized: List(Int),
+  max_used: Int,
+  accuracy_log: Int,
+) -> BitArray {
+  let #(buf, bits, out) = push_bits_unchecked(0, 0, <<>>, accuracy_log - 5, 4)
+  let table_size = int.bitwise_shift_left(1, accuracy_log)
   let normalized_dict = list_to_indexed_dict(normalized, 0, dict.new())
   let #(buf, bits, out) =
     write_dist_loop(
@@ -1036,7 +1048,7 @@ fn encode_fse_dist_header(normalized: List(Int), max_used: Int) -> BitArray {
       max_used,
       table_size + 1,
       table_size,
-      fse_weight_accuracy_log + 1,
+      accuracy_log + 1,
       False,
       buf,
       bits,
@@ -1952,31 +1964,26 @@ fn smallest_state_in(
 // `find_slot_for` (above, used by the weight-FSE encoder) already
 // covers the inverse lookup; reuse it instead of duplicating.
 
-/// Encode the FSE sequence bitstream in Predefined_Mode for all three
-/// alphabets.  Emits the bits in reverse decoder-read order so the
-/// resulting backward bitstream finalises with the standard
-/// "highest-set-bit of the last byte" marker.
-fn encode_sequence_fse_bitstream(sequences: List(ZstdSequence)) -> BitArray {
-  let ll_table = fse.predefined_literal_length_table()
-  let of_table = fse.predefined_offset_table()
-  let ml_table = fse.predefined_match_length_table()
-  let ll_log = fse.predefined_literal_length_log()
-  let of_log = fse.predefined_offset_log()
-  let ml_log = fse.predefined_match_length_log()
+/// Encode the FSE sequence bitstream using the supplied per-alphabet
+/// encoder lookups and accuracy logs.  Emits the bits in reverse
+/// decoder-read order so the resulting backward bitstream finalises
+/// with the standard "highest-set-bit of the last byte" marker.
+/// `seq_codes` is the forward-order list produced by
+/// `compute_seq_codes` (which already integrates rep-offset
+/// collapsing).
+fn encode_seq_fse_with_tables(
+  seq_codes: List(#(Int, Int, Int, Int, Int, Int)),
+  ll_slots: dict.Dict(Int, List(FseEncSlot)),
+  of_slots: dict.Dict(Int, List(FseEncSlot)),
+  ml_slots: dict.Dict(Int, List(FseEncSlot)),
+  ll_log: Int,
+  of_log: Int,
+  ml_log: Int,
+) -> BitArray {
   let ll_size = int.bitwise_shift_left(1, ll_log)
   let of_size = int.bitwise_shift_left(1, of_log)
   let ml_size = int.bitwise_shift_left(1, ml_log)
-  let ll_slots = build_seq_enc_slots(ll_table, ll_size)
-  let of_slots = build_seq_enc_slots(of_table, of_size)
-  let ml_slots = build_seq_enc_slots(ml_table, ml_size)
-
-  // Walk sequences in input order to compute (code, extra) triples
-  // for LL/ML/OF, threading the rep-offset triple (rep[0..2]) so
-  // recurring match distances collapse onto `raw_offset` 1, 2, or 3.
-  // The bit-emission loop below consumes the result in reverse.
-  let seq_codes_forward = compute_seq_codes(sequences, #(1, 4, 8), [])
-  let reversed = list.reverse(seq_codes_forward)
-
+  let reversed = list.reverse(seq_codes)
   case reversed {
     [] -> <<>>
     [first, ..rest] -> {
@@ -1993,10 +2000,9 @@ fn encode_sequence_fse_bitstream(sequences: List(ZstdSequence)) -> BitArray {
       let #(buf, bits, out) =
         push_bits_unchecked(buf, bits, out, ml0_e, fse.ml_extra_bits(ml0_c))
       let #(buf, bits, out) = push_bits_unchecked(buf, bits, out, of0_e, of0_c)
-      // Now process remaining sequences (which are the EARLIER seqs in
-      // input order — they each had an update step BEFORE the seq we
-      // just processed).  For each, push: update bits (OF, ML, LL)
-      // followed by the sequence's own extras (LL, ML, OF).
+      // Process remaining seqs in reverse-input order; each pushes
+      // its own state-update bits (OF, ML, LL in reverse) then its
+      // extras.
       let #(buf, bits, out, ll_state, of_state, ml_state) =
         seq_encode_loop(
           rest,
@@ -2021,6 +2027,268 @@ fn encode_sequence_fse_bitstream(sequences: List(ZstdSequence)) -> BitArray {
       let buf2 = int.bitwise_or(buf, int.bitwise_shift_left(1, bits))
       let bits2 = bits + 1
       flush_final_bits(buf2, bits2, out)
+    }
+  }
+}
+
+/// Predefined_Mode sequence section: count bytes, mode byte 0x00,
+/// FSE bitstream against the three predefined distributions.
+fn build_seq_section_predefined(
+  count_bytes: BitArray,
+  seq_codes: List(#(Int, Int, Int, Int, Int, Int)),
+) -> BitArray {
+  let ll_table = fse.predefined_literal_length_table()
+  let of_table = fse.predefined_offset_table()
+  let ml_table = fse.predefined_match_length_table()
+  let ll_log = fse.predefined_literal_length_log()
+  let of_log = fse.predefined_offset_log()
+  let ml_log = fse.predefined_match_length_log()
+  let ll_slots =
+    build_seq_enc_slots(ll_table, int.bitwise_shift_left(1, ll_log))
+  let of_slots =
+    build_seq_enc_slots(of_table, int.bitwise_shift_left(1, of_log))
+  let ml_slots =
+    build_seq_enc_slots(ml_table, int.bitwise_shift_left(1, ml_log))
+  let seq_bitstream =
+    encode_seq_fse_with_tables(
+      seq_codes,
+      ll_slots,
+      of_slots,
+      ml_slots,
+      ll_log,
+      of_log,
+      ml_log,
+    )
+  bit_array.concat([count_bytes, <<0x00>>, seq_bitstream])
+}
+
+// --- FSE_Compressed_Mode for all three sequence alphabets -----------
+
+const seq_alphabet_ll_max_symbol: Int = 35
+
+const seq_alphabet_of_max_symbol: Int = 31
+
+const seq_alphabet_ml_max_symbol: Int = 52
+
+const seq_alphabet_ll_max_log: Int = 9
+
+const seq_alphabet_of_max_log: Int = 8
+
+const seq_alphabet_ml_max_log: Int = 9
+
+/// Try to encode the sequence section using FSE_Compressed_Mode for
+/// LL/OF/ML.  Returns `None` when normalisation fails for any of the
+/// three alphabets — the caller falls back to Predefined_Mode.
+fn build_seq_section_fse_compressed(
+  count_bytes: BitArray,
+  seq_codes: List(#(Int, Int, Int, Int, Int, Int)),
+) -> Option(BitArray) {
+  let #(ll_counts, of_counts, ml_counts) =
+    tally_seq_alphabets(seq_codes, dict.new(), dict.new(), dict.new())
+  let total = list.length(seq_codes)
+  case
+    prep_alphabet(
+      ll_counts,
+      total,
+      seq_alphabet_ll_max_symbol,
+      seq_alphabet_ll_max_log,
+    ),
+    prep_alphabet(
+      of_counts,
+      total,
+      seq_alphabet_of_max_symbol,
+      seq_alphabet_of_max_log,
+    ),
+    prep_alphabet(
+      ml_counts,
+      total,
+      seq_alphabet_ml_max_symbol,
+      seq_alphabet_ml_max_log,
+    )
+  {
+    Ok(#(ll_norm, _ll_max, ll_log, ll_desc)),
+      Ok(#(of_norm, _of_max, of_log, of_desc)),
+      Ok(#(ml_norm, _ml_max, ml_log, ml_desc))
+    -> {
+      let ll_table = fse.build_state_table(ll_norm, ll_log)
+      let of_table = fse.build_state_table(of_norm, of_log)
+      let ml_table = fse.build_state_table(ml_norm, ml_log)
+      let ll_slots =
+        build_seq_enc_slots(ll_table, int.bitwise_shift_left(1, ll_log))
+      let of_slots =
+        build_seq_enc_slots(of_table, int.bitwise_shift_left(1, of_log))
+      let ml_slots =
+        build_seq_enc_slots(ml_table, int.bitwise_shift_left(1, ml_log))
+      let bitstream =
+        encode_seq_fse_with_tables(
+          seq_codes,
+          ll_slots,
+          of_slots,
+          ml_slots,
+          ll_log,
+          of_log,
+          ml_log,
+        )
+      // Mode byte: bits 7-6 = LL_mode, 5-4 = OF_mode, 3-2 = ML_mode,
+      // 1-0 = reserved (must be 0).  All three at FSE_Compressed_Mode
+      // (value 2) yields `0b10_10_10_00` = 0xA8.
+      let mode_byte = <<0xA8>>
+      Some(
+        bit_array.concat([
+          count_bytes,
+          mode_byte,
+          ll_desc,
+          of_desc,
+          ml_desc,
+          bitstream,
+        ]),
+      )
+    }
+    _, _, _ -> None
+  }
+}
+
+fn tally_seq_alphabets(
+  seq_codes: List(#(Int, Int, Int, Int, Int, Int)),
+  ll: dict.Dict(Int, Int),
+  of_acc: dict.Dict(Int, Int),
+  ml: dict.Dict(Int, Int),
+) -> #(dict.Dict(Int, Int), dict.Dict(Int, Int), dict.Dict(Int, Int)) {
+  case seq_codes {
+    [] -> #(ll, of_acc, ml)
+    [#(ll_c, ml_c, of_c, _, _, _), ..rest] -> {
+      let ll = dict.insert(ll, ll_c, bump_count(ll, ll_c))
+      let of_acc = dict.insert(of_acc, of_c, bump_count(of_acc, of_c))
+      let ml = dict.insert(ml, ml_c, bump_count(ml, ml_c))
+      tally_seq_alphabets(rest, ll, of_acc, ml)
+    }
+  }
+}
+
+fn bump_count(d: dict.Dict(Int, Int), key: Int) -> Int {
+  case dict.get(d, key) {
+    Ok(v) -> v + 1
+    Error(_) -> 1
+  }
+}
+
+// Prepare a single alphabet for FSE_Compressed_Mode emission.
+// Returns `(normalized, max_used, accuracy_log, description_bytes)`
+// or Error if the alphabet won't fit (single-symbol alphabets are
+// rejected — they're better served by RLE_Mode, which this encoder
+// doesn't emit yet, so they slip back to Predefined_Mode through
+// the caller's `None` fallback).
+fn prep_alphabet(
+  counts: dict.Dict(Int, Int),
+  total: Int,
+  max_symbol: Int,
+  max_log: Int,
+) -> Result(#(List(Int), Int, Int, BitArray), Nil) {
+  let max_used = highest_used_seq_code(counts, max_symbol)
+  case max_used < 0 {
+    True -> Error(Nil)
+    False -> {
+      // Pick the smallest accuracy_log that has enough state slots
+      // for the alphabet (>= max_used + 1 entries) but not larger
+      // than the RFC cap.
+      let log = pick_accuracy_log(max_used + 1, max_log)
+      let table_size = int.bitwise_shift_left(1, log)
+      case normalize_seq_counts(counts, total, max_used, table_size, log) {
+        Error(_) -> Error(Nil)
+        Ok(norm) -> {
+          let desc = encode_fse_dist_header_with_log(norm, max_used, log)
+          // Reject pathological single-state distributions where
+          // every symbol collapsed onto one position — accuracy_log
+          // must be >= 5 to satisfy the 4-bit `accuracy_log - 5`
+          // header field, and we already enforce that above.
+          Ok(#(norm, max_used, log, desc))
+        }
+      }
+    }
+  }
+}
+
+fn highest_used_seq_code(counts: dict.Dict(Int, Int), max_symbol: Int) -> Int {
+  dict.fold(counts, -1, fn(acc, sym, count) {
+    case count > 0 && sym > acc && sym <= max_symbol {
+      True -> sym
+      False -> acc
+    }
+  })
+}
+
+fn pick_accuracy_log(num_used_symbols: Int, cap: Int) -> Int {
+  pick_accuracy_log_loop(5, num_used_symbols, cap)
+}
+
+fn pick_accuracy_log_loop(log: Int, target: Int, cap: Int) -> Int {
+  case log >= cap {
+    True -> cap
+    False ->
+      case int.bitwise_shift_left(1, log) >= target {
+        True -> log
+        False -> pick_accuracy_log_loop(log + 1, target, cap)
+      }
+  }
+}
+
+fn normalize_seq_counts(
+  counts: dict.Dict(Int, Int),
+  total: Int,
+  max_used: Int,
+  table_size: Int,
+  _log: Int,
+) -> Result(List(Int), Nil) {
+  case total {
+    0 -> Error(Nil)
+    _ -> {
+      let raw =
+        build_floor_normalized_seq(counts, total, table_size, 0, max_used, [])
+      let sum = sum_int_list(raw, 0)
+      let diff = table_size - sum
+      case diff {
+        0 -> Ok(raw)
+        _ -> {
+          let idx = find_largest_count_index(counts, max_used)
+          case idx < 0 {
+            True -> Error(Nil)
+            False -> Ok(adjust_normalized_at(raw, idx, diff, 0, []))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn build_floor_normalized_seq(
+  counts: dict.Dict(Int, Int),
+  total: Int,
+  table_size: Int,
+  sym: Int,
+  max_used: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case sym > max_used {
+    True -> list.reverse(acc)
+    False -> {
+      let count = case dict.get(counts, sym) {
+        Ok(v) -> v
+        Error(_) -> 0
+      }
+      let normalized = case count {
+        0 -> 0
+        _ -> {
+          let scaled = count * table_size / total
+          case scaled {
+            0 -> 1
+            v -> v
+          }
+        }
+      }
+      build_floor_normalized_seq(counts, total, table_size, sym + 1, max_used, [
+        normalized,
+        ..acc
+      ])
     }
   }
 }
@@ -2123,14 +2391,31 @@ fn try_sequences_block(
     0 -> None
     _ -> {
       let literals_size = bit_array.byte_size(literals)
-      // Encode literals; pick the cheapest of Raw / RLE / Huffman.
       let literals_section =
         encode_literals_section_choice(literals, literals_size)
       let count_bytes = encode_sequences_count(num_sequences)
-      let mode_byte = <<0x00>>
-      let seq_bitstream = encode_sequence_fse_bitstream(sequences)
-      let sequence_section =
-        bit_array.concat([count_bytes, mode_byte, seq_bitstream])
+      let seq_codes = compute_seq_codes(sequences, #(1, 4, 8), [])
+      // Always available — Predefined_Mode produces a small, fixed
+      // header and works for every input.
+      let pre_section = build_seq_section_predefined(count_bytes, seq_codes)
+      // FSE_Compressed_Mode adds its own table descriptions to the
+      // section; only worth trying when there are enough sequences
+      // to amortise the ~10-30 byte description cost.
+      let sequence_section = case num_sequences >= 32 {
+        True ->
+          case build_seq_section_fse_compressed(count_bytes, seq_codes) {
+            Some(fse_section) ->
+              case
+                bit_array.byte_size(fse_section)
+                < bit_array.byte_size(pre_section)
+              {
+                True -> fse_section
+                False -> pre_section
+              }
+            None -> pre_section
+          }
+        False -> pre_section
+      }
       let block_body = bit_array.concat([literals_section, sequence_section])
       let block_body_size = bit_array.byte_size(block_body)
       // The block-header size field is 21 bits — comfortably large

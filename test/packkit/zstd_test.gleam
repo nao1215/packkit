@@ -194,6 +194,28 @@ pub fn encode_uses_fse_huffman_for_wide_alphabet_test() -> Nil {
   decoded |> should.equal(payload)
 }
 
+pub fn encode_picks_fse_compressed_mode_for_biased_sequences_test() -> Nil {
+  // `ABCDX` repeated 100 times: the 'X' separator breaks the LZ77
+  // match at every cycle, so the encoder emits ~99 short sequences
+  // all sharing the same LL/ML/OF codes (LL = 1, ML = 1 = length 4,
+  // OF = 0 → raw_offset 1 = rep[0]).  That's well above the 32-
+  // sequence threshold for trying FSE_Compressed_Mode, and the
+  // distribution is so biased that FSE_Compressed_Mode collapses
+  // to single-symbol tables with 0-bit transitions — a noticeable
+  // win over Predefined_Mode's broad fixed distributions.  The
+  // resulting block has to be tiny relative to the payload (< 5 %)
+  // and the chunk must still round-trip.
+  let payload = repeat_bytes(<<"ABCDX":utf8>>, 100)
+  let payload_size = bit_array.byte_size(payload)
+  let assert Ok(encoded) = zstd.encode(bytes: payload)
+  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  decoded |> should.equal(payload)
+  case bit_array.byte_size(encoded) * 20 < payload_size {
+    True -> Nil
+    False -> should.fail()
+  }
+}
+
 pub fn encode_uses_zstd_rep_match_for_recurring_distance_test() -> Nil {
   // A 4-byte motif repeated 200 times in a row: every match has the
   // same distance (4), so after the first emit every subsequent
