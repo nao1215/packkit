@@ -88,23 +88,37 @@ pub fn default_header() -> Header {
   Header(name: None, comment: None, modified_at_unix: None, extra: [])
 }
 
-/// Attach an optional filename.
+/// Attach an optional filename.  Panics if `name` contains the NUL
+/// byte gzip uses as the FNAME terminator — see [with_name_checked]
+/// when the value comes from untrusted input.
 ///
-/// **Warning:** gzip terminates the FNAME field with a NUL byte, so a
-/// name containing `\0` cannot round-trip — readers will truncate at
-/// the first NUL.  Prefer [with_name_checked] when the value comes
-/// from untrusted input; this unchecked counterpart silently strips
-/// embedded NULs so an already-validated string is still safe to pass.
+/// The unchecked variant guarantees that the value stored in the
+/// header is exactly what the caller passed (lawful round-trip via
+/// `name(with_name(h, x)) == Some(x)`).  Earlier revisions silently
+/// stripped NULs to "be helpful"; that broke the round-trip law and
+/// is now a panic, matching the other unchecked setters in this
+/// module ([with_modified_at] / [with_extra]) and across the package
+/// ([packkit/entry.with_mode] etc.).
 pub fn with_name(header: Header, name name: String) -> Header {
-  Header(..header, name: Some(string.replace(name, "\u{0000}", "")))
+  case with_name_checked(header, name: name) {
+    Ok(h) -> h
+    Error(_) ->
+      panic as "packkit/gzip.with_name: name must not contain NUL (0x00)"
+  }
 }
 
-/// Attach an optional comment.  See [with_name] for the NUL contract;
-/// embedded NULs are silently stripped.  Use [with_comment_checked]
-/// when callers may pass untrusted input that needs to round-trip
-/// faithfully.
+/// Attach an optional comment.  Panics if `comment` contains the NUL
+/// byte gzip uses as the FCOMMENT terminator — see
+/// [with_comment_checked] when the value comes from untrusted input.
+///
+/// Like [with_name], the stored value is exactly what the caller
+/// passed; earlier revisions silently stripped NULs.
 pub fn with_comment(header: Header, comment comment: String) -> Header {
-  Header(..header, comment: Some(string.replace(comment, "\u{0000}", "")))
+  case with_comment_checked(header, comment: comment) {
+    Ok(h) -> h
+    Error(_) ->
+      panic as "packkit/gzip.with_comment: comment must not contain NUL (0x00)"
+  }
 }
 
 /// Why a checked header constructor rejected an argument.
@@ -375,7 +389,17 @@ pub type Decoded {
   Decoded(header: Header, payload: BitArray)
 }
 
-/// Decode a gzip byte stream using default limits.
+/// Decode a gzip byte stream using default limits and return the
+/// rich [Decoded] record (header + payload).
+///
+/// `decode` is asymmetric with [encode]: `encode` takes payload bytes
+/// and emits a stream, while `decode` returns both the payload and the
+/// header.  The asymmetry is intentional — gzip is the only codec in
+/// the package that carries meaningful per-stream metadata (filename,
+/// comment, mtime), and surfacing it on the decode side is what makes
+/// `decode |> .header` useful.  When you only care about the payload
+/// and want the shape every other codec uses (`BitArray ->
+/// Result(BitArray, _)`), use [decode_payload].
 pub fn decode(bytes bytes: BitArray) -> Result(Decoded, error.CodecError) {
   decode_with_limits(bytes: bytes, limits: limit.default())
 }
@@ -384,6 +408,8 @@ pub fn decode(bytes bytes: BitArray) -> Result(Decoded, error.CodecError) {
 /// Parallels every other codec's `decode/1`, which returns
 /// `Result(BitArray, _)` — use this when you don't need the gzip
 /// header (mtime / filename / comment).
+///
+/// Law: `decode_payload(b) == decode(b) |> result.map(fn(d) { d.payload })`.
 pub fn decode_payload(
   bytes bytes: BitArray,
 ) -> Result(BitArray, error.CodecError) {

@@ -5,6 +5,22 @@
 //// the streaming shape the spec calls for - `new_*_decoder`, `push`,
 //// `finish` - so callers can already wire incremental pipelines even
 //// while the underlying codec decoders are still eager.
+////
+//// **Relationship to `packkit/codec.Codec`.**  The streaming
+//// constructors (`new_gzip_encoder`, `new_zstd_decoder`, ...) do NOT
+//// accept a `packkit/codec.Codec` value, so the per-codec `Level` /
+//// preset `Dictionary` settings carried by a `Codec` are not threaded
+//// through this API; every stream uses the codec's default encode
+//// strategy.  This is intentional: a `Codec` is the config object
+//// `packkit.compress` / `packkit.decompress` (the one-shot facade)
+//// consumes, while `packkit/stream` only ever invokes the codec
+//// module's bare `encode/1` / `decode/1` entry points.  Callers that
+//// need a non-default level or a preset dictionary should call the
+//// per-codec module directly (`gzip.encode_with_header`,
+//// `zlib.encode_with_dictionary`, `deflate.encode_dynamic`, …) and
+//// drive the chunking themselves until the streaming API grows
+//// codec-typed constructors.  The `Limits` value, by contrast, IS
+//// honoured incrementally — see [push] / [push_encoder].
 
 import gleam/bit_array
 import gleam/list
