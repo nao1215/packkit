@@ -136,6 +136,12 @@ const aes_low_nibble_mask: Int = 0x0F
 // each, so 16 bytes total per field (1 flag bit + 15 nibble).
 const aes_max_field_bytes: Int = 16
 
+// p7zip's `7z a -p<pw>` ships archives with this default iteration
+// count (2 ^ 19 = 524288).  The encoder hard-codes the same value so
+// archives produced by packkit are indistinguishable from p7zip's at
+// the KDF layer.
+const aes_default_num_cycles_power: Int = 19
+
 // NIDs from the 7z specification.
 const nid_end: Int = 0x00
 
@@ -269,6 +275,73 @@ pub fn encode_with_method(
   archive archive_value: archives.Archive,
   method method: Method,
 ) -> Result(BitArray, error.ArchiveError) {
+  do_encode(archive_value, method, option.None)
+}
+
+/// Encode a logical archive to a 7z byte stream with AES-256-CBC
+/// payload encryption (coder id `06 F1 07 01`).  Plumbed into the
+/// folder as a 2-coder chain `[AES, <method>]` so the existing
+/// `decode_with_password` path reads it back verbatim.
+///
+/// The encoder uses **empty salt** and **a 16-byte all-zero IV** for
+/// determinism — without an FFI into a platform CSPRNG there is no
+/// good source of randomness in pure Gleam.  This is fine for
+/// archives that go to a trusted recipient over an authenticated
+/// channel, but it is NOT a substitute for randomised encryption —
+/// two archives encrypted with the same password produce identical
+/// ciphertext blocks for identical plaintext prefixes, which leaks
+/// information about the payload.  If you need randomised
+/// encryption, encrypt the payload yourself before passing it in or
+/// pre-generate a 16-byte IV from a CSPRNG and feed it back through
+/// a future BYO-IV API.
+///
+/// The inner coder defaults to LZMA — matching what `7z a -p<pw>`
+/// emits — and the key derivation runs the canonical 2^19 = 524288
+/// SHA-256 iterations, which on the JS target is slow (multiple
+/// seconds per archive).
+pub fn encode_with_password(
+  archive archive_value: archives.Archive,
+  password password: String,
+) -> Result(BitArray, error.ArchiveError) {
+  encode_with_password_and_method(
+    archive: archive_value,
+    password: password,
+    method: lzma(),
+  )
+}
+
+/// Same as `encode_with_password` but lets the caller pick the inner
+/// coder (Copy / Deflate / BZip2 / LZMA).  Salt + IV are still empty /
+/// all-zero — see `encode_with_password` for the determinism caveat.
+pub fn encode_with_password_and_method(
+  archive archive_value: archives.Archive,
+  password password: String,
+  method method: Method,
+) -> Result(BitArray, error.ArchiveError) {
+  let spec =
+    EncryptionSpec(
+      password: password,
+      salt: <<>>,
+      iv: <<0:size(128)>>,
+      num_cycles_power: aes_default_num_cycles_power,
+    )
+  do_encode(archive_value, method, option.Some(spec))
+}
+
+type EncryptionSpec {
+  EncryptionSpec(
+    password: String,
+    salt: BitArray,
+    iv: BitArray,
+    num_cycles_power: Int,
+  )
+}
+
+fn do_encode(
+  archive_value: archives.Archive,
+  method: Method,
+  encryption: Option(EncryptionSpec),
+) -> Result(BitArray, error.ArchiveError) {
   let entries = archives.entries(archive_value)
   case entries {
     [] ->
@@ -276,13 +349,14 @@ pub fn encode_with_method(
         path: "<archive>",
         reason: "7z encoder requires at least one entry",
       ))
-    _ -> encode_entries(entries, method)
+    _ -> encode_entries(entries, method, encryption)
   }
 }
 
 fn encode_entries(
   entries: List(entry.Entry),
   method: Method,
+  encryption: Option(EncryptionSpec),
 ) -> Result(BitArray, error.ArchiveError) {
   use _ <- result.try(validate_entries_for_encode(entries))
 
@@ -292,11 +366,20 @@ fn encode_entries(
   let total_unpack = sum_list(unpack_sizes, 0)
   let concatenated = bit_array.concat(bodies)
 
-  use #(compressed, coder_def) <- result.try(encode_via_method(
+  use #(inner_packed, inner_coder_def) <- result.try(encode_via_method(
     concatenated,
     method,
   ))
-  let pack_size = bit_array.byte_size(compressed)
+  let inner_packed_size = bit_array.byte_size(inner_packed)
+
+  use #(packed, folder_inner) <- result.try(maybe_wrap_with_aes(
+    inner_packed,
+    inner_coder_def,
+    inner_packed_size,
+    total_unpack,
+    encryption,
+  ))
+  let pack_size = bit_array.byte_size(packed)
 
   // -- PackInfo ----------------------------------------------------
   let pack_info_body =
@@ -315,17 +398,14 @@ fn encode_entries(
       // num_folders = 1, external = inline.
       write_varint(1),
       <<0x00>>,
-      // num_coders = 1.
-      write_varint(1),
-      // Coder definition (flags + id + optional attrs); per-method.
-      coder_def,
+      folder_inner.folder_coders_block,
     ])
   let unpack_info_body =
     bit_array.concat([
       <<nid_folder>>,
       folder_def,
       <<nid_coders_unpack_size>>,
-      write_varint(total_unpack),
+      folder_inner.coders_unpack_sizes_block,
       <<nid_end>>,
     ])
   let unpack_info = <<nid_unpack_info, unpack_info_body:bits>>
@@ -400,7 +480,7 @@ fn encode_entries(
       post_signature_20,
     ])
 
-  Ok(bit_array.concat([signature_header, compressed, next_header]))
+  Ok(bit_array.concat([signature_header, packed, next_header]))
 }
 
 fn validate_entries_for_encode(
@@ -485,6 +565,158 @@ fn encode_via_method(
       Ok(#(compressed, coder_def))
     }
   }
+}
+
+// Per-folder serialised pieces produced by `maybe_wrap_with_aes`.
+// `folder_coders_block` is the `<num_coders> <coder_defs...> <bind_pairs>`
+// chunk that follows the `external=0x00` flag inside the folder def.
+// `coders_unpack_sizes_block` is the concatenated varint stream the
+// `kCodersUnPackSize` (0x0C) NID expects — one varint per coder
+// output (in linear-chain order).
+type FolderEncoding {
+  FolderEncoding(
+    folder_coders_block: BitArray,
+    coders_unpack_sizes_block: BitArray,
+  )
+}
+
+// Wrap `inner_packed` in an AES-CBC layer when `encryption` is `Some`;
+// pass through unchanged when it is `None`.  Returns the packed bytes
+// to splice into the archive AND the matching folder header pieces.
+fn maybe_wrap_with_aes(
+  inner_packed: BitArray,
+  inner_coder_def: BitArray,
+  inner_packed_size: Int,
+  total_unpack: Int,
+  encryption: Option(EncryptionSpec),
+) -> Result(#(BitArray, FolderEncoding), error.ArchiveError) {
+  case encryption {
+    option.None ->
+      Ok(#(
+        inner_packed,
+        FolderEncoding(
+          folder_coders_block: bit_array.concat([
+            write_varint(1),
+            inner_coder_def,
+          ]),
+          coders_unpack_sizes_block: write_varint(total_unpack),
+        ),
+      ))
+    option.Some(spec) -> {
+      use key <- result.try(derive_aes_key(
+        password: spec.password,
+        salt: spec.salt,
+        num_cycles_power: spec.num_cycles_power,
+      ))
+      use ciphertext <- result.try(aes_cbc_encrypt(inner_packed, key, spec.iv))
+      use aes_coder_def <- result.try(build_aes_coder_def(spec))
+      let folder_coders_block =
+        bit_array.concat([
+          // 2 coders: AES then the inner method.
+          write_varint(2),
+          aes_coder_def,
+          inner_coder_def,
+          // One bind pair: in_idx=1 (inner coder input) ← out_idx=0
+          // (AES coder output).  NumPackedStreams = NumInStreams -
+          // NumBindPairs = 2 - 1 = 1, so the packed-stream index list
+          // is omitted (matches what `parse_one_folder` expects).
+          write_varint(1),
+          write_varint(0),
+        ])
+      let coders_unpack_sizes_block =
+        bit_array.concat([
+          // Coder 0 (AES) outputs the inner-packed stream verbatim
+          // once the trailing padding is sliced off.  The decoder
+          // uses *this* size to pick the slice length, so we record
+          // the un-padded LZMA / Deflate / BZip2 / Copy length.
+          write_varint(inner_packed_size),
+          // Coder 1 (inner) outputs the total concatenated bodies.
+          write_varint(total_unpack),
+        ])
+      Ok(#(
+        ciphertext,
+        FolderEncoding(folder_coders_block:, coders_unpack_sizes_block:),
+      ))
+    }
+  }
+}
+
+// Serialise the AES-256-CBC coder definition: a 0x24 flags byte
+// (id_size=4, has_attrs), the 4-byte coder id `06 F1 07 01`, then a
+// varint with the AES properties length, then the properties
+// themselves (numCyclesPower / flags / optional second byte / salt /
+// iv).
+fn build_aes_props_tail(
+  salt: BitArray,
+  iv: BitArray,
+  salt_extra: Int,
+  iv_extra: Int,
+) -> BitArray {
+  let second_byte =
+    int.bitwise_or(
+      int.bitwise_shift_left(salt_extra, aes_high_nibble_shift),
+      iv_extra,
+    )
+  <<second_byte, salt:bits, iv:bits>>
+}
+
+fn build_aes_coder_def(
+  spec: EncryptionSpec,
+) -> Result(BitArray, error.ArchiveError) {
+  let salt_size = bit_array.byte_size(spec.salt)
+  let iv_size = bit_array.byte_size(spec.iv)
+  use <- bool.guard(
+    when: salt_size > aes_max_field_bytes || iv_size > aes_max_field_bytes,
+    return: Error(error.ArchiveInvalid(
+      message: "7z AES encoder: salt or iv exceeds 16 bytes",
+    )),
+  )
+  use <- bool.guard(
+    when: spec.num_cycles_power < 0
+      || spec.num_cycles_power >= aes_num_cycles_mask,
+    return: Error(error.ArchiveInvalid(
+      message: "7z AES encoder: numCyclesPower must be in 0..62 (0x3F is reserved)",
+    )),
+  )
+  let salt_flag = salt_size > 0
+  let iv_flag = iv_size > 0
+  // Multiply by `flag_to_int` to set / clear the mask bits without a
+  // `case True/False` (which would trip the `prefer_guard_clause`
+  // lint).  `flag_to_int(True) = 1`, `flag_to_int(False) = 0`.
+  let first_byte =
+    int.bitwise_or(
+      spec.num_cycles_power,
+      int.bitwise_or(
+        aes_salt_flag_mask * flag_to_int(salt_flag),
+        aes_iv_flag_mask * flag_to_int(iv_flag),
+      ),
+    )
+  let props_after_first = case salt_flag || iv_flag {
+    False -> <<>>
+    True ->
+      build_aes_props_tail(
+        spec.salt,
+        spec.iv,
+        salt_size - flag_to_int(salt_flag),
+        iv_size - flag_to_int(iv_flag),
+      )
+  }
+  let props = <<first_byte, props_after_first:bits>>
+  let props_size = bit_array.byte_size(props)
+  Ok(
+    bit_array.concat([
+      // flags = 0x24 (id_size=4, has_attrs).
+      <<0x24>>,
+      <<
+        aes_coder_id_byte_0,
+        aes_coder_id_byte_1,
+        aes_coder_id_byte_2,
+        aes_coder_id_byte_3,
+      >>,
+      write_varint(props_size),
+      props,
+    ]),
+  )
 }
 
 fn build_sub_streams_info(unpack_sizes: List(Int)) -> BitArray {
@@ -773,7 +1005,7 @@ fn decode_internal(
   ))
   use header <- result.try(case next_header_bytes {
     <<n, rest:bytes>> if n == nid_encoded_header ->
-      decode_encoded_header(rest, bytes, limits)
+      decode_encoded_header(rest, bytes, password, limits)
     _ -> Ok(next_header_bytes)
   })
   use parsed <- result.try(parse_header(header))
@@ -785,6 +1017,7 @@ fn decode_internal(
 fn decode_encoded_header(
   bytes_after_nid: BitArray,
   full_archive: BitArray,
+  password: Option(String),
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
   // The encoded-header body is a StreamsInfo block describing the
@@ -819,12 +1052,12 @@ fn decode_encoded_header(
         pack_size,
         "7z encoded-header packed bytes",
       ))
-      // Encoded next-header decoding never carries a user password —
-      // header encryption (`-mhe=on`) is out of scope for now, and a
-      // legitimate non-encrypted encoded next-header is always
-      // LZMA-coded.  Threading `option.None` here keeps the AES branch
-      // unreachable on this path.
-      decode_folder(packed, folder, unpack_sizes, option.None, limits)
+      // `password` is forwarded so that header-encryption archives
+      // (`7z a -p<pw> -mhe=on ...`) — which wrap the next header in an
+      // AES coder chain just like a regular folder — decrypt
+      // transparently.  Archives without an AES coder in the encoded
+      // header's folder ignore the password.
+      decode_folder(packed, folder, unpack_sizes, password, limits)
     }
   }
 }
@@ -2570,6 +2803,60 @@ fn utf16le_append_codepoint(scalar: Int, acc: BitArray) -> BitArray {
   let high = 0xD800 + int.bitwise_shift_right(adjusted, 10)
   let low = 0xDC00 + int.bitwise_and(adjusted, 0x3FF)
   <<acc:bits, high:little-size(16), low:little-size(16)>>
+}
+
+// AES-CBC encryption: pad `plaintext` to a 16-byte boundary with
+// zeros, then for each 16-byte block XOR it with the previous
+// ciphertext block (or `iv` for the first) and AES-encrypt the
+// result.  The 7z format does not specify a particular padding
+// scheme — p7zip simply zero-pads up to the next 16-byte boundary
+// and records the un-padded length in `CodersUnPackSize` so the
+// decoder can trim it back, and that's what we do too.
+fn aes_cbc_encrypt(
+  plaintext: BitArray,
+  key: aes.ExpandedKey,
+  iv: BitArray,
+) -> Result(BitArray, error.ArchiveError) {
+  let plaintext_size = bit_array.byte_size(plaintext)
+  let remainder = int.bitwise_and(plaintext_size, aes_block_size - 1)
+  let padding_bytes = case remainder {
+    0 -> 0
+    used -> aes_block_size - used
+  }
+  let padding = case padding_bytes {
+    0 -> <<>>
+    _ -> <<0:size({ padding_bytes * 8 })>>
+  }
+  let padded = <<plaintext:bits, padding:bits>>
+  aes_cbc_encrypt_loop(padded, key, iv_or_zero(iv), <<>>)
+}
+
+fn aes_cbc_encrypt_loop(
+  plaintext: BitArray,
+  key: aes.ExpandedKey,
+  prev_block: BitArray,
+  acc: BitArray,
+) -> Result(BitArray, error.ArchiveError) {
+  case plaintext {
+    <<>> -> Ok(acc)
+    <<block:bytes-size(16), rest:bytes>> -> {
+      let xored = xor_bit_arrays(block, prev_block)
+      use ciphertext_block <- result.try(
+        aes.encrypt_block(key, xored)
+        |> result.replace_error(error.ArchiveInvalid(
+          message: "7z AES encrypt_block rejected a 16-byte plaintext block",
+        )),
+      )
+      aes_cbc_encrypt_loop(rest, key, ciphertext_block, <<
+        acc:bits,
+        ciphertext_block:bits,
+      >>)
+    }
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES plaintext tail shorter than 16 bytes after padding",
+      ))
+  }
 }
 
 // AES-CBC decryption: split `ciphertext` into 16-byte blocks, decrypt
