@@ -5,6 +5,7 @@
 //// Erlang and JavaScript targets.
 
 import gleam/bit_array
+import gleam/bool
 import gleam/int
 import gleam/list
 
@@ -787,14 +788,14 @@ pub fn hmac_sha1(key key: BitArray, data data: BitArray) -> BitArray {
   let key_block = hmac_sha1_prepare_key(key)
   let outer_pad = xor_with_byte(key_block, 0x5C)
   let inner_pad = xor_with_byte(key_block, 0x36)
-  let inner = sha1(bit_array.concat([inner_pad, data]))
-  sha1(bit_array.concat([outer_pad, inner]))
+  let inner = sha1(data: bit_array.concat([inner_pad, data]))
+  sha1(data: bit_array.concat([outer_pad, inner]))
 }
 
 fn hmac_sha1_prepare_key(key: BitArray) -> BitArray {
   let key_size = bit_array.byte_size(key)
   let normalised = case key_size > hmac_sha1_block_size {
-    True -> sha1(key)
+    True -> sha1(data: key)
     False -> key
   }
   let normalised_size = bit_array.byte_size(normalised)
@@ -838,8 +839,14 @@ pub fn pbkdf2_hmac_sha1(
 ) -> BitArray {
   let block_count = { dk_len + 19 } / 20
   let raw = pbkdf2_blocks(password, salt, iterations, block_count, 1, <<>>)
-  let assert Ok(truncated) = bit_array.slice(raw, 0, dk_len)
-  truncated
+  // `pbkdf2_blocks` always emits `block_count * 20 >= dk_len` bytes
+  // (block_count = ceil(dk_len / 20)), so the slice is in-bounds by
+  // construction; the `Error` arm only fires on an unreachable
+  // negative dk_len which `bit_array.slice` would reject.
+  case bit_array.slice(raw, 0, dk_len) {
+    Ok(truncated) -> truncated
+    Error(_) -> raw
+  }
 }
 
 fn pbkdf2_blocks(
@@ -850,20 +857,16 @@ fn pbkdf2_blocks(
   index: Int,
   acc: BitArray,
 ) -> BitArray {
-  case index > block_count {
-    True -> acc
-    False -> {
-      let block = pbkdf2_one_block(password, salt, iterations, index)
-      pbkdf2_blocks(
-        password,
-        salt,
-        iterations,
-        block_count,
-        index + 1,
-        bit_array.concat([acc, block]),
-      )
-    }
-  }
+  use <- bool.guard(when: index > block_count, return: acc)
+  let block = pbkdf2_one_block(password, salt, iterations, index)
+  pbkdf2_blocks(
+    password,
+    salt,
+    iterations,
+    block_count,
+    index + 1,
+    bit_array.concat([acc, block]),
+  )
 }
 
 fn pbkdf2_one_block(
@@ -873,7 +876,10 @@ fn pbkdf2_one_block(
   index: Int,
 ) -> BitArray {
   let initial =
-    hmac_sha1(password, bit_array.concat([salt, <<index:size(32)-big>>]))
+    hmac_sha1(
+      key: password,
+      data: bit_array.concat([salt, <<index:size(32)-big>>]),
+    )
   pbkdf2_iterate(password, initial, initial, iterations - 1)
 }
 
@@ -886,7 +892,7 @@ fn pbkdf2_iterate(
   case remaining {
     0 -> accumulator
     _ -> {
-      let next = hmac_sha1(password, previous)
+      let next = hmac_sha1(key: password, data: previous)
       pbkdf2_iterate(
         password,
         next,

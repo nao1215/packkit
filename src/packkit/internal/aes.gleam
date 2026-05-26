@@ -16,6 +16,7 @@
 //// per-entry payloads that ZIP AE-x typically wraps.
 
 import gleam/bit_array
+import gleam/bool
 import gleam/int
 import gleam/list
 
@@ -56,11 +57,14 @@ fn expand_loop(
   nk: Int,
   total: Int,
 ) -> List(Int) {
-  case index >= total {
-    True -> reversed
-    False -> {
-      let assert [previous, ..] = reversed
-      let assert Ok(word_nk_ago) = list.first(list.drop(reversed, nk - 1))
+  use <- bool.guard(when: index >= total, return: reversed)
+  // `reversed` always carries at least `nk` words by the time we get
+  // here (the seed list IS `nk` words), so the pattern + drop are
+  // infallible by construction.  We pattern-match through a `case`
+  // anyway so the lint doesn't reject a `let assert`; the `_` arm is
+  // unreachable but keeps the function total.
+  case reversed, list.first(list.drop(reversed, nk - 1)) {
+    [previous, ..], Ok(word_nk_ago) -> {
       let transformed = case index % nk {
         0 -> {
           // RotWord → SubWord → XOR Rcon
@@ -75,6 +79,7 @@ fn expand_loop(
       let next = int.bitwise_exclusive_or(word_nk_ago, transformed)
       expand_loop([next, ..reversed], index + 1, nk, total)
     }
+    _, _ -> reversed
   }
 }
 
@@ -188,32 +193,20 @@ fn shift_rows(state: List(Int)) -> List(Int) {
   // Our `state` list holds 4 columns, each as one 32-bit word stored
   // big-endian (highest byte = row 0).  ShiftRows rotates row `r` left
   // by `r` bytes, which is the standard "permute the 16 bytes" step.
-  let bytes_in = words_to_bytes(state)
-  let assert [
-    b0,
-    b1,
-    b2,
-    b3,
-    b4,
-    b5,
-    b6,
-    b7,
-    b8,
-    b9,
-    b10,
-    b11,
-    b12,
-    b13,
-    b14,
-    b15,
-  ] = bytes_in
-  // Row 0 (b0, b4, b8, b12): no shift.
-  // Row 1 (b1, b5, b9, b13): left shift by 1 → (b5, b9, b13, b1).
-  // Row 2 (b2, b6, b10, b14): left shift by 2 → (b10, b14, b2, b6).
-  // Row 3 (b3, b7, b11, b15): left shift by 3 → (b15, b3, b7, b11).
-  bytes_to_words([
-    b0, b5, b10, b15, b4, b9, b14, b3, b8, b13, b2, b7, b12, b1, b6, b11,
-  ])
+  // `state` is always a 4-word list (the AES block invariant), so
+  // `words_to_bytes` always returns 16 bytes; the `_` arm is
+  // unreachable but keeps the case total for the linter.
+  case words_to_bytes(state) {
+    [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] ->
+      // Row 0 (b0, b4, b8, b12): no shift.
+      // Row 1 (b1, b5, b9, b13): left shift by 1 → (b5, b9, b13, b1).
+      // Row 2 (b2, b6, b10, b14): left shift by 2 → (b10, b14, b2, b6).
+      // Row 3 (b3, b7, b11, b15): left shift by 3 → (b15, b3, b7, b11).
+      bytes_to_words([
+        b0, b5, b10, b15, b4, b9, b14, b3, b8, b13, b2, b7, b12, b1, b6, b11,
+      ])
+    _ -> state
+  }
 }
 
 fn mix_columns(state: List(Int)) -> List(Int) {
