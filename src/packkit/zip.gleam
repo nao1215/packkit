@@ -1005,25 +1005,67 @@ fn find_unix_uid_gid_in_extra(extra: BitArray) -> Option(#(Int, Int)) {
 }
 
 fn find_unix_uid_gid_new(extra: BitArray) -> Option(#(Int, Int)) {
-  case find_extra_field(extra, unix_uid_gid_new_extra_id) {
+  use body <- option_try(find_extra_field(extra, unix_uid_gid_new_extra_id))
+  parse_unix_uid_gid_new_body(body)
+}
+
+// Parse the body of a UID/GID extra (everything after the
+// header_id + size pair).  Layout:
+//   1 byte version (ignored — packkit only checks the field is
+//                   well-formed, not the version)
+//   1 byte uid_size + uid_size bytes UID
+//   1 byte gid_size + gid_size bytes GID
+fn parse_unix_uid_gid_new_body(body: BitArray) -> Option(#(Int, Int)) {
+  case body {
+    <<_version, uid_size, rest:bytes>> -> parse_uid_then_gid(rest, uid_size)
+    _ -> None
+  }
+}
+
+fn parse_uid_then_gid(rest: BitArray, uid_size: Int) -> Option(#(Int, Int)) {
+  use #(uid, after_uid) <- option_try_pair(decode_unix_uid_gid_value(
+    rest,
+    uid_size,
+  ))
+  parse_gid_field(after_uid, uid)
+}
+
+fn parse_gid_field(after_uid: BitArray, uid: Int) -> Option(#(Int, Int)) {
+  case after_uid {
+    <<gid_size, gid_rest:bytes>> -> parse_gid_value(gid_rest, gid_size, uid)
+    _ -> None
+  }
+}
+
+fn parse_gid_value(
+  gid_rest: BitArray,
+  gid_size: Int,
+  uid: Int,
+) -> Option(#(Int, Int)) {
+  use #(gid, _) <- option_try_pair(decode_unix_uid_gid_value(gid_rest, gid_size))
+  Some(#(uid, gid))
+}
+
+// Tiny `use`-style helpers so the parsers above can early-return
+// on None without an explicit nested case.  Mirrors `result.try`
+// but for `Option`-returning callees.
+fn option_try(
+  source: Result(a, b),
+  continuation: fn(a) -> Option(c),
+) -> Option(c) {
+  case source {
+    Ok(value) -> continuation(value)
     Error(_) -> None
-    Ok(body) ->
-      case body {
-        <<_version, uid_size, rest:bytes>> ->
-          case decode_unix_uid_gid_value(rest, uid_size) {
-            None -> None
-            Some(#(uid, after_uid)) ->
-              case after_uid {
-                <<gid_size, gid_rest:bytes>> ->
-                  case decode_unix_uid_gid_value(gid_rest, gid_size) {
-                    None -> None
-                    Some(#(gid, _)) -> Some(#(uid, gid))
-                  }
-                _ -> None
-              }
-          }
-        _ -> None
-      }
+  }
+}
+
+fn option_try_pair(
+  source: Option(a),
+  continuation: fn(a) -> Option(c),
+) -> Option(c) {
+  case source {
+    Some(value) -> continuation(value)
+    None -> None
   }
 }
 
