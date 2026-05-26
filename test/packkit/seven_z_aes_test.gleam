@@ -65,14 +65,18 @@ pub fn decode_with_wrong_password_surfaces_typed_error_test() -> Nil {
   // with a typed `ArchiveInvalid` — what matters is we don't panic.
   let archive_bytes = fixture_bytes()
 
-  case
+  let outcome =
     seven_z.decode_with_password(
       bytes: archive_bytes,
       password: "wrong-password",
     )
-  {
-    Error(_) -> Nil
+
+  // We only care that the outcome is `Error(_)`; the specific typed
+  // error varies (LZMA2 usually surfaces ArchiveInvalid, but the
+  // codec layer is free to pick a sharper error in future).
+  case outcome {
     Ok(_) -> should.fail()
+    _ -> Nil
   }
 }
 

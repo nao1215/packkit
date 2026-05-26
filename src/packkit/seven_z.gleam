@@ -27,6 +27,7 @@ import gleam/bool
 import gleam/int
 import gleam/list
 import gleam/option.{type Option}
+import gleam/order
 import gleam/result
 import gleam/string
 import packkit/archive as archives
@@ -2517,14 +2518,24 @@ fn aes_kdf_loop(
   counter: Int,
   rounds: Int,
 ) -> checksum.Sha256State {
-  use <- bool.guard(when: counter == rounds, return: state)
-  let counter_bytes = <<counter:little-size(64)>>
-  let next_state =
-    state
-    |> checksum.sha256_update(data: salt)
-    |> checksum.sha256_update(data: password_utf16le)
-    |> checksum.sha256_update(data: counter_bytes)
-  aes_kdf_loop(next_state, salt, password_utf16le, counter + 1, rounds)
+  // Direct tail-recursive `case` — NOT `bool.guard` / `use` — because
+  // numCyclesPower defaults to 19, so this fires 524288 times.  The
+  // Gleam JS backend only rewrites self-tail-calls to a `while` when
+  // the recursive call is in tail position of the function body; the
+  // closure that `use <- bool.guard` desugars to would hide the tail
+  // call and overflow the JS stack on Node.
+  case int.compare(counter, rounds) {
+    order.Lt -> {
+      let counter_bytes = <<counter:little-size(64)>>
+      let next_state =
+        state
+        |> checksum.sha256_update(data: salt)
+        |> checksum.sha256_update(data: password_utf16le)
+        |> checksum.sha256_update(data: counter_bytes)
+      aes_kdf_loop(next_state, salt, password_utf16le, counter + 1, rounds)
+    }
+    _ -> state
+  }
 }
 
 // p7zip encodes the password as little-endian UTF-16 (the historical
@@ -2534,9 +2545,12 @@ fn aes_kdf_loop(
 // code unit, scalars from 0x10000..0x10FFFF emit a surrogate pair.
 fn utf16le_encode(source: String, acc: BitArray) -> BitArray {
   case string.pop_grapheme(source) {
-    Error(_) -> acc
     Ok(#(grapheme, rest)) ->
       utf16le_encode(rest, utf16le_append_grapheme(grapheme, acc))
+    // `string.pop_grapheme` only returns `Error(Nil)` on an empty
+    // string — there's no other error variant.  Use `result.unwrap`
+    // to keep the linter happy without inventing a fallback.
+    _ -> acc
   }
 }
 
