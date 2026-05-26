@@ -462,3 +462,87 @@ pub fn decode_deflate_coder_rejects_corrupted_stream_test() -> Nil {
     _ -> should.fail()
   }
 }
+
+// -- entry mtime (Windows FILETIME) round-trip ------------------------
+//
+// Before the nid_mtime (0x14) wiring, `seven_z.encode` discarded
+// every entry's `modified_at_unix` and the decoder ignored the
+// Mtime block produced by `7z a -mtm=on`.  These tests pin the new
+// behaviour: any positive Unix mtime survives encode->decode at
+// 1-second resolution, archives with no mtime stay at 0 (no block
+// emitted), and a system-tool fixture decodes at the right second.
+
+pub fn roundtrip_preserves_seven_z_entry_mtime_test() -> Nil {
+  let stamped =
+    entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
+    |> entry.with_modified_at(unix_seconds: 1_749_990_896)
+  let archive_value = archive.add(seven_z.new(), entry: stamped)
+  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
+  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
+  case archive.entries(decoded) {
+    [restored] -> {
+      restored
+      |> entry.metadata
+      |> entry.modified_at_unix
+      |> should.equal(1_749_990_896)
+    }
+    _ -> should.fail()
+  }
+}
+
+pub fn roundtrip_seven_z_without_mtime_skips_mtime_block_test() -> Nil {
+  // An archive whose entries carry no mtime must not emit the
+  // optional Mtime block — the round-trip output stays bit-stable
+  // against the pre-mtime encoder, and the decoded entry retains
+  // `modified_at_unix = 0`.
+  let plain = entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
+  let archive_value = archive.add(seven_z.new(), entry: plain)
+  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
+  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
+  case archive.entries(decoded) {
+    [restored] -> {
+      restored
+      |> entry.metadata
+      |> entry.modified_at_unix
+      |> should.equal(0)
+    }
+    _ -> should.fail()
+  }
+}
+
+pub fn decodes_system_seven_z_with_mtime_test() -> Nil {
+  // `touch -d '2025-06-15 12:34:56 UTC' greeting.txt && 7z a -mtm=on
+  //  greeting.7z greeting.txt` (p7zip 23.01).  The Mtime block uses
+  // the all-defined form (flag byte = 1, external = 0) and packs a
+  // single 8-byte little-endian Windows FILETIME = 0x01DBDDF1E6681800
+  // — exactly (1_749_990_896 + 11_644_473_600) × 10_000_000.
+  let fixture = <<
+    0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04, 0x6F, 0x4A, 0x7D, 0x02,
+    0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xD8, 0x50, 0x7E, 0x5A, 0x01, 0x00, 0x0A, 0x6D,
+    0x74, 0x69, 0x6D, 0x65, 0x20, 0x74, 0x65, 0x73, 0x74, 0x0A, 0x00, 0x01,
+    0x04, 0x06, 0x00, 0x01, 0x09, 0x0F, 0x00, 0x07, 0x0B, 0x01, 0x00, 0x01,
+    0x21, 0x21, 0x01, 0x00, 0x0C, 0x0B, 0x00, 0x08, 0x0A, 0x01, 0x0B, 0x69,
+    0xF2, 0x97, 0x00, 0x00, 0x05, 0x01, 0x19, 0x0C, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x1B, 0x00, 0x67,
+    0x00, 0x72, 0x00, 0x65, 0x00, 0x65, 0x00, 0x74, 0x00, 0x69, 0x00, 0x6E,
+    0x00, 0x67, 0x00, 0x2E, 0x00, 0x74, 0x00, 0x78, 0x00, 0x74, 0x00, 0x00,
+    0x00, 0x19, 0x00, 0x14, 0x0A, 0x01, 0x00, 0x00, 0x18, 0x68, 0xE6, 0xF1,
+    0xDD, 0xDB, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xA4, 0x81, 0x00,
+    0x00,
+  >>
+  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
+  case archive.entries(decoded) {
+    [single] -> {
+      entry.to_string(entry.path(single))
+      |> should.equal("greeting.txt")
+      entry.body(single)
+      |> should.equal(<<"mtime test\n":utf8>>)
+      single
+      |> entry.metadata
+      |> entry.modified_at_unix
+      |> should.equal(1_749_990_896)
+    }
+    _ -> should.fail()
+  }
+}

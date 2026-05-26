@@ -23,6 +23,7 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
+import gleam/option.{type Option}
 import gleam/result
 import gleam/string
 import packkit/archive as archives
@@ -223,6 +224,18 @@ fn encode_entries(
   // -- FilesInfo ---------------------------------------------------
   use names_block <- result.try(encode_names_block(names))
   let num_files = list.length(entries)
+  let mtimes_unix =
+    list.map(entries, fn(e) { entry.modified_at_unix(entry.metadata(e)) })
+  // Only emit the Mtime block when at least one entry carries a
+  // recorded mtime (> 0).  An archive of "no mtime" entries stays
+  // bit-for-bit identical to the pre-mtime encoder output, so a
+  // round-trip without any `with_modified_at` call decodes back to
+  // `modified_at_unix = 0` on every entry.
+  let any_mtime_set = list.any(mtimes_unix, fn(m) { m > 0 })
+  let mtime_block = case any_mtime_set {
+    True -> build_mtime_block(mtimes_unix)
+    False -> <<>>
+  }
   let files_info =
     bit_array.concat([
       <<nid_files_info>>,
@@ -230,6 +243,7 @@ fn encode_entries(
       <<nid_name>>,
       write_varint(bit_array.byte_size(names_block)),
       names_block,
+      mtime_block,
       <<nid_end>>,
     ])
 
@@ -307,6 +321,97 @@ fn drop_last(values: List(a), acc: List(a)) -> List(a) {
     [] -> list.reverse(acc)
     [_] -> list.reverse(acc)
     [head, ..rest] -> drop_last(rest, [head, ..acc])
+  }
+}
+
+// Build a serialised FilesInfo Mtime block (NID 0x14) for the given
+// per-entry Unix mtimes.  Entries with mtime <= 0 are marked
+// "undefined" via the bitmap; entries with mtime > 0 contribute one
+// 8-byte FILETIME LE.  When every entry is defined the bitmap is
+// omitted and the `all_defined` flag is set to 1, matching the
+// canonical form `7z a -mtm=on` emits.
+fn build_mtime_block(mtimes_unix: List(Int)) -> BitArray {
+  let defined_flags = list.map(mtimes_unix, fn(m) { m > 0 })
+  let all_defined = list.all(defined_flags, fn(b) { b })
+  let num_files = list.length(mtimes_unix)
+  let filetime_payload =
+    list.fold(mtimes_unix, <<>>, fn(acc, m) {
+      case m > 0 {
+        True -> {
+          let ft = unix_to_filetime(m)
+          bit_array.concat([acc, <<ft:little-size(64)>>])
+        }
+        False -> acc
+      }
+    })
+  let body = case all_defined {
+    True -> bit_array.concat([<<0x01, 0x00>>, filetime_payload])
+    False -> {
+      let bitmap = pack_bool_bits(defined_flags, num_files)
+      bit_array.concat([<<0x00, 0x00>>, bitmap, filetime_payload])
+    }
+  }
+  bit_array.concat([
+    <<nid_mtime>>,
+    write_varint(bit_array.byte_size(body)),
+    body,
+  ])
+}
+
+// Pack a list of `count` booleans into ceil(count / 8) bytes,
+// MSB-first within each byte, padding the trailing byte with 0 bits.
+// Matches the 7z bitmap layout used by both EmptyStream/EmptyFile and
+// the Mtime defined-flags block.
+fn pack_bool_bits(bits: List(Bool), count: Int) -> BitArray {
+  pack_bool_bits_loop(bits, count, 0, 0, <<>>)
+}
+
+fn pack_bool_bits_loop(
+  bits: List(Bool),
+  remaining: Int,
+  bit_index: Int,
+  current_byte: Int,
+  acc: BitArray,
+) -> BitArray {
+  case remaining {
+    0 ->
+      case bit_index {
+        0 -> acc
+        _ -> bit_array.concat([acc, <<current_byte>>])
+      }
+    _ -> {
+      let #(head, tail) = case bits {
+        [b, ..rest] -> #(b, rest)
+        [] -> #(False, [])
+      }
+      let bit_value = case head {
+        True -> 1
+        False -> 0
+      }
+      let updated_byte =
+        int.bitwise_or(
+          current_byte,
+          int.bitwise_shift_left(bit_value, 7 - bit_index),
+        )
+      case bit_index == 7 {
+        True ->
+          pack_bool_bits_loop(
+            tail,
+            remaining - 1,
+            0,
+            0,
+            bit_array.concat([acc, <<updated_byte>>]),
+          )
+        False ->
+          pack_bool_bits_loop(
+            tail,
+            remaining - 1,
+            bit_index + 1,
+            updated_byte,
+            acc,
+          )
+      }
+    }
   }
 }
 
@@ -535,6 +640,12 @@ type ParsedHeader {
     /// empty and every empty-stream entry is treated as a directory
     /// (the historical default before EmptyFile was honoured).
     empty_files: List(Bool),
+    /// One slot per archive member, in declaration order: `Some(unix_seconds)`
+    /// when the 7z `Mtime` block (NID 0x14) carried a defined Windows
+    /// FILETIME for that member, `None` otherwise.  An empty list means
+    /// the archive had no Mtime block at all.  Decoded by
+    /// `parse_mtime_block`, applied by `build_archive_entries`.
+    mtimes_unix: List(Option(Int)),
   )
 }
 
@@ -588,6 +699,7 @@ type HeaderFiles {
     names: List(String),
     empty_streams: List(Bool),
     empty_files: List(Bool),
+    mtimes_unix: List(Option(Int)),
   )
 }
 
@@ -625,7 +737,7 @@ fn finalize_parsed_header(
 ) -> Result(ParsedHeader, error.ArchiveError) {
   case parser.streams, parser.files {
     HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
-      HeaderFilesParsed(names, empty_streams, empty_files)
+      HeaderFilesParsed(names, empty_streams, empty_files, mtimes_unix)
     ->
       Ok(ParsedHeader(
         pack_pos: pack_pos,
@@ -636,6 +748,7 @@ fn finalize_parsed_header(
         file_names: names,
         empty_streams: empty_streams,
         empty_files: empty_files,
+        mtimes_unix: mtimes_unix,
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
       HeaderFilesNone
@@ -650,6 +763,7 @@ fn finalize_parsed_header(
           file_names: [],
           empty_streams: [],
           empty_files: [],
+          mtimes_unix: [],
         ),
       )
     _, _ ->
@@ -973,7 +1087,7 @@ fn parse_files_info(
   bytes: BitArray,
 ) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
   use #(num_files, rest) <- result.try(read_number(bytes))
-  parse_files_loop(rest, num_files, [], [], [])
+  parse_files_loop(rest, num_files, [], [], [], [])
 }
 
 fn parse_files_loop(
@@ -982,6 +1096,7 @@ fn parse_files_loop(
   names: List(String),
   empty_streams: List(Bool),
   empty_files: List(Bool),
+  mtimes_unix: List(Option(Int)),
 ) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
@@ -998,6 +1113,7 @@ fn parse_files_loop(
                 es -> es
               },
               empty_files: empty_files,
+              mtimes_unix: mtimes_unix,
             ),
             rest,
           ))
@@ -1022,6 +1138,7 @@ fn parse_files_loop(
             parsed_names,
             empty_streams,
             empty_files,
+            mtimes_unix,
           )
         }
         n if n == nid_empty_stream -> {
@@ -1045,6 +1162,7 @@ fn parse_files_loop(
             names,
             flags,
             empty_files,
+            mtimes_unix,
           )
         }
         n if n == nid_empty_file -> {
@@ -1076,13 +1194,48 @@ fn parse_files_loop(
             names,
             empty_streams,
             flags,
+            mtimes_unix,
+          )
+        }
+        n if n == nid_mtime -> {
+          // The mtime block carries one Windows FILETIME per file,
+          // with an optional bitmap selecting which entries have the
+          // field defined.  Layout:
+          //   varint size
+          //   1 byte all_defined  (1 = every entry has a FILETIME)
+          //   1 byte external     (0 = inline payload follows)
+          //   if !all_defined: ceil(num_files / 8) bytes of bits
+          //   N × 8 bytes FILETIME LE (N = number of defined entries)
+          // packkit only honours the inline form; external (1) means
+          // the FILETIMEs live in AdditionalStreamsInfo, which is
+          // already rejected at the section level above.
+          use #(size, after_size) <- result.try(read_number(rest))
+          use payload <- result.try(slice_required(
+            after_size,
+            0,
+            size,
+            "7z mtime block payload",
+          ))
+          let assert Ok(after_payload) =
+            bit_array.slice(
+              after_size,
+              size,
+              bit_array.byte_size(after_size) - size,
+            )
+          use parsed_mtimes <- result.try(parse_mtime_block(payload, num_files))
+          parse_files_loop(
+            after_payload,
+            num_files,
+            names,
+            empty_streams,
+            empty_files,
+            parsed_mtimes,
           )
         }
         n
           if n == nid_dummy
           || n == nid_ctime
           || n == nid_atime
-          || n == nid_mtime
           || n == nid_win_attributes
           || n == nid_anti
           || n == nid_start_pos
@@ -1101,6 +1254,7 @@ fn parse_files_loop(
             names,
             empty_streams,
             empty_files,
+            mtimes_unix,
           )
         }
         _ ->
@@ -1117,6 +1271,108 @@ fn count_true(bits: List(Bool)) -> Int {
     [] -> 0
     [True, ..rest] -> 1 + count_true(rest)
     [False, ..rest] -> count_true(rest)
+  }
+}
+
+// -- mtime block (NID 0x14) ------------------------------------------
+//
+// Windows FILETIME counts 100-nanosecond intervals since the Windows
+// epoch (1601-01-01 00:00:00 UTC).  Unix time counts seconds since
+// the Unix epoch (1970-01-01 00:00:00 UTC), which is exactly
+// 11_644_473_600 seconds after the Windows epoch.  Bridging the two
+// is therefore:
+//   FILETIME = (UnixSeconds + 11_644_473_600) × 10_000_000
+//   UnixSeconds = FILETIME / 10_000_000 − 11_644_473_600
+// We round toward 0 (integer division), losing the sub-second
+// fraction Windows times can carry but the packkit entry model
+// cannot represent.
+
+const filetime_epoch_offset_seconds: Int = 11_644_473_600
+
+const filetime_ticks_per_second: Int = 10_000_000
+
+fn unix_to_filetime(unix_seconds: Int) -> Int {
+  { unix_seconds + filetime_epoch_offset_seconds } * filetime_ticks_per_second
+}
+
+fn filetime_to_unix(filetime: Int) -> Int {
+  filetime / filetime_ticks_per_second - filetime_epoch_offset_seconds
+}
+
+fn parse_mtime_block(
+  payload: BitArray,
+  num_files: Int,
+) -> Result(List(Option(Int)), error.ArchiveError) {
+  case payload {
+    <<all_defined, external, after_header:bytes>> -> {
+      use <- bool.guard(
+        when: external != 0,
+        return: Error(error.ArchiveNotImplemented(
+          feature: "7z external Mtime block",
+        )),
+      )
+      use defined_flags <- result.try(case all_defined {
+        1 -> Ok(list.repeat(True, num_files))
+        _ -> read_mtime_defined_flags(after_header, num_files)
+      })
+      let body_after_flags = case all_defined {
+        1 -> after_header
+        _ -> {
+          let bitmap_size = { num_files + 7 } / 8
+          let assert Ok(rest) =
+            bit_array.slice(
+              after_header,
+              bitmap_size,
+              bit_array.byte_size(after_header) - bitmap_size,
+            )
+          rest
+        }
+      }
+      read_mtime_filetimes(body_after_flags, defined_flags, [])
+    }
+    _ ->
+      Error(error.ArchiveInvalid(message: "truncated 7z mtime block header"))
+  }
+}
+
+fn read_mtime_defined_flags(
+  payload: BitArray,
+  num_files: Int,
+) -> Result(List(Bool), error.ArchiveError) {
+  let bitmap_size = { num_files + 7 } / 8
+  use bits <- result.try(slice_required(
+    payload,
+    0,
+    bitmap_size,
+    "7z mtime defined bitmap",
+  ))
+  Ok(bit_array_to_bool_list(bits, num_files, []))
+}
+
+fn read_mtime_filetimes(
+  payload: BitArray,
+  defined_flags: List(Bool),
+  acc: List(Option(Int)),
+) -> Result(List(Option(Int)), error.ArchiveError) {
+  case defined_flags {
+    [] -> Ok(list.reverse(acc))
+    [False, ..rest] ->
+      read_mtime_filetimes(payload, rest, [option.None, ..acc])
+    [True, ..rest] ->
+      case payload {
+        <<filetime:little-size(64), tail:bytes>> -> {
+          let unix_seconds = filetime_to_unix(filetime)
+          let safe = case unix_seconds < 0 {
+            True -> 0
+            False -> unix_seconds
+          }
+          read_mtime_filetimes(tail, rest, [option.Some(safe), ..acc])
+        }
+        _ ->
+          Error(error.ArchiveInvalid(
+            message: "truncated 7z mtime FILETIME entry",
+          ))
+      }
   }
 }
 
@@ -1788,6 +2044,7 @@ fn build_archive_entries(
     parsed.file_names,
     parsed.empty_streams,
     parsed.empty_files,
+    parsed.mtimes_unix,
     parsed.substream_sizes,
     0,
     [],
@@ -1803,11 +2060,19 @@ fn build_entries_loop(
   names: List(String),
   empties: List(Bool),
   empty_files: List(Bool),
+  mtimes: List(Option(Int)),
   sizes: List(Int),
   consumed: Int,
   acc: List(entry.Entry),
   limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
+  // Pull the next mtime slot.  When the Mtime block was absent the
+  // input list is empty for every iteration and we treat the entry
+  // as having no recorded mtime (option.None).
+  let #(entry_mtime, rest_mtimes) = case mtimes {
+    [m, ..rest] -> #(m, rest)
+    [] -> #(option.None, [])
+  }
   case names, empties {
     [], _ -> Ok(list.reverse(acc))
     [name, ..rest_names], [is_empty, ..rest_empties] ->
@@ -1822,8 +2087,8 @@ fn build_entries_loop(
             [] -> #(False, [])
           }
           let adder = case is_file {
-            True -> add_file(name, <<>>, acc, limits)
-            False -> add_directory(name, acc, limits)
+            True -> add_file(name, <<>>, entry_mtime, acc, limits)
+            False -> add_directory(name, entry_mtime, acc, limits)
           }
           adder
           |> result.try(fn(new_acc) {
@@ -1832,6 +2097,7 @@ fn build_entries_loop(
               rest_names,
               rest_empties,
               rest_empty_files,
+              rest_mtimes,
               sizes,
               consumed,
               new_acc,
@@ -1846,6 +2112,8 @@ fn build_entries_loop(
             rest_names,
             rest_empties,
             empty_files,
+            entry_mtime,
+            rest_mtimes,
             sizes,
             consumed,
             acc,
@@ -1859,6 +2127,8 @@ fn build_entries_loop(
         rest_names,
         [],
         empty_files,
+        entry_mtime,
+        rest_mtimes,
         sizes,
         consumed,
         acc,
@@ -1873,6 +2143,8 @@ fn consume_one_file_body(
   rest_names: List(String),
   rest_empties: List(Bool),
   empty_files: List(Bool),
+  entry_mtime: Option(Int),
+  rest_mtimes: List(Option(Int)),
   sizes: List(Int),
   consumed: Int,
   acc: List(entry.Entry),
@@ -1886,13 +2158,14 @@ fn consume_one_file_body(
     [] -> #(bit_array.byte_size(plain) - consumed, [])
   }
   let assert Ok(body) = bit_array.slice(plain, consumed, this_size)
-  add_file(name, body, acc, limits)
+  add_file(name, body, entry_mtime, acc, limits)
   |> result.try(fn(new_acc) {
     build_entries_loop(
       plain,
       rest_names,
       rest_empties,
       empty_files,
+      rest_mtimes,
       next_sizes,
       consumed + this_size,
       new_acc,
@@ -1901,9 +2174,18 @@ fn consume_one_file_body(
   })
 }
 
+fn apply_mtime(e: entry.Entry, mtime: Option(Int)) -> entry.Entry {
+  case mtime {
+    option.Some(unix_seconds) if unix_seconds > 0 ->
+      entry.with_modified_at(e, unix_seconds: unix_seconds)
+    _ -> e
+  }
+}
+
 fn add_file(
   name: String,
   body: BitArray,
+  mtime: Option(Int),
   acc: List(entry.Entry),
   limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
@@ -1916,7 +2198,7 @@ fn add_file(
             limit: "max_entry_depth",
             actual: depth,
           ))
-        False -> Ok([e, ..acc])
+        False -> Ok([apply_mtime(e, mtime), ..acc])
       }
     }
     Error(_) ->
@@ -1928,6 +2210,7 @@ fn add_file(
 
 fn add_directory(
   name: String,
+  mtime: Option(Int),
   acc: List(entry.Entry),
   limits: limit.Limits,
 ) -> Result(List(entry.Entry), error.ArchiveError) {
@@ -1940,7 +2223,7 @@ fn add_directory(
             limit: "max_entry_depth",
             actual: depth,
           ))
-        False -> Ok([e, ..acc])
+        False -> Ok([apply_mtime(e, mtime), ..acc])
       }
     }
     Error(_) ->

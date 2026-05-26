@@ -75,7 +75,15 @@ Implemented codecs and archive families:
   round-trip; non-`File` entries are rejected because the encoder
   does not emit `EmptyStream` / `Attribute` blocks yet, and the
   encoder still emits LZMA only (the new Copy / Deflate / BZip2
-  coverage is decode-side)
+  coverage is decode-side).  Per-entry mtimes round-trip in both
+  directions: the encoder emits a `FilesInfo` Mtime block
+  (NID 0x14) packing each entry's Unix seconds as a Windows
+  FILETIME (100-nanosecond ticks since 1601-01-01 UTC); the
+  decoder reads the same block and applies the resulting Unix
+  seconds via `entry.with_modified_at`.  Archives whose entries
+  all lack a recorded mtime stay bit-stable against the
+  pre-mtime encoder output — the Mtime block is omitted entirely
+  so an unstamped round-trip leaves `modified_at_unix = 0`
 - **deflate**: full RFC 1951 decoder (stored, fixed, dynamic Huffman);
   LZ77 encoder (3-byte hash chain, 32 KiB window) with fixed-Huffman
   (`deflate.encode`) and dynamic-Huffman (`deflate.encode_dynamic`)
