@@ -1,19 +1,18 @@
-//// AES-128 / AES-192 / AES-256 block cipher — encrypt only.
+//// AES-128 / AES-192 / AES-256 block cipher.
 ////
-//// This module is the cryptographic primitive ZIP AE-x decryption is
-//// built on.  The WinZip AES extension uses AES in CTR mode, which
-//// only needs the forward (encrypt) transform on a block of all-zero
-//// or counter bytes — the ciphertext is then XOR'd into the plaintext
-//// (decrypt direction is the same operation).  We intentionally do
-//// NOT implement the inverse (decrypt) transform: keeping the
-//// surface small reduces audit area and avoids the slower
-//// inverse-S-box / inverse-MixColumns paths.
+//// Forward (encrypt) transform is what ZIP AE-x decryption is built
+//// on — WinZip AES uses CTR mode, which only needs encrypt on a
+//// counter block whose output is XOR'd into the plaintext.  7z AES
+//// (coder id `06 F1 07 01`) instead uses AES-256-CBC, which needs
+//// the inverse (decrypt) transform, so `decrypt_block` is provided
+//// alongside `encrypt_block`.
 ////
-//// The implementation follows FIPS 197 §5.1 (Cipher) and §5.2
-//// (Key Expansion).  Pure Gleam, no FFI: cross-target by construction
-//// (Erlang + JavaScript), at the cost of being noticeably slower than
-//// a native-extension AES.  Acceptable for the small (sub-MB)
-//// per-entry payloads that ZIP AE-x typically wraps.
+//// The implementation follows FIPS 197 §5.1 (Cipher), §5.2 (Key
+//// Expansion), and §5.3 (Inverse Cipher).  Pure Gleam, no FFI:
+//// cross-target by construction (Erlang + JavaScript), at the cost
+//// of being noticeably slower than a native-extension AES.
+//// Acceptable for the small (sub-MB) per-entry payloads that ZIP
+//// AE-x and 7z AES typically wrap.
 
 import gleam/bit_array
 import gleam/bool
@@ -253,6 +252,143 @@ fn gmul2(value: Int) -> Int {
 
 fn gmul3(value: Int) -> Int {
   int.bitwise_exclusive_or(gmul2(value), value)
+}
+
+// -- decrypt path ---------------------------------------------------
+
+/// Decrypt one 16-byte ciphertext block under the expanded key.
+/// The same `ExpandedKey` schedule produced by `expand_key` is
+/// consumed in reverse order (FIPS 197 §5.3).  Input shorter or
+/// longer than 16 bytes is rejected with `Error(Nil)`.
+pub fn decrypt_block(key: ExpandedKey, block: BitArray) -> Result(BitArray, Nil) {
+  case bit_array.byte_size(block) {
+    16 -> {
+      let state = bit_array_to_u32_words(block, [])
+      let state_xored = add_round_key(state, key.round_keys, key.rounds)
+      let final_state =
+        decrypt_rounds(state_xored, key.round_keys, key.rounds - 1)
+      Ok(u32_words_to_bit_array(final_state, <<>>))
+    }
+    _ -> Error(Nil)
+  }
+}
+
+fn decrypt_rounds(
+  state: List(Int),
+  round_keys: List(Int),
+  round: Int,
+) -> List(Int) {
+  case round {
+    0 -> {
+      // Final round of the inverse cipher: InvShiftRows → InvSubBytes →
+      // AddRoundKey(round_keys[0]).  No InvMixColumns.
+      let after_shift = inv_shift_rows(state)
+      let after_sub = inv_sub_bytes(after_shift)
+      add_round_key(after_sub, round_keys, 0)
+    }
+    _ -> {
+      let after_shift = inv_shift_rows(state)
+      let after_sub = inv_sub_bytes(after_shift)
+      let after_key = add_round_key(after_sub, round_keys, round)
+      let after_mix = inv_mix_columns(after_key)
+      decrypt_rounds(after_mix, round_keys, round - 1)
+    }
+  }
+}
+
+fn inv_sub_bytes(state: List(Int)) -> List(Int) {
+  list.map(state, inv_sub_word)
+}
+
+fn inv_sub_word(word: Int) -> Int {
+  let b0 = inv_sbox(int.bitwise_and(int.bitwise_shift_right(word, 24), 0xFF))
+  let b1 = inv_sbox(int.bitwise_and(int.bitwise_shift_right(word, 16), 0xFF))
+  let b2 = inv_sbox(int.bitwise_and(int.bitwise_shift_right(word, 8), 0xFF))
+  let b3 = inv_sbox(int.bitwise_and(word, 0xFF))
+  int.bitwise_or(
+    int.bitwise_or(
+      int.bitwise_or(
+        int.bitwise_shift_left(b0, 24),
+        int.bitwise_shift_left(b1, 16),
+      ),
+      int.bitwise_shift_left(b2, 8),
+    ),
+    b3,
+  )
+}
+
+fn inv_shift_rows(state: List(Int)) -> List(Int) {
+  // Inverse of ShiftRows: row `r` rotates RIGHT by `r` bytes.  See the
+  // comment in `shift_rows` for the column-major layout convention.
+  case words_to_bytes(state) {
+    [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] ->
+      // Row 0 (b0, b4, b8, b12): no shift.
+      // Row 1 (b1, b5, b9, b13): right shift by 1 → (b13, b1, b5, b9).
+      // Row 2 (b2, b6, b10, b14): right shift by 2 → (b10, b14, b2, b6).
+      // Row 3 (b3, b7, b11, b15): right shift by 3 → (b7, b11, b15, b3).
+      bytes_to_words([
+        b0, b13, b10, b7, b4, b1, b14, b11, b8, b5, b2, b15, b12, b9, b6, b3,
+      ])
+    _ -> state
+  }
+}
+
+fn inv_mix_columns(state: List(Int)) -> List(Int) {
+  list.map(state, inv_mix_one_column)
+}
+
+fn inv_mix_one_column(word: Int) -> Int {
+  let s0 = int.bitwise_and(int.bitwise_shift_right(word, 24), 0xFF)
+  let s1 = int.bitwise_and(int.bitwise_shift_right(word, 16), 0xFF)
+  let s2 = int.bitwise_and(int.bitwise_shift_right(word, 8), 0xFF)
+  let s3 = int.bitwise_and(word, 0xFF)
+  let r0 = mix_xor4(gmul14(s0), gmul11(s1), gmul13(s2), gmul9(s3))
+  let r1 = mix_xor4(gmul9(s0), gmul14(s1), gmul11(s2), gmul13(s3))
+  let r2 = mix_xor4(gmul13(s0), gmul9(s1), gmul14(s2), gmul11(s3))
+  let r3 = mix_xor4(gmul11(s0), gmul13(s1), gmul9(s2), gmul14(s3))
+  int.bitwise_or(
+    int.bitwise_or(
+      int.bitwise_or(
+        int.bitwise_shift_left(r0, 24),
+        int.bitwise_shift_left(r1, 16),
+      ),
+      int.bitwise_shift_left(r2, 8),
+    ),
+    r3,
+  )
+}
+
+fn gmul4(value: Int) -> Int {
+  gmul2(gmul2(value))
+}
+
+fn gmul8(value: Int) -> Int {
+  gmul2(gmul4(value))
+}
+
+fn gmul9(value: Int) -> Int {
+  int.bitwise_exclusive_or(gmul8(value), value)
+}
+
+fn gmul11(value: Int) -> Int {
+  int.bitwise_exclusive_or(
+    int.bitwise_exclusive_or(gmul8(value), gmul2(value)),
+    value,
+  )
+}
+
+fn gmul13(value: Int) -> Int {
+  int.bitwise_exclusive_or(
+    int.bitwise_exclusive_or(gmul8(value), gmul4(value)),
+    value,
+  )
+}
+
+fn gmul14(value: Int) -> Int {
+  int.bitwise_exclusive_or(
+    int.bitwise_exclusive_or(gmul8(value), gmul4(value)),
+    gmul2(value),
+  )
 }
 
 // -- byte / word helpers --------------------------------------------
@@ -576,5 +712,268 @@ fn sbox(byte: Int) -> Int {
     0xFD -> 0x54
     0xFE -> 0xBB
     _ -> 0x16
+  }
+}
+
+// -- AES inverse S-box ----------------------------------------------
+
+fn inv_sbox(byte: Int) -> Int {
+  case byte {
+    0x00 -> 0x52
+    0x01 -> 0x09
+    0x02 -> 0x6A
+    0x03 -> 0xD5
+    0x04 -> 0x30
+    0x05 -> 0x36
+    0x06 -> 0xA5
+    0x07 -> 0x38
+    0x08 -> 0xBF
+    0x09 -> 0x40
+    0x0A -> 0xA3
+    0x0B -> 0x9E
+    0x0C -> 0x81
+    0x0D -> 0xF3
+    0x0E -> 0xD7
+    0x0F -> 0xFB
+    0x10 -> 0x7C
+    0x11 -> 0xE3
+    0x12 -> 0x39
+    0x13 -> 0x82
+    0x14 -> 0x9B
+    0x15 -> 0x2F
+    0x16 -> 0xFF
+    0x17 -> 0x87
+    0x18 -> 0x34
+    0x19 -> 0x8E
+    0x1A -> 0x43
+    0x1B -> 0x44
+    0x1C -> 0xC4
+    0x1D -> 0xDE
+    0x1E -> 0xE9
+    0x1F -> 0xCB
+    0x20 -> 0x54
+    0x21 -> 0x7B
+    0x22 -> 0x94
+    0x23 -> 0x32
+    0x24 -> 0xA6
+    0x25 -> 0xC2
+    0x26 -> 0x23
+    0x27 -> 0x3D
+    0x28 -> 0xEE
+    0x29 -> 0x4C
+    0x2A -> 0x95
+    0x2B -> 0x0B
+    0x2C -> 0x42
+    0x2D -> 0xFA
+    0x2E -> 0xC3
+    0x2F -> 0x4E
+    0x30 -> 0x08
+    0x31 -> 0x2E
+    0x32 -> 0xA1
+    0x33 -> 0x66
+    0x34 -> 0x28
+    0x35 -> 0xD9
+    0x36 -> 0x24
+    0x37 -> 0xB2
+    0x38 -> 0x76
+    0x39 -> 0x5B
+    0x3A -> 0xA2
+    0x3B -> 0x49
+    0x3C -> 0x6D
+    0x3D -> 0x8B
+    0x3E -> 0xD1
+    0x3F -> 0x25
+    0x40 -> 0x72
+    0x41 -> 0xF8
+    0x42 -> 0xF6
+    0x43 -> 0x64
+    0x44 -> 0x86
+    0x45 -> 0x68
+    0x46 -> 0x98
+    0x47 -> 0x16
+    0x48 -> 0xD4
+    0x49 -> 0xA4
+    0x4A -> 0x5C
+    0x4B -> 0xCC
+    0x4C -> 0x5D
+    0x4D -> 0x65
+    0x4E -> 0xB6
+    0x4F -> 0x92
+    0x50 -> 0x6C
+    0x51 -> 0x70
+    0x52 -> 0x48
+    0x53 -> 0x50
+    0x54 -> 0xFD
+    0x55 -> 0xED
+    0x56 -> 0xB9
+    0x57 -> 0xDA
+    0x58 -> 0x5E
+    0x59 -> 0x15
+    0x5A -> 0x46
+    0x5B -> 0x57
+    0x5C -> 0xA7
+    0x5D -> 0x8D
+    0x5E -> 0x9D
+    0x5F -> 0x84
+    0x60 -> 0x90
+    0x61 -> 0xD8
+    0x62 -> 0xAB
+    0x63 -> 0x00
+    0x64 -> 0x8C
+    0x65 -> 0xBC
+    0x66 -> 0xD3
+    0x67 -> 0x0A
+    0x68 -> 0xF7
+    0x69 -> 0xE4
+    0x6A -> 0x58
+    0x6B -> 0x05
+    0x6C -> 0xB8
+    0x6D -> 0xB3
+    0x6E -> 0x45
+    0x6F -> 0x06
+    0x70 -> 0xD0
+    0x71 -> 0x2C
+    0x72 -> 0x1E
+    0x73 -> 0x8F
+    0x74 -> 0xCA
+    0x75 -> 0x3F
+    0x76 -> 0x0F
+    0x77 -> 0x02
+    0x78 -> 0xC1
+    0x79 -> 0xAF
+    0x7A -> 0xBD
+    0x7B -> 0x03
+    0x7C -> 0x01
+    0x7D -> 0x13
+    0x7E -> 0x8A
+    0x7F -> 0x6B
+    0x80 -> 0x3A
+    0x81 -> 0x91
+    0x82 -> 0x11
+    0x83 -> 0x41
+    0x84 -> 0x4F
+    0x85 -> 0x67
+    0x86 -> 0xDC
+    0x87 -> 0xEA
+    0x88 -> 0x97
+    0x89 -> 0xF2
+    0x8A -> 0xCF
+    0x8B -> 0xCE
+    0x8C -> 0xF0
+    0x8D -> 0xB4
+    0x8E -> 0xE6
+    0x8F -> 0x73
+    0x90 -> 0x96
+    0x91 -> 0xAC
+    0x92 -> 0x74
+    0x93 -> 0x22
+    0x94 -> 0xE7
+    0x95 -> 0xAD
+    0x96 -> 0x35
+    0x97 -> 0x85
+    0x98 -> 0xE2
+    0x99 -> 0xF9
+    0x9A -> 0x37
+    0x9B -> 0xE8
+    0x9C -> 0x1C
+    0x9D -> 0x75
+    0x9E -> 0xDF
+    0x9F -> 0x6E
+    0xA0 -> 0x47
+    0xA1 -> 0xF1
+    0xA2 -> 0x1A
+    0xA3 -> 0x71
+    0xA4 -> 0x1D
+    0xA5 -> 0x29
+    0xA6 -> 0xC5
+    0xA7 -> 0x89
+    0xA8 -> 0x6F
+    0xA9 -> 0xB7
+    0xAA -> 0x62
+    0xAB -> 0x0E
+    0xAC -> 0xAA
+    0xAD -> 0x18
+    0xAE -> 0xBE
+    0xAF -> 0x1B
+    0xB0 -> 0xFC
+    0xB1 -> 0x56
+    0xB2 -> 0x3E
+    0xB3 -> 0x4B
+    0xB4 -> 0xC6
+    0xB5 -> 0xD2
+    0xB6 -> 0x79
+    0xB7 -> 0x20
+    0xB8 -> 0x9A
+    0xB9 -> 0xDB
+    0xBA -> 0xC0
+    0xBB -> 0xFE
+    0xBC -> 0x78
+    0xBD -> 0xCD
+    0xBE -> 0x5A
+    0xBF -> 0xF4
+    0xC0 -> 0x1F
+    0xC1 -> 0xDD
+    0xC2 -> 0xA8
+    0xC3 -> 0x33
+    0xC4 -> 0x88
+    0xC5 -> 0x07
+    0xC6 -> 0xC7
+    0xC7 -> 0x31
+    0xC8 -> 0xB1
+    0xC9 -> 0x12
+    0xCA -> 0x10
+    0xCB -> 0x59
+    0xCC -> 0x27
+    0xCD -> 0x80
+    0xCE -> 0xEC
+    0xCF -> 0x5F
+    0xD0 -> 0x60
+    0xD1 -> 0x51
+    0xD2 -> 0x7F
+    0xD3 -> 0xA9
+    0xD4 -> 0x19
+    0xD5 -> 0xB5
+    0xD6 -> 0x4A
+    0xD7 -> 0x0D
+    0xD8 -> 0x2D
+    0xD9 -> 0xE5
+    0xDA -> 0x7A
+    0xDB -> 0x9F
+    0xDC -> 0x93
+    0xDD -> 0xC9
+    0xDE -> 0x9C
+    0xDF -> 0xEF
+    0xE0 -> 0xA0
+    0xE1 -> 0xE0
+    0xE2 -> 0x3B
+    0xE3 -> 0x4D
+    0xE4 -> 0xAE
+    0xE5 -> 0x2A
+    0xE6 -> 0xF5
+    0xE7 -> 0xB0
+    0xE8 -> 0xC8
+    0xE9 -> 0xEB
+    0xEA -> 0xBB
+    0xEB -> 0x3C
+    0xEC -> 0x83
+    0xED -> 0x53
+    0xEE -> 0x99
+    0xEF -> 0x61
+    0xF0 -> 0x17
+    0xF1 -> 0x2B
+    0xF2 -> 0x04
+    0xF3 -> 0x7E
+    0xF4 -> 0xBA
+    0xF5 -> 0x77
+    0xF6 -> 0xD6
+    0xF7 -> 0x26
+    0xF8 -> 0xE1
+    0xF9 -> 0x69
+    0xFA -> 0x14
+    0xFB -> 0x63
+    0xFC -> 0x55
+    0xFD -> 0x21
+    0xFE -> 0x0C
+    _ -> 0x7D
   }
 }

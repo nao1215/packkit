@@ -318,6 +318,140 @@ fn mod(value: Int, divisor: Int) -> Int {
 
 // -- SHA-256 (FIPS 180-4) -----------------------------------------------
 
+/// Opaque incremental SHA-256 state.  Built via `sha256_init`,
+/// extended by `sha256_update`, finished by `sha256_finalize`.
+/// Useful when the input is produced one small chunk at a time
+/// — e.g. the 7z key-derivation function loops 2^numCyclesPower
+/// rounds (typically 524288) each appending salt + password + an
+/// 8-byte counter; building one giant `BitArray` to pass to
+/// `sha256` would be quadratic on the JS target.
+pub opaque type Sha256State {
+  Sha256State(
+    h0: Int,
+    h1: Int,
+    h2: Int,
+    h3: Int,
+    h4: Int,
+    h5: Int,
+    h6: Int,
+    h7: Int,
+    /// Bytes seen but not yet absorbed into a 64-byte block.
+    buffer: BitArray,
+    /// Total bytes fed in via `sha256_update`; needed for the
+    /// 64-bit length encoding in the final padded block.
+    total_len: Int,
+  )
+}
+
+/// Fresh SHA-256 state using the FIPS 180-4 §5.3.3 initial hash
+/// constants.
+pub fn sha256_init() -> Sha256State {
+  Sha256State(
+    h0: 0x6A09E667,
+    h1: 0xBB67AE85,
+    h2: 0x3C6EF372,
+    h3: 0xA54FF53A,
+    h4: 0x510E527F,
+    h5: 0x9B05688C,
+    h6: 0x1F83D9AB,
+    h7: 0x5BE0CD19,
+    buffer: <<>>,
+    total_len: 0,
+  )
+}
+
+/// Absorb `data` into the running SHA-256 state.  Bytes accumulate
+/// in an internal buffer and full 64-byte blocks are consumed as
+/// soon as they're available, so callers may pass arbitrarily small
+/// chunks without blowing memory.
+pub fn sha256_update(state: Sha256State, data data: BitArray) -> Sha256State {
+  let combined = <<state.buffer:bits, data:bits>>
+  let new_total = state.total_len + bit_array.byte_size(data)
+  let #(h0, h1, h2, h3, h4, h5, h6, h7, remainder) =
+    sha256_consume_blocks(
+      combined,
+      state.h0,
+      state.h1,
+      state.h2,
+      state.h3,
+      state.h4,
+      state.h5,
+      state.h6,
+      state.h7,
+    )
+  Sha256State(
+    h0:,
+    h1:,
+    h2:,
+    h3:,
+    h4:,
+    h5:,
+    h6:,
+    h7:,
+    buffer: remainder,
+    total_len: new_total,
+  )
+}
+
+/// Apply FIPS 180-4 padding to whatever bytes are still buffered
+/// in `state`, process the final block(s), and return the 32-byte
+/// digest.
+pub fn sha256_finalize(state state: Sha256State) -> BitArray {
+  let bit_len = state.total_len * 8
+  let buf_len = bit_array.byte_size(state.buffer)
+  let mod_len = mod(buf_len + 9, 64)
+  let zeros = case mod_len {
+    0 -> 0
+    n -> 64 - n
+  }
+  let padding = pad_zeros(zeros, <<>>)
+  let final_block =
+    bit_array.concat([state.buffer, <<0x80>>, padding, <<bit_len:size(64)-big>>])
+  let #(h0, h1, h2, h3, h4, h5, h6, h7) =
+    sha256_process_blocks(
+      final_block,
+      state.h0,
+      state.h1,
+      state.h2,
+      state.h3,
+      state.h4,
+      state.h5,
+      state.h6,
+      state.h7,
+    )
+  <<
+    h0:size(32),
+    h1:size(32),
+    h2:size(32),
+    h3:size(32),
+    h4:size(32),
+    h5:size(32),
+    h6:size(32),
+    h7:size(32),
+  >>
+}
+
+fn sha256_consume_blocks(
+  data: BitArray,
+  h0: Int,
+  h1: Int,
+  h2: Int,
+  h3: Int,
+  h4: Int,
+  h5: Int,
+  h6: Int,
+  h7: Int,
+) -> #(Int, Int, Int, Int, Int, Int, Int, Int, BitArray) {
+  case data {
+    <<block:bytes-size(64), rest:bytes>> -> {
+      let #(a0, a1, a2, a3, a4, a5, a6, a7) =
+        sha256_process_blocks(block, h0, h1, h2, h3, h4, h5, h6, h7)
+      sha256_consume_blocks(rest, a0, a1, a2, a3, a4, a5, a6, a7)
+    }
+    _ -> #(h0, h1, h2, h3, h4, h5, h6, h7, data)
+  }
+}
+
 /// Compute the SHA-256 digest of `data` and return the 32-byte digest
 /// as a `BitArray`.  Used by the xz block-check field (`check_type =
 /// 10`).

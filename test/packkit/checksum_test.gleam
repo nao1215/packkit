@@ -70,6 +70,46 @@ pub fn sha256_abc_test() -> Nil {
   >>)
 }
 
+pub fn sha256_streaming_matches_one_shot_test() -> Nil {
+  // Feed the two-block FIPS input one byte at a time and confirm the
+  // incremental API produces the same digest as `sha256` does in one
+  // pass.  Cross-checks padding + total-length bookkeeping in
+  // `sha256_finalize`.
+  let input = <<
+    "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq":utf8,
+  >>
+  let expected = checksum.sha256(input)
+
+  let final_state =
+    bit_array_each_byte(input, checksum.sha256_init(), fn(state, byte) {
+      checksum.sha256_update(state, data: <<byte>>)
+    })
+
+  checksum.sha256_finalize(state: final_state) |> should.equal(expected)
+}
+
+pub fn sha256_streaming_empty_test() -> Nil {
+  // Calling finalize with no update must match `sha256(<<>>)`.
+  let expected = checksum.sha256(<<>>)
+  checksum.sha256_finalize(state: checksum.sha256_init())
+  |> should.equal(expected)
+}
+
+fn bit_array_each_byte(
+  bytes: BitArray,
+  acc: Sha256AccState,
+  step: fn(Sha256AccState, Int) -> Sha256AccState,
+) -> Sha256AccState {
+  case bytes {
+    <<byte, rest:bytes>> -> bit_array_each_byte(rest, step(acc, byte), step)
+    _ -> acc
+  }
+}
+
+// Local alias to keep `bit_array_each_byte`'s signature short.
+type Sha256AccState =
+  checksum.Sha256State
+
 pub fn sha256_two_block_test() -> Nil {
   // The classic 56-byte input that forces an extra padding block
   // ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq").
