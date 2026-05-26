@@ -701,10 +701,23 @@ fn encode_entry(
   // uncompressed size to know when to stop."  Our LZMA encoder is
   // literal-only and never emits an EOS marker so we always set the
   // bit when the method is LZMA.
-  let gp_flag = case method_code {
+  //
+  // Bit 11 is the Language Encoding Flag (a.k.a. EFS bit, APPNOTE
+  // §4.4.4): when set, the entry's filename and comment are encoded
+  // as UTF-8 rather than the historical CP437.  packkit's encoder
+  // always emits filenames as UTF-8, but ASCII filenames are
+  // byte-identical to CP437, so we only set bit 11 when the name
+  // actually contains bytes ≥ 0x80 — keeping output for ASCII names
+  // bit-stable against the pre-EFS encoder.
+  let lzma_flag_bit = case method_code {
     m if m == method_lzma -> 0x02
     _ -> 0
   }
+  let efs_flag_bit = case name_needs_utf8_flag(name_bytes) {
+    True -> 0x0800
+    False -> 0x00
+  }
+  let gp_flag = int.bitwise_or(lzma_flag_bit, efs_flag_bit)
 
   let local_header =
     bit_array.concat([
@@ -1847,6 +1860,24 @@ fn bytes_to_string(bytes: BitArray) -> Result(String, error.ArchiveError) {
     Ok(value) -> Ok(value)
     Error(_) ->
       Error(error.ArchiveInvalid(message: "non-UTF-8 ZIP name (set EFS flag)"))
+  }
+}
+
+// Decide whether to set the Language Encoding Flag (gp flag bit 11)
+// on an entry whose filename serialises to the given bytes.  ASCII
+// bytes (< 0x80) are identical in UTF-8 and CP437, so the flag is
+// redundant for pure-ASCII names and we leave it clear.  Any byte
+// ≥ 0x80 indicates a UTF-8 multibyte sequence and we set the flag
+// so spec-conformant decoders treat the name as UTF-8 instead of
+// CP437.
+fn name_needs_utf8_flag(name_bytes: BitArray) -> Bool {
+  case name_bytes {
+    <<b, rest:bytes>> ->
+      case b >= 0x80 {
+        True -> True
+        False -> name_needs_utf8_flag(rest)
+      }
+    _ -> False
   }
 }
 

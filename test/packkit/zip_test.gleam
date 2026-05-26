@@ -719,3 +719,60 @@ pub fn decodes_system_zip_with_unix_extended_timestamp_test() -> Nil {
   |> should.equal(1_749_990_896)
 }
 
+
+// -- Language Encoding Flag (gp flag bit 11 / EFS) -------------------
+//
+// APPNOTE.TXT §4.4.4 says bit 11 of the per-entry general purpose
+// flag indicates the filename and comment are UTF-8, not CP437.
+// packkit always emits filenames as UTF-8, so pure-ASCII names
+// (byte-identical in UTF-8 and CP437) leave bit 11 clear, but any
+// name carrying a byte ≥ 0x80 forces the bit on so spec-conformant
+// decoders interpret the name as UTF-8 instead of mojibaking it
+// through the CP437 table.
+
+fn read_local_gp_flag(bytes: BitArray) -> Int {
+  // The local file header signature is at offset 0; gp_flag is at
+  // offset 6 as a LE16.  Use bit_array.slice + a small pattern match
+  // to pull the two bytes without re-implementing read_le16_at.
+  let assert Ok(slice) = bit_array.slice(bytes, 6, 2)
+  case slice {
+    <<lo, hi>> -> int.bitwise_or(lo, int.bitwise_shift_left(hi, 8))
+    _ -> 0
+  }
+}
+
+pub fn encode_sets_efs_flag_on_non_ascii_filename_test() -> Nil {
+  // Japanese filename "こんにちは.txt" — every UTF-8 byte beyond
+  // the literal "." and "txt" is ≥ 0x80, so bit 11 must be set on
+  // the encoded entry.
+  let payload = <<"hello":utf8>>
+  let archive_value =
+    archive.add(
+      zip.new(),
+      entry: entry.file(path: "こんにちは.txt", body: payload),
+    )
+  let assert Ok(bytes) = zip.encode(archive: archive_value)
+  let gp_flag = read_local_gp_flag(bytes)
+  int.bitwise_and(gp_flag, 0x0800)
+  |> should.equal(0x0800)
+
+  // Round-trip should still recover the original (UTF-8) name and body.
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [restored] = archive.entries(decoded)
+  entry.to_string(entry.path(restored))
+  |> should.equal("こんにちは.txt")
+  entry.body(restored)
+  |> should.equal(payload)
+}
+
+pub fn encode_omits_efs_flag_on_ascii_filename_test() -> Nil {
+  // Pure-ASCII filename — bit 11 must stay clear.  Bit 1 (the LZMA
+  // EOS-omitted marker) is only set when the method is LZMA, so for
+  // a default stored entry every bit must be 0.
+  let archive_value =
+    archive.add(zip.new(), entry: entry.file(path: "ascii.txt", body: <<"a":utf8>>))
+  let assert Ok(bytes) = zip.encode(archive: archive_value)
+  let gp_flag = read_local_gp_flag(bytes)
+  int.bitwise_and(gp_flag, 0x0800)
+  |> should.equal(0)
+}

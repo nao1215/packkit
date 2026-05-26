@@ -59,7 +59,12 @@ Implemented codecs and archive families:
   extra when present and falls back to the DOS pair otherwise.
   Pre-1980 mtimes fall outside the DOS-date window so they are
   clamped to the "no mtime" sentinel in the DOS slots but still
-  carried losslessly in the UT extra
+  carried losslessly in the UT extra.  Filenames containing
+  bytes ≥ 0x80 set the general-purpose Language Encoding Flag
+  (bit 11, APPNOTE.TXT §4.4.4) so spec-conformant decoders
+  interpret the bytes as UTF-8 instead of CP437; pure-ASCII
+  names leave the flag clear and stay bit-stable against the
+  pre-EFS encoder
 - **7z**: single-folder reader.  Recognised single-coder ids:
   LZMA (`0x03 0x01 0x01`), LZMA2 (`0x21`), Copy (`0x00`),
   Deflate (`0x04 0x01 0x08`), BZip2 (`0x04 0x02 0x02`), and
