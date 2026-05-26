@@ -25,6 +25,7 @@
 //// ints) and JavaScript (53-bit floats).
 
 import gleam/bit_array
+import gleam/bool
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/order
@@ -195,10 +196,11 @@ fn decode_main_byte(
   byte: Int,
   prev_byte_before_consume: Int,
 ) -> Result(State, Bcj2Error) {
-  case is_branch_candidate(byte, prev_byte_before_consume) {
-    False -> Ok(state)
-    True -> decode_branch(state, byte)
-  }
+  use <- bool.guard(
+    when: !is_branch_candidate(byte, prev_byte_before_consume),
+    return: Ok(state),
+  )
+  decode_branch(state, byte)
 }
 
 // Read a single byte from the main stream, append it to the output,
