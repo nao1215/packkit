@@ -9,20 +9,27 @@
 //// the past.
 
 import gleam/bit_array
+import gleam/list
 import gleeunit/should
 import metamon
 import metamon/generator
 import metamon/generator/range
+import packkit
+import packkit/archive
 import packkit/brotli
 import packkit/bzip2
 import packkit/deflate
+import packkit/entry
 import packkit/error
 import packkit/gzip
 import packkit/limit
 import packkit/lz4
 import packkit/lzw
+import packkit/recipe
 import packkit/snappy
+import packkit/tar
 import packkit/xz
+import packkit/zip
 import packkit/zlib
 import packkit/zstd
 
@@ -235,6 +242,114 @@ fn repeat(value: a, n: Int) -> List(a) {
     0 -> []
     _ -> [value, ..repeat(value, n - 1)]
   }
+}
+
+// -- recipe-level pack / unpack round trips -------------------------------
+
+/// Pack one logical entry whose body is random bytes, unpack it, and
+/// assert the body round-trips byte-for-byte through the chosen
+/// recipe.  metamon shrinks the body to a minimal counter-example if
+/// any recipe drops a byte mid-pipeline — the codec-level properties
+/// above would only catch the codec step.
+fn check_single_entry_recipe_round_trip(
+  recipe_value: recipe.Recipe,
+  body: BitArray,
+) -> Bool {
+  let arc = tar.new() |> tar.add_file(path: "f", body: body)
+
+  case packkit.pack(archive_value: arc, using: recipe_value) {
+    Ok(packed) ->
+      case packkit.unpack(bytes: packed, using: recipe_value) {
+        Ok(unpacked) ->
+          case archive.entries(unpacked) {
+            [single] -> entry.body(single) == body
+            _ -> False
+          }
+        _ -> False
+      }
+    _ -> False
+  }
+}
+
+pub fn property_recipe_tar_gzip_round_trip_test() -> Nil {
+  metamon.forall(bytes_gen(), fn(b) {
+    check_single_entry_recipe_round_trip(recipe.tar_gzip(), b)
+  })
+}
+
+pub fn property_recipe_tar_zstd_round_trip_test() -> Nil {
+  metamon.forall(bytes_gen(), fn(b) {
+    check_single_entry_recipe_round_trip(recipe.tar_zstd(), b)
+  })
+}
+
+pub fn property_recipe_tar_xz_round_trip_test() -> Nil {
+  metamon.forall(bytes_gen(), fn(b) {
+    check_single_entry_recipe_round_trip(recipe.tar_xz(), b)
+  })
+}
+
+pub fn property_recipe_tar_bare_round_trip_test() -> Nil {
+  // No outer codec — exercises the pack/unpack pipeline directly
+  // against the tar encoder/decoder pair without the codec layer
+  // masking shape-preserving mutations.
+  metamon.forall(bytes_gen(), fn(b) {
+    check_single_entry_recipe_round_trip(recipe.tar(), b)
+  })
+}
+
+/// Same shape against the bare ZIP recipe.  Stresses the per-entry
+/// stored-method encoder + decoder, the central-directory layout, and
+/// the EOCD parser for arbitrary body sizes including the empty
+/// payload.
+pub fn property_recipe_zip_round_trip_test() -> Nil {
+  metamon.forall(bytes_gen(), fn(body) {
+    let arc =
+      zip.new()
+      |> archive.add(entry: entry.file(path: "f", body: body))
+    case packkit.pack(archive_value: arc, using: recipe.zip()) {
+      Ok(packed) ->
+        case packkit.unpack(bytes: packed, using: recipe.zip()) {
+          Ok(unpacked) ->
+            case archive.entries(unpacked) {
+              [single] -> entry.body(single) == body
+              _ -> False
+            }
+          _ -> False
+        }
+      _ -> False
+    }
+  })
+}
+
+// -- API law: archive.entry_by_path == list.find on entries() ------------
+
+/// Pin the lawful equivalence between `archive.entry_by_path(arc, path)`
+/// and `archive.entries(arc) |> list.find(...)`.  The implementation
+/// IS `list.find(entries(arc), ...)` today, but metamon generates a
+/// random body so a regression that picked the wrong list (the
+/// internal reversed list — the historical bug) would surface here
+/// instead of only through the hand-written duplicate-path fixture.
+pub fn property_entry_by_path_matches_list_find_on_entries_test() -> Nil {
+  metamon.forall(bytes_gen(), fn(body) {
+    let arc =
+      tar.new()
+      |> tar.add_file(path: "a", body: body)
+      |> tar.add_file(path: "b", body: <<"second":utf8>>)
+      |> tar.add_file(path: "a", body: <<"third":utf8>>)
+
+    let via_helper = archive.entry_by_path(arc, path: "a")
+    let via_list_find =
+      archive.entries(arc)
+      |> list.find(fn(e) { entry.to_string(entry.path(e)) == "a" })
+
+    case via_helper, via_list_find {
+      Ok(x), Ok(y) -> entry.body(x) == entry.body(y)
+      Ok(_), _ -> False
+      _, Ok(_) -> False
+      _, _ -> True
+    }
+  })
 }
 
 pub fn multi_stream_cumulative_output_limit_test() -> Nil {
