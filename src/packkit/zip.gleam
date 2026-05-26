@@ -910,7 +910,9 @@ fn find_unix_ts_extra_mtime(extra: BitArray) -> Option(Int) {
     Ok(body) ->
       case body {
         <<flags, mtime:little-size(32), _:bytes>> ->
-          case int.bitwise_and(flags, unix_ts_flag_mtime) == unix_ts_flag_mtime {
+          case
+            int.bitwise_and(flags, unix_ts_flag_mtime) == unix_ts_flag_mtime
+          {
             True -> Some(mtime)
             False -> None
           }

@@ -1180,9 +1180,7 @@ fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) 
       && b2 == bzip2_coder_id_mid
       && b3 == bzip2_coder_id_low
     -> Ok(BZip2)
-    <<b1, b2, b3, b4>>
-      if b1 == bcj_prefix_byte_0 && b2 == bcj_prefix_byte_1
-    ->
+    <<b1, b2, b3, b4>> if b1 == bcj_prefix_byte_0 && b2 == bcj_prefix_byte_1 ->
       case b3, b4 {
         v3, v4 if v3 == bcj_x86_byte_2 && v4 == bcj_x86_byte_3 -> Ok(BcjX86)
         v3, v4 if v3 == bcj_ppc_byte_2 && v4 == bcj_ppc_byte_3 -> Ok(BcjPpc)
@@ -1459,8 +1457,7 @@ fn parse_mtime_block(
       }
       read_mtime_filetimes(body_after_flags, defined_flags, [])
     }
-    _ ->
-      Error(error.ArchiveInvalid(message: "truncated 7z mtime block header"))
+    _ -> Error(error.ArchiveInvalid(message: "truncated 7z mtime block header"))
   }
 }
 
@@ -1485,8 +1482,7 @@ fn read_mtime_filetimes(
 ) -> Result(List(Option(Int)), error.ArchiveError) {
   case defined_flags {
     [] -> Ok(list.reverse(acc))
-    [False, ..rest] ->
-      read_mtime_filetimes(payload, rest, [option.None, ..acc])
+    [False, ..rest] -> read_mtime_filetimes(payload, rest, [option.None, ..acc])
     [True, ..rest] ->
       case payload {
         <<filetime:little-size(64), tail:bytes>> -> {
@@ -2001,7 +1997,8 @@ fn delta_decode_seven_z_loop(
     [] -> list.reverse(output)
     [b, ..rest] ->
       case index < distance {
-        True -> delta_decode_seven_z_loop(rest, distance, [b, ..output], index + 1)
+        True ->
+          delta_decode_seven_z_loop(rest, distance, [b, ..output], index + 1)
         False -> {
           // `output` holds emitted bytes in reverse order (head =
           // most recent).  The byte we emitted `distance` slots ago

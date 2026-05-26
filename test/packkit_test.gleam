@@ -162,8 +162,7 @@ pub fn facade_pack_unpack_via_recipe_zip_test() -> Nil {
 
   let assert Ok(bytes) =
     packkit.pack(archive_value: archive_value, using: recipe.zip())
-  let assert Ok(decoded) =
-    packkit.unpack(bytes: bytes, using: recipe.zip())
+  let assert Ok(decoded) = packkit.unpack(bytes: bytes, using: recipe.zip())
 
   archive.entry_count(decoded)
   |> should.equal(2)
@@ -180,8 +179,7 @@ pub fn facade_pack_unpack_via_recipe_tar_bare_test() -> Nil {
     |> tar.add_file(path: "b.txt", body: <<"b":utf8>>)
   let assert Ok(bytes) =
     packkit.pack(archive_value: archive_value, using: recipe.tar())
-  let assert Ok(decoded) =
-    packkit.unpack(bytes: bytes, using: recipe.tar())
+  let assert Ok(decoded) = packkit.unpack(bytes: bytes, using: recipe.tar())
   archive.entry_count(decoded)
   |> should.equal(2)
 }

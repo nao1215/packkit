@@ -86,8 +86,7 @@ pub fn format_codec_error(err: CodecError) -> String {
       <> " does not support the requested option \""
       <> option
       <> "\""
-    CodecNotImplemented(feature) ->
-      "codec: not yet implemented — " <> feature
+    CodecNotImplemented(feature) -> "codec: not yet implemented — " <> feature
   }
 }
 
@@ -134,8 +133,7 @@ pub fn format_detect_error(err: DetectError) -> String {
   case err {
     DetectUnknownFormat(input) ->
       "detect: could not classify input \"" <> input <> "\""
-    DetectNotImplemented(feature) ->
-      "detect: not yet implemented — " <> feature
+    DetectNotImplemented(feature) -> "detect: not yet implemented — " <> feature
   }
 }
 
@@ -147,7 +145,6 @@ pub fn format_recipe_error(err: RecipeError) -> String {
     RecipeEmptyCodecChain -> "recipe: codec chain is empty"
     RecipeUnsupportedComposition(description) ->
       "recipe: unsupported composition — " <> description
-    RecipeNotImplemented(feature) ->
-      "recipe: not yet implemented — " <> feature
+    RecipeNotImplemented(feature) -> "recipe: not yet implemented — " <> feature
   }
 }
