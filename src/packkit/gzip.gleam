@@ -34,6 +34,10 @@ const fname_flag: Int = 0x08
 
 const fcomment_flag: Int = 0x10
 
+// RFC 1952 §2.3.1: FLG bits 0x20, 0x40, and 0x80 are reserved and
+// MUST be zero.  Reject any header that lights them up.
+const flg_reserved_mask: Int = 0xE0
+
 const os_unknown: Int = 0xFF
 
 /// Gzip header metadata.
@@ -522,12 +526,21 @@ fn decode_one_member(
           message: "gzip compression method is not deflate",
         )),
       )
+      // RFC 1952 §2.3.1: FLG bits 0x20 / 0x40 / 0x80 are reserved and
+      // "must be zero".  Reject up-front so an unexpected future
+      // extension does not silently slip through as if it were valid.
+      use <- bool.guard(
+        when: int.bitwise_and(flg, flg_reserved_mask) != 0,
+        return: Error(error.CodecInvalidData(
+          message: "gzip reserved FLG bits set",
+        )),
+      )
       // RFC 1952 §2.3.1: MTIME=0 means "no time stamp available".
       let initial = case mtime {
         0 -> default_header()
         n -> Header(..default_header(), modified_at_unix: Some(n))
       }
-      decode_header_and_payload(rest, flg, initial, limits)
+      decode_header_and_payload(rest, flg, initial, limits, bytes)
     }
     _ -> Error(error.CodecInvalidData(message: "gzip header truncated"))
   }
@@ -538,6 +551,7 @@ fn decode_header_and_payload(
   flg: Int,
   acc: Header,
   limits: limit.Limits,
+  original: BitArray,
 ) -> Result(#(Decoded, BitArray), error.CodecError) {
   use #(bytes, extra_value) <- result.try(maybe_read_extra(bytes, flg))
   use #(bytes, name_value) <- result.try(maybe_read_string(
@@ -550,7 +564,7 @@ fn decode_header_and_payload(
     flg,
     fcomment_flag,
   ))
-  use bytes <- result.try(maybe_skip_header_crc(bytes, flg))
+  use bytes <- result.try(maybe_verify_header_crc(bytes, flg, original))
 
   let header =
     acc
@@ -670,6 +684,15 @@ fn parse_extra_subfields(
   }
 }
 
+// Decode a NUL-terminated gzip header string.  RFC 1952 §2.3.1
+// specifies the FNAME / FCOMMENT character set as ISO 8859-1
+// (LATIN-1).  Modern producers (GNU gzip, libarchive, ...) commonly
+// write UTF-8 instead, and most consumers accept both.  We try UTF-8
+// first (the common case for names produced by Gleam itself, and what
+// most modern tooling emits) and fall back to a 1-to-1
+// byte-to-codepoint Latin-1 mapping so RFC-conformant Latin-1
+// filenames round-trip cleanly.  The byte 0x00 is the NUL terminator
+// and never appears in the payload, so the fallback is unambiguous.
 fn maybe_read_string(
   bytes: BitArray,
   flg: Int,
@@ -679,16 +702,41 @@ fn maybe_read_string(
     0 -> Ok(#(bytes, None))
     _ ->
       case split_at_nul(bytes, 0) {
-        Ok(#(string_bits, after)) ->
-          case bit_array.to_string(string_bits) {
-            Ok(value) -> Ok(#(after, Some(value)))
-            Error(_) ->
-              Error(error.CodecInvalidData(
-                message: "gzip header string is not UTF-8",
-              ))
+        Ok(#(string_bits, after)) -> {
+          let decoded = case bit_array.to_string(string_bits) {
+            Ok(value) -> value
+            Error(_) -> latin1_decode(string_bits, "")
           }
+          Ok(#(after, Some(decoded)))
+        }
         Error(err) -> Error(err)
       }
+  }
+}
+
+fn latin1_decode(bytes: BitArray, acc: String) -> String {
+  case bytes {
+    <<>> -> acc
+    <<b, rest:bytes>> -> {
+      // RFC 1952 spec character set is ISO 8859-1, which is the
+      // identity map for the first 256 Unicode code points.  Convert
+      // each byte to its U+00xx code point and concatenate.  Bytes
+      // 0x00..0x7F encode to themselves; bytes 0x80..0xFF encode to a
+      // 2-byte UTF-8 sequence (lead `0xC2 | (b >> 6)`, continuation
+      // `0x80 | (b & 0x3F)`).  Hand-coding the encoding avoids the
+      // extra `string.utf_codepoint -> UtfCodepoint -> BitArray ->
+      // String` dance and is safe for any single byte.
+      let cp = case b < 0x80 {
+        True -> <<b>>
+        False -> <<
+          int.bitwise_or(0xC0, int.bitwise_shift_right(b, 6)),
+          int.bitwise_or(0x80, int.bitwise_and(b, 0x3F)),
+        >>
+      }
+      let assert Ok(ch) = bit_array.to_string(cp)
+      latin1_decode(rest, acc <> ch)
+    }
+    _ -> acc
   }
 }
 
@@ -710,18 +758,59 @@ fn split_at_nul(
   }
 }
 
-fn maybe_skip_header_crc(
+// RFC 1952 §2.3.1: "If FLG.FHCRC is set, a CRC16 for the gzip header
+// is present, immediately before the compressed data. The CRC16
+// consists of the two least significant bytes of the CRC32 for all
+// bytes of the gzip header up to and not including the CRC16."
+//
+// `original` is the byte buffer this gzip member was decoded from
+// (starting at the magic).  At the moment this helper runs, the
+// header has been fully consumed except for the optional 2-byte
+// CRC16 itself, so the prefix `original[0..header_len]` is exactly
+// the byte range the spec covers.
+fn maybe_verify_header_crc(
   bytes: BitArray,
   flg: Int,
+  original: BitArray,
 ) -> Result(BitArray, error.CodecError) {
   case int.bitwise_and(flg, fhcrc_flag) {
     0 -> Ok(bytes)
-    _ ->
-      case bit_array.slice(bytes, 2, bit_array.byte_size(bytes) - 2) {
-        Ok(rest) -> Ok(rest)
-        Error(_) ->
-          Error(error.CodecInvalidData(message: "gzip header CRC missing"))
-      }
+    _ -> verify_header_crc(bytes, original)
+  }
+}
+
+fn verify_header_crc(
+  bytes: BitArray,
+  original: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  let header_len = bit_array.byte_size(original) - bit_array.byte_size(bytes)
+  use #(expected, rest) <- result.try(read_header_crc16(bytes))
+  use header_bytes <- result.try(slice_header_for_crc(original, header_len))
+  let actual = int.bitwise_and(checksum.crc32(data: header_bytes), 0xFFFF)
+  case actual == expected {
+    True -> Ok(rest)
+    False ->
+      Error(error.CodecInvalidData(message: "gzip header CRC16 mismatch"))
+  }
+}
+
+fn read_header_crc16(
+  bytes: BitArray,
+) -> Result(#(Int, BitArray), error.CodecError) {
+  case bytes {
+    <<expected:size(16)-little, rest:bytes>> -> Ok(#(expected, rest))
+    _ -> Error(error.CodecInvalidData(message: "gzip header CRC missing"))
+  }
+}
+
+fn slice_header_for_crc(
+  original: BitArray,
+  header_len: Int,
+) -> Result(BitArray, error.CodecError) {
+  case bit_array.slice(original, 0, header_len) {
+    Ok(header_bytes) -> Ok(header_bytes)
+    Error(_) ->
+      Error(error.CodecInvalidData(message: "gzip header CRC bounds error"))
   }
 }
 

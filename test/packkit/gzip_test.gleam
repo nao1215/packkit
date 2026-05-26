@@ -1,6 +1,8 @@
 import gleam/bit_array
+import gleam/int
 import gleam/option.{None, Some}
 import gleeunit/should
+import packkit/checksum
 import packkit/error
 import packkit/gzip
 import packkit/limit
@@ -256,4 +258,97 @@ pub fn fextra_roundtrip_with_name_and_comment_test() -> Nil {
 pub fn fextra_default_header_has_empty_extra_test() -> Nil {
   gzip.extra(gzip.default_header())
   |> should.equal([])
+}
+
+// -- RFC 1952 §2.3.1 compliance --------------------------------------------
+
+/// Reserved FLG bits (0x20 / 0x40 / 0x80) MUST be zero per RFC 1952.
+/// Earlier revisions of `gzip.decode` happily accepted any flag value
+/// and would silently misinterpret a future extension as if it were a
+/// vanilla gzip stream — added an explicit guard, pin it as a test.
+pub fn rejects_reserved_flg_bit_test() -> Nil {
+  // Minimal header carrying just a reserved bit set.  CM is deflate
+  // and the payload is irrelevant because the guard fires before any
+  // DEFLATE byte is parsed.
+  let header_with_reserved_bit = <<
+    0x1F, 0x8B, 0x08, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+  >>
+  case gzip.decode(bytes: header_with_reserved_bit) {
+    Error(error.CodecInvalidData(message: "gzip reserved FLG bits set")) -> Nil
+    _ -> should.fail()
+  }
+}
+
+/// RFC 1952 §2.3.1: when FLG.FHCRC is set, the 2-byte field is the
+/// CRC-16 (low two bytes of the CRC-32) of the header bytes up to but
+/// not including the CRC-16 itself.  The decoder used to skip those
+/// two bytes without verifying them; this test pins the verified path
+/// in both the accept and reject directions.
+pub fn fhcrc_accepts_valid_and_rejects_corrupt_test() -> Nil {
+  // Minimal header for an empty DEFLATE stored block, with FHCRC set.
+  let header_for_crc = <<
+    0x1F, 0x8B, 0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+  >>
+  let crc16 = int.bitwise_and(checksum.crc32(data: header_for_crc), 0xFFFF)
+  let crc16_bytes = <<crc16:size(16)-little>>
+  // DEFLATE empty stored block: bfinal=1 btype=00 → 0x01 then LEN=0 then ~LEN=0xFFFF.
+  let deflate_empty_stored = <<0x01, 0x00, 0x00, 0xFF, 0xFF>>
+  // Empty payload trailer: CRC32 = 0, ISIZE = 0.
+  let trailer = <<0:size(64)>>
+
+  let good =
+    bit_array.concat([
+      header_for_crc,
+      crc16_bytes,
+      deflate_empty_stored,
+      trailer,
+    ])
+  let assert Ok(decoded) = gzip.decode(bytes: good)
+  decoded.payload
+  |> should.equal(<<>>)
+
+  // Flip the low byte of the CRC-16 — must fail with the typed
+  // mismatch message rather than silently propagating.
+  let bad_crc16_bytes = <<
+    int.bitwise_exclusive_or(int.bitwise_and(crc16, 0xFF), 0xFF),
+    int.bitwise_shift_right(crc16, 8),
+  >>
+  let bad =
+    bit_array.concat([
+      header_for_crc,
+      bad_crc16_bytes,
+      deflate_empty_stored,
+      trailer,
+    ])
+  case gzip.decode(bytes: bad) {
+    Error(error.CodecInvalidData(message: "gzip header CRC16 mismatch")) -> Nil
+    _ -> should.fail()
+  }
+}
+
+/// RFC 1952 §2.3.1 specifies FNAME / FCOMMENT as ISO 8859-1 (LATIN-1).
+/// Earlier revisions decoded as UTF-8 and rejected RFC-conformant
+/// Latin-1 names containing bytes 0x80..0xFF.  The decoder now tries
+/// UTF-8 first (the common modern case) and falls back to a 1-to-1
+/// byte-to-codepoint Latin-1 mapping so a stream produced by an older
+/// `gzip` honouring the spec literally still decodes.
+pub fn fname_latin1_decodes_test() -> Nil {
+  // Header with FLG.FNAME, name = "café" in ISO-8859-1 (the trailing
+  // `é` is byte 0xE9 — not valid as a standalone UTF-8 sequence).
+  let header_fixed = <<
+    0x1F, 0x8B, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+  >>
+  let fname_latin1 = <<0x63, 0x61, 0x66, 0xE9, 0x00>>
+  let deflate_empty_stored = <<0x01, 0x00, 0x00, 0xFF, 0xFF>>
+  let trailer = <<0:size(64)>>
+
+  let stream =
+    bit_array.concat([header_fixed, fname_latin1, deflate_empty_stored, trailer])
+
+  let assert Ok(decoded) = gzip.decode(bytes: stream)
+  // UTF-8 string "café" — U+00E9 encodes to bytes C3 A9.
+  gzip.name(decoded.header)
+  |> should.equal(Some("café"))
+  decoded.payload
+  |> should.equal(<<>>)
 }

@@ -118,8 +118,9 @@ jobs:
             ```
 
             See [HexDocs](https://hexdocs.pm/packkit) for the API
-            reference and the repository spec for the implementation
-            roadmap.
+            reference and
+            [CHANGELOG.md](https://github.com/nao1215/packkit/blob/main/CHANGELOG.md)
+            for the implementation history.
           draft: false
           prerelease: ${{ contains(steps.tag.outputs.TAG_NAME, '-alpha') || contains(steps.tag.outputs.TAG_NAME, '-beta') || contains(steps.tag.outputs.TAG_NAME, '-rc') }}
           generate_release_notes: false

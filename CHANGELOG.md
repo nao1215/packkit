@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+## [0.1.0] - 2026-05-26
+
+Initial public release.  The bullets below are the entire change history
+accumulated during the pre-1.0 scaffold-to-stable arc; everything listed
+ships in v0.1.0.  Highlights of the pre-release hardening pass:
+
+- **Fix (gzip, RFC 1952 §2.3.1 compliance)**: the decoder now (a) rejects
+  reserved FLG bits 0x20 / 0x40 / 0x80 with a typed
+  `CodecInvalidData("gzip reserved FLG bits set")` instead of silently
+  ignoring them; (b) actually verifies the FHCRC field against the
+  CRC-16 of the preceding header bytes (low two bytes of CRC-32) and
+  surfaces a typed `gzip header CRC16 mismatch` on disagreement
+  (previously the two bytes were skipped without verification); and
+  (c) decodes FNAME / FCOMMENT through a UTF-8-then-Latin-1 fallback so
+  RFC-conformant ISO-8859-1 names from older `gzip` producers no longer
+  surface as `"gzip header string is not UTF-8"`.
+- **Fix (archive)**: `archive.entry_by_path` searches in insertion order
+  (the order the docstring promises and `entries() |> list.find(...)`
+  produces) instead of the internal reversed list, so duplicate-path
+  archives return the first match, not the last.
+- **Fix (gzip)**: `with_name` / `with_comment` panic on embedded NUL
+  to keep the round-trip law `name(with_name(h, x)) == Some(x)`.
+  Previously they silently stripped NULs, breaking the law; the checked
+  counterparts (`with_name_checked` / `with_comment_checked`) are still
+  the untrusted-input route.
+- **Fix (lz4, JS target)**: refactored `decode_block_loop`,
+  `decode_blocks`, `decode_legacy_blocks`, and `copy_match_byte_by_byte`
+  into Step/Continue trampolines, mirroring the deflate / bzip2 fix.
+  Decoding more than ~1500 LZ77 sequences on JS no longer overflows the
+  call stack with `RangeError: Maximum call stack size exceeded`.
+- **Fix (detect)**: `from_path_or_bytes` surfaces the caller-supplied
+  `path` in the `DetectUnknownFormat.input` field when both detection
+  paths fail, instead of the internal `"byte-signature scan"` sentinel.
+- **Tests**: added 180 differential-corpus tests across gzip / bzip2 /
+  xz / zstd / lz4 / lzw (compress) against the system CLI, plus six
+  metamon-driven recipe pack/unpack round-trip properties.
+- **Docs**: README rewritten around worked examples (every code block
+  is checked by `test/packkit/readme_examples_test.gleam` so it cannot
+  silently rot); `doc/reference/spec.md` removed (it was local-only,
+  gitignored, and stale).
+- **Workflows**: the GitHub Release body now points at
+  `CHANGELOG.md` rather than a non-existent repository spec.
+
+The remaining bullets are the per-feature history of the 0.1.0 cycle.
+
 - **Feature (brotli)**: the encoder now also emits a real LZ77
   compressed metablock as a third candidate (alongside the existing
   uncompressed and literals-only paths).  A greedy 4-byte hash-chain
@@ -728,7 +773,8 @@
 - Added safe gzip header constructors: `with_name_checked` /
   `with_comment_checked` reject the NUL byte that would silently
   truncate the FNAME / FCOMMENT field on round-trip.  The unchecked
-  builders now strip embedded NULs.
+  builders panic on embedded NULs (lawful round-trip — the value the
+  caller passes is the value stored).
 - Tightened `detect.from_bytes`: gzip requires CM=8, zlib verifies
   CMF.CM/CINFO and the FCHECK mod-31 invariant (no more
   false-positives on `0x78 _` prefixes), bzip2 requires the 1..9

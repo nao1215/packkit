@@ -150,17 +150,17 @@ pub fn from_path_or_bytes_falls_back_to_bytes_test() -> Nil {
   |> should.equal(Some(codec.gzip()))
 }
 
-pub fn from_path_or_bytes_surfaces_bytes_error_when_both_unknown_test() -> Nil {
-  // Both the filename and the bytes are uninformative; the wrapper
-  // surfaces the bytes-side error so the message reflects the more
-  // specific signal (the actual data that failed magic-byte
-  // detection), not the path placeholder.
+pub fn from_path_or_bytes_surfaces_caller_path_when_both_unknown_test() -> Nil {
+  // Both the filename and the bytes are uninformative.  The wrapper
+  // must surface the caller-supplied `path` in the `input` field — not
+  // the internal `"byte-signature scan"` sentinel, which is opaque to
+  // end users and was the behaviour earlier revisions exposed.
   case
     detect.from_path_or_bytes(path: "mystery.bin", bytes: <<
       "definitely not a recognised header":utf8,
     >>)
   {
-    Error(error.DetectUnknownFormat(input: "byte-signature scan")) -> Nil
+    Error(error.DetectUnknownFormat(input: "mystery.bin")) -> Nil
     _ -> should.fail()
   }
 }

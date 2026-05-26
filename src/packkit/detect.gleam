@@ -34,15 +34,24 @@ pub fn from_filename(path: String) -> Result(Detected, error.DetectError) {
 /// when the path is uninformative (`-`, `/dev/stdin`, an arbitrary
 /// upload, etc.) the file's first bytes still pin the format.
 ///
-/// The returned `Detected` carries whichever path produced the hit; on
-/// failure the typed error mentions the path attempted last so the
-/// message stays specific to the user's input.
+/// On total failure (neither the filename nor the magic bytes
+/// classified the input) the returned `DetectUnknownFormat` carries
+/// the original caller-supplied `path` in its `input` field — never
+/// the internal `"byte-signature scan"` sentinel — so the message
+/// stays specific to the user's input.
 pub fn from_path_or_bytes(
   path path: String,
   bytes bytes: BitArray,
 ) -> Result(Detected, error.DetectError) {
+  // On total failure (neither side matched) surface
+  // `DetectUnknownFormat(input: path)` so the message reflects the
+  // caller's input rather than the internal `"byte-signature scan"`
+  // sentinel `from_bytes` carries.  Chained `result.or` short-circuits
+  // on the first Ok and falls through to the canonical error only
+  // when both detection paths failed.
   from_filename(path)
   |> result.or(from_bytes(bytes))
+  |> result.or(Error(error.DetectUnknownFormat(input: path)))
 }
 
 /// Filename rules, ordered most-specific first so the first match wins.
