@@ -69,6 +69,19 @@ const unix_ts_extra_id: Int = 0x5455
 
 const unix_ts_flag_mtime: Int = 0x01
 
+// InfoZIP Unix UID/GID extra fields.  The "new" form (`ux`, 0x7875)
+// stores variable-width UID + GID values prefixed by their byte
+// length, so the field is future-proof against UIDs > 2^32.  The
+// "old" form (`Ux`, 0x7855) is fixed at 2 bytes UID + 2 bytes GID
+// and was deprecated when systems with > 65535 UIDs became common.
+// packkit emits the new form; the decoder accepts either, preferring
+// the new form when both are present.
+const unix_uid_gid_new_extra_id: Int = 0x7875
+
+const unix_uid_gid_old_extra_id: Int = 0x7855
+
+const unix_uid_gid_new_version: Int = 1
+
 const method_store: Int = 0
 
 const method_deflate: Int = 8
@@ -650,6 +663,18 @@ fn encode_entry(
     False -> <<>>
   }
 
+  // InfoZIP UID/GID extra (header_id 0x7875).  Emit only when the
+  // entry actually carries owner ids — root-owned entries (uid=0,
+  // gid=0) stay bit-stable against the pre-UID/GID encoder so the
+  // overwhelmingly common "no ownership info" archive doesn't pay
+  // an extra 15 bytes per entry.
+  let uid = entry.user_id(metadata)
+  let gid = entry.group_id(metadata)
+  let unix_uid_gid_extra = case uid > 0 || gid > 0 {
+    True -> build_unix_uid_gid_extra(uid, gid)
+    False -> <<>>
+  }
+
   let zip64_local_extra = case local_needs_zip64 {
     False -> <<>>
     True ->
@@ -677,11 +702,14 @@ fn encode_entry(
       )
   }
   // Concatenate Zip64 extras (when present) with the Extended
-  // Timestamp extra.  APPNOTE.TXT does not mandate any ordering
-  // between extra fields, but it's conventional to write Zip64 first
-  // because some legacy decoders bail at the first unknown id.
-  let local_extra = bit_array.concat([zip64_local_extra, unix_ts_extra])
-  let central_extra = bit_array.concat([zip64_central_extra, unix_ts_extra])
+  // Timestamp + UID/GID extras.  APPNOTE.TXT does not mandate any
+  // ordering between extra fields, but it's conventional to write
+  // Zip64 first because some legacy decoders bail at the first
+  // unknown id.
+  let local_extra =
+    bit_array.concat([zip64_local_extra, unix_ts_extra, unix_uid_gid_extra])
+  let central_extra =
+    bit_array.concat([zip64_central_extra, unix_ts_extra, unix_uid_gid_extra])
 
   let version_needed = case
     local_needs_zip64 || central_needs_zip64,
@@ -936,6 +964,97 @@ fn find_unix_ts_extra_mtime(extra: BitArray) -> Option(Int) {
           }
         _ -> None
       }
+  }
+}
+
+// Build the InfoZIP "new" Unix UID/GID extra field (header_id
+// 0x7875 / "ux").  Both UID and GID are emitted as little-endian
+// uint32 (size byte = 4), which is enough headroom for every Unix
+// system in production use without paying the full uint64 cost.
+// `entry.with_owner_checked` already rejects negative values, so we
+// know the inputs fit in 32 bits unsigned.
+fn build_unix_uid_gid_extra(uid: Int, gid: Int) -> BitArray {
+  let body = <<
+    unix_uid_gid_new_version,
+    0x04,
+    uid:little-size(32),
+    0x04,
+    gid:little-size(32),
+  >>
+  bit_array.concat([
+    le16(unix_uid_gid_new_extra_id),
+    le16(bit_array.byte_size(body)),
+    body,
+  ])
+}
+
+// Scan the extras blob for either UID/GID extra and return
+// `Some(#(uid, gid))` when one is found.  The new form (0x7875)
+// supports variable widths but in practice every writer emits
+// 4-byte values, so we accept 1/2/4-byte widths defensively and
+// reject anything else.  The old form (0x7855) is fixed at 2 bytes
+// per field; some writers emit a zero-length central record (only
+// the local one carries the values), so a missing-old-form match
+// is not an error.  When both forms are present we prefer the new
+// one.
+fn find_unix_uid_gid_in_extra(extra: BitArray) -> Option(#(Int, Int)) {
+  case find_unix_uid_gid_new(extra) {
+    Some(pair) -> Some(pair)
+    None -> find_unix_uid_gid_old(extra)
+  }
+}
+
+fn find_unix_uid_gid_new(extra: BitArray) -> Option(#(Int, Int)) {
+  case find_extra_field(extra, unix_uid_gid_new_extra_id) {
+    Error(_) -> None
+    Ok(body) ->
+      case body {
+        <<_version, uid_size, rest:bytes>> ->
+          case decode_unix_uid_gid_value(rest, uid_size) {
+            None -> None
+            Some(#(uid, after_uid)) ->
+              case after_uid {
+                <<gid_size, gid_rest:bytes>> ->
+                  case decode_unix_uid_gid_value(gid_rest, gid_size) {
+                    None -> None
+                    Some(#(gid, _)) -> Some(#(uid, gid))
+                  }
+                _ -> None
+              }
+          }
+        _ -> None
+      }
+  }
+}
+
+fn find_unix_uid_gid_old(extra: BitArray) -> Option(#(Int, Int)) {
+  case find_extra_field(extra, unix_uid_gid_old_extra_id) {
+    Error(_) -> None
+    Ok(body) ->
+      case body {
+        <<uid:little-size(16), gid:little-size(16), _:bytes>> ->
+          Some(#(uid, gid))
+        _ -> None
+      }
+  }
+}
+
+// Decode a `width`-byte little-endian unsigned integer from the
+// head of `bytes`.  packkit's extras are always emitted with
+// width = 4, but other producers may use 1, 2, or 8 (the new
+// 0x7875 form is intentionally variable-width).  Widths we don't
+// recognise return None so the caller falls back to the old form
+// or skips the extra entirely.
+fn decode_unix_uid_gid_value(
+  bytes: BitArray,
+  width: Int,
+) -> Option(#(Int, BitArray)) {
+  case width, bytes {
+    1, <<value, rest:bytes>> -> Some(#(value, rest))
+    2, <<value:little-size(16), rest:bytes>> -> Some(#(value, rest))
+    4, <<value:little-size(32), rest:bytes>> -> Some(#(value, rest))
+    8, <<value:little-size(64), rest:bytes>> -> Some(#(value, rest))
+    _, _ -> None
   }
 }
 
@@ -1233,6 +1352,18 @@ fn parse_central_directory(
           }
       }
 
+      // Resolve owner (UID, GID) from the InfoZIP `ux` / `Ux` extras.
+      // Either form may be absent; when neither is present the
+      // entry's owner stays at 0/0 (root) — which is also the
+      // default a freshly-created Entry carries, so the round-trip
+      // for plain archives is a no-op.
+      let #(owner_uid, owner_gid) = case
+        find_unix_uid_gid_in_extra(extra_bits)
+      {
+        Some(#(uid, gid)) if uid >= 0 && gid >= 0 -> #(uid, gid)
+        _ -> #(0, 0)
+      }
+
       use <- bool.guard(
         when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
         return: Error(error.ArchiveLimitExceeded(
@@ -1270,6 +1401,8 @@ fn parse_central_directory(
         gp_flag,
         password,
         mtime_resolved,
+        owner_uid,
+        owner_gid,
       ))
 
       // Adversarial archives can pack many independently-bounded
@@ -1327,6 +1460,8 @@ fn read_local_entry(
   gp_flag: Int,
   password: Option(String),
   mtime_unix: Int,
+  owner_uid: Int,
+  owner_gid: Int,
 ) -> Result(entry.Entry, error.ArchiveError) {
   use signature <- result.try(read_le32_at(full, local_offset))
   use <- bool.guard(
@@ -1476,9 +1611,14 @@ fn read_local_entry(
       0 -> e
       _ -> entry.with_mode(e, mode: mode)
     }
-    case mtime_unix > 0 {
+    let with_mtime = case mtime_unix > 0 {
       True -> entry.with_modified_at(with_mode, unix_seconds: mtime_unix)
       False -> with_mode
+    }
+    case owner_uid > 0 || owner_gid > 0 {
+      True ->
+        entry.with_owner(with_mtime, user_id: owner_uid, group_id: owner_gid)
+      False -> with_mtime
     }
   }
 

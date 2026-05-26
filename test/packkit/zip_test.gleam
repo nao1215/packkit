@@ -764,3 +764,80 @@ pub fn encode_omits_efs_flag_on_ascii_filename_test() -> Nil {
   int.bitwise_and(gp_flag, 0x0800)
   |> should.equal(0)
 }
+
+// -- entry uid/gid round-trip (InfoZIP `ux` 0x7875) -------------------
+//
+// ZIP's fixed central-directory record has no slot for Unix
+// ownership.  The InfoZIP "new" Unix extra field (header_id
+// 0x7875) carries variable-width UID + GID values; packkit emits
+// the 4-byte form whenever the entry's owner is non-default
+// (uid > 0 || gid > 0).  Root-owned entries (uid=gid=0) skip the
+// extra so plain archives stay bit-stable against the pre-uid/gid
+// encoder.
+
+fn zip_roundtrip_owner(uid: Int, gid: Int) -> #(Int, Int) {
+  let value =
+    entry.file(path: "owned.txt", body: <<"hi":utf8>>)
+    |> entry.with_owner(user_id: uid, group_id: gid)
+  let archive_value = archive.add(zip.new(), entry: value)
+  let assert Ok(bytes) = zip.encode(archive: archive_value)
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [single] = archive.entries(decoded)
+  let meta = entry.metadata(single)
+  #(entry.user_id(meta), entry.group_id(meta))
+}
+
+pub fn roundtrip_preserves_entry_uid_gid_test() -> Nil {
+  // Typical end-user account on Linux: uid/gid = 1000.
+  zip_roundtrip_owner(1000, 1000)
+  |> should.equal(#(1000, 1000))
+}
+
+pub fn roundtrip_preserves_uid_only_test() -> Nil {
+  // uid > 0 with gid = 0 still emits the extra (the predicate
+  // is `uid > 0 || gid > 0`); both values must round-trip even
+  // when only one is non-default.
+  zip_roundtrip_owner(1234, 0)
+  |> should.equal(#(1234, 0))
+}
+
+pub fn roundtrip_skips_uid_gid_extra_for_root_owner_test() -> Nil {
+  // uid = gid = 0 is the default for a freshly-constructed Entry,
+  // so the encoder skips the extra and the decoder leaves the owner
+  // at the default 0/0 instead of materialising explicit values
+  // that would otherwise change the entry's metadata fingerprint.
+  zip_roundtrip_owner(0, 0)
+  |> should.equal(#(0, 0))
+}
+
+pub fn decodes_system_zip_with_unix_uid_gid_extra_test() -> Nil {
+  // `touch owned.txt && zip owned.zip owned.txt` (Info-ZIP 3.0)
+  // run as a user with uid = gid = 1000.  The central extra
+  // carries the new-form UID/GID extra (header_id 0x7875) with
+  // 4-byte values + the Extended Timestamp extra (0x5455) +
+  // packkit-irrelevant fields.  We assert the round-trip surfaces
+  // the producer's uid/gid via `entry.user_id` / `entry.group_id`.
+  let fixture = <<
+    0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEF, 0x56, 0xBA,
+    0x5C, 0xF5, 0xBF, 0x54, 0x31, 0x0B, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x00, 0x00,
+    0x09, 0x00, 0x1C, 0x00, 0x6F, 0x77, 0x6E, 0x65, 0x64, 0x2E, 0x74, 0x78, 0x74,
+    0x55, 0x54, 0x09, 0x00, 0x03, 0x92, 0xFD, 0x14, 0x6A, 0x92, 0xFD, 0x14, 0x6A,
+    0x75, 0x78, 0x0B, 0x00, 0x01, 0x04, 0xE8, 0x03, 0x00, 0x00, 0x04, 0xE8, 0x03,
+    0x00, 0x00, 0x6F, 0x77, 0x6E, 0x65, 0x72, 0x20, 0x74, 0x65, 0x73, 0x74, 0x0A,
+    0x50, 0x4B, 0x01, 0x02, 0x1E, 0x03, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEF,
+    0x56, 0xBA, 0x5C, 0xF5, 0xBF, 0x54, 0x31, 0x0B, 0x00, 0x00, 0x00, 0x0B, 0x00,
+    0x00, 0x00, 0x09, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0xA4, 0x81, 0x00, 0x00, 0x00, 0x00, 0x6F, 0x77, 0x6E, 0x65, 0x64, 0x2E,
+    0x74, 0x78, 0x74, 0x55, 0x54, 0x05, 0x00, 0x03, 0x92, 0xFD, 0x14, 0x6A, 0x75,
+    0x78, 0x0B, 0x00, 0x01, 0x04, 0xE8, 0x03, 0x00, 0x00, 0x04, 0xE8, 0x03, 0x00,
+    0x00, 0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+    0x4F, 0x00, 0x00, 0x00, 0x4E, 0x00, 0x00, 0x00, 0x00, 0x00,
+  >>
+  let assert Ok(decoded) = zip.decode(bytes: fixture)
+  let assert [single] = archive.entries(decoded)
+  entry.to_string(entry.path(single))
+  |> should.equal("owned.txt")
+  let meta = entry.metadata(single)
+  entry.user_id(meta) |> should.equal(1000)
+  entry.group_id(meta) |> should.equal(1000)
+}

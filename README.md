@@ -64,7 +64,13 @@ Implemented codecs and archive families:
   (bit 11, APPNOTE.TXT §4.4.4) so spec-conformant decoders
   interpret the bytes as UTF-8 instead of CP437; pure-ASCII
   names leave the flag clear and stay bit-stable against the
-  pre-EFS encoder
+  pre-EFS encoder.  Unix UID/GID round-trip in both directions
+  via the InfoZIP "new" Unix extra field (header_id 0x7875
+  / "ux") with 4-byte uid + gid; the decoder also accepts the
+  legacy 2-byte form (header_id 0x7855 / "Ux") when an archive
+  uses it.  Root-owned entries (uid = gid = 0) skip the extra
+  so plain archives stay bit-stable against the pre-UID/GID
+  encoder
 - **7z**: single-folder reader.  Recognised single-coder ids:
   LZMA (`0x03 0x01 0x01`), LZMA2 (`0x21`), Copy (`0x00`),
   Deflate (`0x04 0x01 0x08`), BZip2 (`0x04 0x02 0x02`), and
