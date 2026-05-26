@@ -142,6 +142,11 @@ const aes_max_field_bytes: Int = 16
 // the KDF layer.
 const aes_default_num_cycles_power: Int = 19
 
+// AES-256 key size in bytes; the 7z AES coder is always AES-256
+// (per p7zip — the same 32-byte SHA-256 digest is used as the key
+// regardless of how many cipher rounds it eventually drives).
+const aes_key_size_256: Int = 32
+
 // NIDs from the 7z specification.
 const nid_end: Int = 0x00
 
@@ -275,7 +280,7 @@ pub fn encode_with_method(
   archive archive_value: archives.Archive,
   method method: Method,
 ) -> Result(BitArray, error.ArchiveError) {
-  do_encode(archive_value, method, option.None)
+  do_encode(archive_value, method, option.None, option.None)
 }
 
 /// Encode a logical archive to a 7z byte stream with AES-256-CBC
@@ -318,14 +323,55 @@ pub fn encode_with_password_and_method(
   password password: String,
   method method: Method,
 ) -> Result(BitArray, error.ArchiveError) {
-  let spec =
-    EncryptionSpec(
-      password: password,
-      salt: <<>>,
-      iv: <<0:size(128)>>,
-      num_cycles_power: aes_default_num_cycles_power,
-    )
-  do_encode(archive_value, method, option.Some(spec))
+  do_encode(
+    archive_value,
+    method,
+    option.Some(default_encryption_spec(password)),
+    option.None,
+  )
+}
+
+/// Encode an archive with both the payload AND the next-header bytes
+/// AES-encrypted — the on-disk equivalent of `7z a -p<pw> -mhe=on`.
+/// The signature header points at an "encoded next header" (NID 0x17)
+/// whose StreamsInfo block tells the decoder where the AES-encrypted
+/// next-header pack lives; the next header itself is plain bytes
+/// AES-CBC-encrypted with the user's password (no inner compression
+/// — the header is small enough that LZMA isn't worth the dispatch
+/// cost).
+///
+/// The same determinism caveat as `encode_with_password` applies: salt
+/// is empty and IV is all zeros.
+pub fn encode_with_password_and_header_encryption(
+  archive archive_value: archives.Archive,
+  password password: String,
+) -> Result(BitArray, error.ArchiveError) {
+  encode_with_password_and_header_encryption_and_method(
+    archive: archive_value,
+    password: password,
+    method: lzma(),
+  )
+}
+
+/// Like `encode_with_password_and_header_encryption` but lets the
+/// caller pick the inner coder for the *payload*.  The header is
+/// always wrapped in just AES (no inner method).
+pub fn encode_with_password_and_header_encryption_and_method(
+  archive archive_value: archives.Archive,
+  password password: String,
+  method method: Method,
+) -> Result(BitArray, error.ArchiveError) {
+  let spec = default_encryption_spec(password)
+  do_encode(archive_value, method, option.Some(spec), option.Some(spec))
+}
+
+fn default_encryption_spec(password: String) -> EncryptionSpec {
+  EncryptionSpec(
+    password: password,
+    salt: <<>>,
+    iv: <<0:size(128)>>,
+    num_cycles_power: aes_default_num_cycles_power,
+  )
 }
 
 type EncryptionSpec {
@@ -341,6 +387,7 @@ fn do_encode(
   archive_value: archives.Archive,
   method: Method,
   encryption: Option(EncryptionSpec),
+  header_encryption: Option(EncryptionSpec),
 ) -> Result(BitArray, error.ArchiveError) {
   let entries = archives.entries(archive_value)
   case entries {
@@ -349,7 +396,7 @@ fn do_encode(
         path: "<archive>",
         reason: "7z encoder requires at least one entry",
       ))
-    _ -> encode_entries(entries, method, encryption)
+    _ -> encode_entries(entries, method, encryption, header_encryption)
   }
 }
 
@@ -357,6 +404,7 @@ fn encode_entries(
   entries: List(entry.Entry),
   method: Method,
   encryption: Option(EncryptionSpec),
+  header_encryption: Option(EncryptionSpec),
 ) -> Result(BitArray, error.ArchiveError) {
   use _ <- result.try(validate_entries_for_encode(entries))
 
@@ -453,7 +501,7 @@ fn encode_entries(
     ])
 
   // -- Header block ------------------------------------------------
-  let next_header =
+  let plain_next_header =
     bit_array.concat([
       <<nid_header>>,
       main_streams,
@@ -461,15 +509,20 @@ fn encode_entries(
       <<nid_end>>,
     ])
 
-  let next_header_size = bit_array.byte_size(next_header)
-  let next_header_crc = checksum.crc32(next_header)
-  let next_header_offset = pack_size
+  use #(post_pack_bytes, final_next_header) <- result.try(
+    maybe_encrypt_next_header(plain_next_header, pack_size, header_encryption),
+  )
+
+  let final_next_header_size = bit_array.byte_size(final_next_header)
+  let final_next_header_crc = checksum.crc32(final_next_header)
+  let final_next_header_offset =
+    pack_size + bit_array.byte_size(post_pack_bytes)
 
   // -- Signature header --------------------------------------------
   let post_signature_20 = <<
-    next_header_offset:little-size(64),
-    next_header_size:little-size(64),
-    next_header_crc:little-size(32),
+    final_next_header_offset:little-size(64),
+    final_next_header_size:little-size(64),
+    final_next_header_crc:little-size(32),
   >>
   let start_crc = checksum.crc32(post_signature_20)
   let signature_header =
@@ -480,7 +533,99 @@ fn encode_entries(
       post_signature_20,
     ])
 
-  Ok(bit_array.concat([signature_header, packed, next_header]))
+  Ok(
+    bit_array.concat([
+      signature_header,
+      packed,
+      post_pack_bytes,
+      final_next_header,
+    ]),
+  )
+}
+
+// Returns `#(post_pack_bytes, final_next_header)` where:
+//   - `post_pack_bytes` are inserted between the payload pack and the
+//     next header (empty when header encryption is off, the
+//     AES-encrypted next-header pack when it's on).
+//   - `final_next_header` is what the signature header points at: the
+//     plain header bytes when header encryption is off, or the
+//     wrapped `nid_encoded_header + StreamsInfo` bytes when it's on.
+fn maybe_encrypt_next_header(
+  plain_next_header: BitArray,
+  payload_pack_size: Int,
+  header_encryption: Option(EncryptionSpec),
+) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+  case header_encryption {
+    option.None -> Ok(#(<<>>, plain_next_header))
+    option.Some(spec) -> {
+      use key <- result.try(derive_aes_key(
+        password: spec.password,
+        salt: spec.salt,
+        num_cycles_power: spec.num_cycles_power,
+      ))
+      use encrypted_header <- result.try(aes_cbc_encrypt(
+        plain_next_header,
+        key,
+        spec.iv,
+      ))
+      let plain_size = bit_array.byte_size(plain_next_header)
+      let encrypted_size = bit_array.byte_size(encrypted_header)
+      use aes_coder_def <- result.try(build_aes_coder_def(spec))
+      let encoded_next_header =
+        build_encoded_next_header_for_aes(
+          pack_pos: payload_pack_size,
+          pack_size: encrypted_size,
+          aes_coder_def: aes_coder_def,
+          plain_header_size: plain_size,
+        )
+      Ok(#(encrypted_header, encoded_next_header))
+    }
+  }
+}
+
+// Build the `NID encoded_header (0x17) + StreamsInfo` block that goes
+// where the signature header points when `-mhe=on` is in effect.  The
+// StreamsInfo describes a 1-folder, 1-coder (AES-only) pack region
+// holding the AES-encrypted plain next header.
+fn build_encoded_next_header_for_aes(
+  pack_pos pack_pos: Int,
+  pack_size pack_size: Int,
+  aes_coder_def aes_coder_def: BitArray,
+  plain_header_size plain_header_size: Int,
+) -> BitArray {
+  let pack_info =
+    bit_array.concat([
+      <<nid_pack_info>>,
+      write_varint(pack_pos),
+      write_varint(1),
+      <<nid_size>>,
+      write_varint(pack_size),
+      <<nid_end>>,
+    ])
+  let folder_def =
+    bit_array.concat([
+      write_varint(1),
+      // external = inline
+      <<0x00>>,
+      // num_coders = 1 (just AES)
+      write_varint(1),
+      aes_coder_def,
+    ])
+  let unpack_info =
+    bit_array.concat([
+      <<nid_unpack_info>>,
+      <<nid_folder>>,
+      folder_def,
+      <<nid_coders_unpack_size>>,
+      write_varint(plain_header_size),
+      <<nid_end>>,
+    ])
+  bit_array.concat([
+    <<nid_encoded_header>>,
+    pack_info,
+    unpack_info,
+    <<nid_end>>,
+  ])
 }
 
 fn validate_entries_for_encode(
@@ -1032,18 +1177,19 @@ fn decode_encoded_header(
         message: "7z encoded next header has no StreamsInfo",
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
-      // The encoded-header path always uses exactly one folder per
-      // spec: the next-header bytes are a single LZMA-coded stream.
-      // Reject the (unobserved-in-the-wild) multi-folder shape with a
-      // typed error rather than silently picking the first folder.
-      use <- bool.guard(
-        when: list.length(folders) != 1,
-        return: Error(error.ArchiveNotImplemented(
-          feature: "7z encoded header spread across multiple folders",
-        )),
-      )
-      let assert [folder, ..] = folders
-      let assert [unpack_sizes, ..] = folder_unpack_sizes
+      // The common case is one folder, but the spec allows multiple —
+      // each folder consumes the next slice from the pack region and
+      // emits a chunk of the encoded next header; concatenated in
+      // folder order, they form the plain next-header bytes that
+      // `parse_header` then reads.  We reuse the same machinery as the
+      // top-level `decode_all_folders` so the AES / linear-chain logic
+      // is exercised through a single code path.
+      //
+      // `password` is forwarded so that header-encryption archives
+      // (`7z a -p<pw> -mhe=on ...`) — which wrap the next header in an
+      // AES coder chain just like a regular folder — decrypt
+      // transparently.  Archives without an AES coder in the encoded
+      // header's folder ignore the password.
       let pack_offset = signature_size + pack_pos
       let pack_size = sum_list(pack_sizes, 0)
       use packed <- result.try(slice_required(
@@ -1052,12 +1198,16 @@ fn decode_encoded_header(
         pack_size,
         "7z encoded-header packed bytes",
       ))
-      // `password` is forwarded so that header-encryption archives
-      // (`7z a -p<pw> -mhe=on ...`) — which wrap the next header in an
-      // AES coder chain just like a regular folder — decrypt
-      // transparently.  Archives without an AES coder in the encoded
-      // header's folder ignore the password.
-      decode_folder(packed, folder, unpack_sizes, password, limits)
+      decode_all_folders(
+        packed,
+        folders,
+        folder_unpack_sizes,
+        pack_sizes,
+        password,
+        limits,
+        0,
+        [],
+      )
     }
   }
 }
@@ -1085,13 +1235,18 @@ fn parse_signature_header(
       next_crc:little-unsigned-size(32),
       _:bytes,
     >> -> {
-      use <- bool.guard(
-        when: next_offset_hi != 0 || next_size_hi != 0,
-        return: Error(error.ArchiveNotImplemented(
-          feature: "7z next header above 2^32 bytes",
-        )),
-      )
-      Ok(#(next_offset_lo, next_size_lo, next_crc))
+      // The 7z spec records `next_header_offset` and `next_header_size`
+      // as 64-bit little-endian uints, so we compose the two 32-bit
+      // halves into the full 64-bit value.  Gleam Ints are arbitrary
+      // precision, so there's no overflow worry — the practical cap is
+      // whichever value the caller passes for `max_input_bytes`.
+      let next_offset =
+        int.bitwise_shift_left(next_offset_hi, 32)
+        |> int.bitwise_or(next_offset_lo)
+      let next_size =
+        int.bitwise_shift_left(next_size_hi, 32)
+        |> int.bitwise_or(next_size_lo)
+      Ok(#(next_offset, next_size, next_crc))
     }
     _ -> Error(error.ArchiveInvalid(message: "invalid 7z signature header"))
   }
@@ -1541,8 +1696,11 @@ fn split_unpack_sizes_by_folder(
 // Parse a single folder definition: NumCoders varint, N coder defs,
 // then (when NumCoders > 1) NumBindPairs = NumOutStreams - 1 bind
 // pairs and (when NumPackedStreams > 1) the packed-stream indices.
-// packkit supports linear 1- or 2-coder chains only; non-linear and
-// 3+-coder shapes are rejected with typed `ArchiveNotImplemented`.
+// packkit supports linear 1-, 2-, or 3-coder chains where every
+// coder has a single input + single output and the bind pairs wire
+// them in straight order.  Non-linear graphs (BCJ2's 4-stream demux,
+// or any non-(i, i-1) bind pair shape) and 4+-coder folders are
+// rejected with typed `ArchiveNotImplemented`.
 fn parse_one_folder(
   bytes: BitArray,
 ) -> Result(#(ParsedFolder, BitArray), error.ArchiveError) {
@@ -1554,7 +1712,7 @@ fn parse_one_folder(
     )),
   )
   use <- bool.guard(
-    when: num_coders > 2,
+    when: num_coders > 3,
     return: Error(error.ArchiveNotImplemented(
       feature: "7z folders with " <> int.to_string(num_coders) <> " coders",
     )),
@@ -1563,28 +1721,47 @@ fn parse_one_folder(
   case num_coders {
     1 -> Ok(#(ParsedFolder(coders: coders), rest))
     _ -> {
-      // 2-coder simple chain: exactly 1 bind pair, in_idx = 1, out_idx = 0
-      // means "coder 1's input is wired from coder 0's output", i.e.
-      // packed bytes feed coder 0, coder 1's output is the folder
-      // output.  Any other indexing is non-linear (BCJ2 etc) and
-      // unsupported.  NumPackedStreams = NumInStreams - NumBindPairs
-      // = 2 - 1 = 1, so the spec omits the explicit packed-stream
-      // index list — we don't consume anything for it.
-      use #(in_idx, after_in) <- result.try(read_number(rest))
-      use #(out_idx, after_out) <- result.try(read_number(after_in))
-      use <- bool.guard(
-        when: in_idx != 1 || out_idx != 0,
-        return: Error(error.ArchiveNotImplemented(
-          feature: "7z non-linear 2-coder folder topology (bind in="
-          <> int.to_string(in_idx)
-          <> " out="
-          <> int.to_string(out_idx)
-          <> ")",
-        )),
-      )
-      Ok(#(ParsedFolder(coders: coders), after_out))
+      // For an N-coder linear chain we expect N - 1 bind pairs in the
+      // canonical order: (in_idx = i, out_idx = i - 1) for i in 1..N-1.
+      // Packed bytes feed coder 0; coder N-1's output is the folder
+      // output.  Anything else (BCJ2 demux etc) is non-linear and
+      // rejected.  NumPackedStreams = NumInStreams - NumBindPairs = 1
+      // so the spec omits the explicit packed-stream index list.
+      let num_bind_pairs = num_coders - 1
+      use #(after_bind_pairs, _) <- result.try(consume_linear_bind_pairs(
+        rest,
+        1,
+        num_bind_pairs,
+      ))
+      Ok(#(ParsedFolder(coders: coders), after_bind_pairs))
     }
   }
+}
+
+fn consume_linear_bind_pairs(
+  bytes: BitArray,
+  next_in_idx: Int,
+  remaining: Int,
+) -> Result(#(BitArray, Nil), error.ArchiveError) {
+  use <- bool.guard(when: remaining == 0, return: Ok(#(bytes, Nil)))
+  use #(in_idx, after_in) <- result.try(read_number(bytes))
+  use #(out_idx, after_out) <- result.try(read_number(after_in))
+  let expected_out_idx = next_in_idx - 1
+  use <- bool.guard(
+    when: in_idx != next_in_idx || out_idx != expected_out_idx,
+    return: Error(error.ArchiveNotImplemented(
+      feature: "7z non-linear coder topology (bind in="
+      <> int.to_string(in_idx)
+      <> " out="
+      <> int.to_string(out_idx)
+      <> ", expected linear in="
+      <> int.to_string(next_in_idx)
+      <> " out="
+      <> int.to_string(expected_out_idx)
+      <> ")",
+    )),
+  )
+  consume_linear_bind_pairs(after_out, next_in_idx + 1, remaining - 1)
 }
 
 fn parse_coders_loop(
@@ -2441,32 +2618,51 @@ fn decode_folder(
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
-  case folder.coders {
-    [single] -> dispatch_coder(packed, single, unpack_sizes, password, limits)
-    [first, second] -> {
-      // 2-coder linear chain: packed bytes feed `first`, its output
-      // feeds `second`, and `second`'s output is the folder output.
-      // The two CodersUnPackSize entries match that ordering — entry 0
-      // = first coder's output size, entry 1 = second coder's output
-      // size (= the folder unpack total we use for substream
-      // splitting).
-      let #(first_unpack, final_unpack) = case unpack_sizes {
-        [first_size, second_size, ..] -> #(first_size, second_size)
-        [only_size] -> #(only_size, only_size)
-        [] -> #(0, 0)
-      }
+  // N-coder linear chain: packed bytes feed coder 0, whose output
+  // feeds coder 1, and so on through coder N-1 whose output is the
+  // folder output.  CodersUnPackSize entries match that ordering, one
+  // varint per coder output (entry i = coder i's declared output
+  // size).  `parse_one_folder` already enforced the canonical linear
+  // bind-pair ordering, so we can simply walk both lists in lockstep.
+  decode_linear_chain(packed, folder.coders, unpack_sizes, password, limits)
+}
+
+fn decode_linear_chain(
+  packed: BitArray,
+  coders: List(CoderSpec),
+  unpack_sizes: List(Int),
+  password: Option(String),
+  limits: limit.Limits,
+) -> Result(BitArray, error.ArchiveError) {
+  case coders, unpack_sizes {
+    [], _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z folder has unsupported coder count",
+      ))
+    [single], _ ->
+      dispatch_coder(packed, single, unpack_sizes, password, limits)
+    [head, ..rest_coders], [head_size, ..rest_sizes] -> {
       use intermediate <- result.try(dispatch_coder(
         packed,
-        first,
-        [first_unpack],
+        head,
+        [head_size],
         password,
         limits,
       ))
-      dispatch_coder(intermediate, second, [final_unpack], password, limits)
+      decode_linear_chain(
+        intermediate,
+        rest_coders,
+        rest_sizes,
+        password,
+        limits,
+      )
     }
-    _ ->
+    // CodersUnPackSize was shorter than the coder list — malformed
+    // header; reject rather than silently splitting on a phantom
+    // size.
+    _, _ ->
       Error(error.ArchiveInvalid(
-        message: "7z folder has unsupported coder count",
+        message: "7z folder coder list longer than CodersUnPackSize block",
       ))
   }
 }
@@ -2713,28 +2909,26 @@ fn parse_aes_field_sizes(
 }
 
 // Derive a 32-byte AES-256 key per p7zip's `CKeyInfo::CalcKey` in
-// `CPP/7zip/Crypto/7zAes.cpp`: feed
-//   salt || utf16le(password) || u64_le(counter)
-// into one SHA-256 context for `2 ^ num_cycles_power` iterations, then
-// the digest is the key.  numCyclesPower == 0x3F (63) is a documented
-// "use SHA256(salt || password) directly" escape hatch; not observed
-// in archives produced by p7zip's `7z a`, so reject it for now.
+// `CPP/7zip/Crypto/7zAes.cpp`.  Two modes:
+//   - numCyclesPower < 0x3F (the common case): feed
+//       salt || utf16le(password) || u64_le(counter)
+//     into one SHA-256 context for `2 ^ num_cycles_power` iterations
+//     (typically 524288), then the digest is the key.
+//   - numCyclesPower == 0x3F (rare; not produced by `7z a` but allowed
+//     by the spec): no hashing at all — the key is just
+//     `salt || utf16le(password) || zeros`, truncated to 32 bytes.
+//     The escape hatch exists so trusted tools can pre-derive keys
+//     elsewhere and store them in the archive without the KDF cost.
 fn derive_aes_key(
   password password: String,
   salt salt: BitArray,
   num_cycles_power num_cycles_power: Int,
 ) -> Result(aes.ExpandedKey, error.ArchiveError) {
-  use <- bool.guard(
-    when: num_cycles_power == aes_num_cycles_mask,
-    return: Error(error.ArchiveNotImplemented(
-      feature: "7z AES numCyclesPower 0x3F (direct SHA-256 mode)",
-    )),
-  )
   let password_utf16le = utf16le_encode(password, <<>>)
-  let rounds = int.bitwise_shift_left(1, num_cycles_power)
-  let initial = checksum.sha256_init()
-  let final_state = aes_kdf_loop(initial, salt, password_utf16le, 0, rounds)
-  let digest = checksum.sha256_finalize(state: final_state)
+  let digest = case num_cycles_power == aes_num_cycles_mask {
+    True -> derive_aes_key_direct(salt, password_utf16le)
+    False -> derive_aes_key_hashed(salt, password_utf16le, num_cycles_power)
+  }
   case aes.expand_key(digest) {
     Ok(expanded) -> Ok(expanded)
     Error(Nil) ->
@@ -2742,6 +2936,28 @@ fn derive_aes_key(
         message: "7z AES key expansion rejected the derived 32-byte digest",
       ))
   }
+}
+
+fn derive_aes_key_hashed(
+  salt: BitArray,
+  password_utf16le: BitArray,
+  num_cycles_power: Int,
+) -> BitArray {
+  let rounds = int.bitwise_shift_left(1, num_cycles_power)
+  let initial = checksum.sha256_init()
+  let final_state = aes_kdf_loop(initial, salt, password_utf16le, 0, rounds)
+  checksum.sha256_finalize(state: final_state)
+}
+
+fn derive_aes_key_direct(salt: BitArray, password_utf16le: BitArray) -> BitArray {
+  // p7zip pseudo-code: copy salt, then password, then zero-fill — all
+  // truncated to 32 bytes.  We build the concatenation upfront, pad on
+  // the right with 32 zero bytes (always enough), and slice the first
+  // 32 bytes.  The slice cannot fail because the padded buffer is at
+  // least 32 bytes; the `result.unwrap` keeps the linter happy.
+  let combined = <<salt:bits, password_utf16le:bits, 0:size({ 32 * 8 })>>
+  bit_array.slice(combined, 0, aes_key_size_256)
+  |> result.unwrap(or: <<0:size({ 32 * 8 })>>)
 }
 
 fn aes_kdf_loop(

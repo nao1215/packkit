@@ -192,6 +192,58 @@ pub fn encode_with_password_is_deterministic_test() -> Nil {
   first |> should.equal(second)
 }
 
+pub fn encode_with_header_encryption_round_trip_test() -> Nil {
+  // `-mhe=on` equivalent: both the payload AND the next header are
+  // AES-encrypted.  Round-trip through `decode_with_password` (which
+  // forwards the password into `decode_encoded_header`) must recover
+  // the original entries.
+  let archive =
+    archives.new(format: seven_z.format())
+    |> archives.add(
+      entry: entry.file(path: "ledger.txt", body: <<
+        "header-encrypted entry body\n":utf8,
+      >>),
+    )
+
+  let assert Ok(encoded) =
+    seven_z.encode_with_password_and_header_encryption(
+      archive: archive,
+      password: secret_password,
+    )
+
+  let assert Ok(decoded) =
+    seven_z.decode_with_password(bytes: encoded, password: secret_password)
+
+  let assert [member] = archives.entries(decoded)
+  member |> entry.path |> entry.to_string |> should.equal("ledger.txt")
+  member |> entry.body |> should.equal(<<"header-encrypted entry body\n":utf8>>)
+}
+
+pub fn encode_with_header_encryption_emits_nid_17_test() -> Nil {
+  // The header-encryption encoder must point the signature header at
+  // an `nid_encoded_header (0x17)` block — that's the on-disk marker
+  // for `-mhe=on`.  We can read the next-header start byte directly
+  // from the archive without involving a decoder.
+  let archive =
+    archives.new(format: seven_z.format())
+    |> archives.add(entry: entry.file(path: "x.txt", body: <<"hello":utf8>>))
+
+  let assert Ok(encoded) =
+    seven_z.encode_with_password_and_header_encryption(
+      archive: archive,
+      password: secret_password,
+    )
+
+  // Signature header bytes 12..19 hold the little-endian 64-bit
+  // offset of the next header from the end of the signature header.
+  let assert <<_:bytes-size(12), next_offset:little-size(64), _:bytes>> =
+    encoded
+  let next_header_start = 32 + next_offset
+  // Skip to that offset and read the first byte — it must be 0x17.
+  let assert <<_:bytes-size(next_header_start), first_byte, _:bytes>> = encoded
+  first_byte |> should.equal(0x17)
+}
+
 pub fn encode_with_password_decode_wrong_password_test() -> Nil {
   let archive =
     archives.new(format: seven_z.format())
