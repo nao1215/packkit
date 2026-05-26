@@ -50,8 +50,14 @@ Implemented codecs and archive families:
   preamble + 5-byte property block and hands the range-coded
   payload to the internal LZMA decoder.  Entries protected by
   PKWARE traditional ("ZipCrypto") encryption decode via
-  `zip.decode_with_password` (the strong-encryption gp flag bit
-  is rejected explicitly rather than decoded as ZipCrypto).
+  `zip.decode_with_password`.  WinZip AES (AE-1 / AE-2,
+  AES-128/192/256) also decodes through the same API — the AES
+  marker method 99 routes to a PBKDF2-HMAC-SHA1 key derivation
+  + AES-CTR + HMAC-SHA1 authentication path before handing the
+  decrypted bytes off to the real method's decoder.  The legacy
+  "strong-encryption" gp flag bit 6 (a separate proprietary
+  PKWARE scheme distinct from AE-x) is still rejected with a
+  typed `ArchiveNotImplemented`.
   Per-entry mtimes round-trip in both directions: the encoder
   writes the DOS date/time fields *and* an InfoZIP Extended
   Timestamp extra field (header_id 0x5455) carrying the original

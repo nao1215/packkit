@@ -41,6 +41,7 @@ import packkit/codec as codecs
 import packkit/deflate
 import packkit/entry
 import packkit/error
+import packkit/internal/aes
 import packkit/internal/lzma
 import packkit/level
 import packkit/limit
@@ -98,6 +99,17 @@ const method_zstd: Int = 93
 
 const method_xz: Int = 95
 
+// WinZip AES (AE-x) marker — entries with this method are encrypted
+// via AES-CTR + HMAC-SHA1; the real compression method lives in the
+// 0x9901 extra field.  The decoder rewrites `method` to that real
+// value before dispatching, so the marker only appears at the
+// entry-header level.
+const method_winzip_aes: Int = 99
+
+const aex_extra_id: Int = 0x9901
+
+const aex_pbkdf2_iterations: Int = 1000
+
 fn is_supported_method(method: Int) -> Bool {
   method == method_store
   || method == method_deflate
@@ -105,6 +117,7 @@ fn is_supported_method(method: Int) -> Bool {
   || method == method_lzma
   || method == method_zstd
   || method == method_xz
+  || method == method_winzip_aes
 }
 
 /// `version_needed` value emitted in any entry that carries a Zip64
@@ -1566,24 +1579,41 @@ fn read_local_entry(
 
   let data_offset = local_offset + 30 + local_name_length + local_extra_length
 
-  // Resolve any PKWARE traditional encryption layer up-front so the
-  // method-specific branch always sees the plain compressed bytes.
-  // `comp_size` already accounts for the 12-byte encryption header
-  // for encrypted entries (and equals `uncomp_size` for unencrypted
-  // stored entries), so it's the right total-size value to hand to
-  // the resolver in every case.
-  use plain_slice <- result.try(resolve_pkware_decryption(
-    full,
-    data_offset,
-    comp_size,
-    encrypted,
-    expected_crc,
-    password,
-    name,
-  ))
-  let data_offset = plain_slice.0
-  let comp_size = plain_slice.1
-  let body_source = plain_slice.2
+  // Encrypted entries take one of two paths:
+  //   1. WinZip AES (method == 99): the 0x9901 extra carries the real
+  //      method; the payload is AES-CTR + HMAC-SHA1.  We replace
+  //      `method` with the real compression method and hand the
+  //      decrypted bytes to that method's decoder.
+  //   2. PKWARE traditional ("ZipCrypto"): legacy stream cipher seeded
+  //      by the password.  `resolve_pkware_decryption` strips the
+  //      12-byte encryption header and returns the plain compressed
+  //      slice — used by every non-AES encrypted entry.
+  let is_aex = encrypted && method == method_winzip_aes
+  use #(data_offset, comp_size, body_source, method) <- result.try(case is_aex {
+    True ->
+      resolve_aex_decryption(
+        full,
+        data_offset,
+        comp_size,
+        local_extra_bits,
+        password,
+        name,
+      )
+    False ->
+      resolve_pkware_decryption(
+        full,
+        data_offset,
+        comp_size,
+        encrypted,
+        expected_crc,
+        password,
+        name,
+      )
+      |> result.map(fn(triple) {
+        let #(offset, size, source) = triple
+        #(offset, size, source, method)
+      })
+  })
 
   use body <- result.try(case method {
     m if m == method_store ->
@@ -1639,8 +1669,16 @@ fn read_local_entry(
       ))
   })
 
+  // AE-2 archives zero the CRC32 because HMAC-SHA1 has already
+  // authenticated the data; in that mode `expected_crc` from the
+  // central directory is 0 and the CRC check would always fail
+  // against any non-empty plaintext.  The AE-x decryption path has
+  // already verified HMAC, so we skip CRC for AE-2-shaped entries
+  // (encrypted + expected_crc == 0).  Legacy ZipCrypto entries
+  // always carry a real CRC, so the check still runs for them.
+  let skip_crc = is_aex && expected_crc == 0
   use <- bool.guard(
-    when: checksum.crc32(body) != expected_crc,
+    when: !skip_crc && checksum.crc32(body) != expected_crc,
     return: Error(error.ArchiveInvalid(message: "ZIP CRC32 mismatch")),
   )
 
@@ -1853,6 +1891,224 @@ fn pkware_last_byte_loop(bytes: BitArray, last: Int) -> Int {
   case bytes {
     <<b, rest:bytes>> -> pkware_last_byte_loop(rest, b)
     _ -> last
+  }
+}
+
+// ============================================================
+// WinZip AES-x encryption (AE-1 / AE-2, AES-128/192/256 CTR)
+//
+// Per APPNOTE.TXT §7.2 (Encryption Specification) and the WinZip
+// AES whitepaper:
+//   - GP flag bit 0 set, compression method = 99, extra 0x9901
+//     carries (version, "AE", strength, real_method).
+//   - Entry data layout:
+//       salt        : 8 / 12 / 16 bytes  (per AES-128/192/256)
+//       pwd_verify  : 2 bytes
+//       ciphertext  : comp_size - salt - 2 - 10 bytes
+//       hmac_tag    : 10 bytes
+//   - PBKDF2-HMAC-SHA1(password, salt, 1000, key_len*2 + 2):
+//       first key_len bytes = AES key
+//       next key_len bytes = HMAC key
+//       last 2 bytes       = password verification (must match
+//                            `pwd_verify`)
+//   - AES-CTR counter: 128-bit little-endian, starts at 1, ++ per block.
+//   - HMAC-SHA1(hmac_key, ciphertext)[0..10] must match `hmac_tag`.
+//   - AE-1 leaves CRC32 as the plaintext CRC; AE-2 zeroes it because
+//     HMAC has already authenticated the data.
+// ============================================================
+
+type AexParams {
+  AexParams(version: Int, strength: Int, real_method: Int)
+}
+
+/// Resolve a method-99 AE-x entry to its plain compressed bytes
+/// (i.e. the bytes the real method's decoder would receive in the
+/// unencrypted case) plus the real method id.  Returns `Error` when
+/// the 0x9901 extra is missing / malformed, the password fails the
+/// 2-byte verifier check, or the HMAC tag mismatches the ciphertext.
+fn resolve_aex_decryption(
+  full: BitArray,
+  data_offset: Int,
+  total_size: Int,
+  extras: BitArray,
+  password: Option(String),
+  name: String,
+) -> Result(#(Int, Int, BitArray, Int), error.ArchiveError) {
+  use params <- result.try(parse_aex_extra(extras, name))
+  use key_len <- result.try(aex_key_length(params.strength, name))
+  let salt_len = key_len / 2
+  use pwd <- result.try(case password {
+    Some(value) -> Ok(value)
+    None ->
+      Error(error.ArchiveNotImplemented(
+        feature: "encrypted ZIP entry \""
+        <> name
+        <> "\" (use decode_with_password)",
+      ))
+  })
+  use raw <- result.try(slice_or_error(full, data_offset, total_size))
+  let ciphertext_len = total_size - salt_len - 2 - 10
+  use <- bool.guard(
+    when: ciphertext_len < 0,
+    return: Error(error.ArchiveInvalid(
+      message: "ZIP AE-x entry \""
+      <> name
+      <> "\" is too short for salt + verifier + HMAC",
+    )),
+  )
+  let assert Ok(salt) = bit_array.slice(raw, 0, salt_len)
+  let assert Ok(verifier) = bit_array.slice(raw, salt_len, 2)
+  let assert Ok(ciphertext) = bit_array.slice(raw, salt_len + 2, ciphertext_len)
+  let assert Ok(hmac_tag) =
+    bit_array.slice(raw, salt_len + 2 + ciphertext_len, 10)
+  let derived =
+    checksum.pbkdf2_hmac_sha1(
+      password: bit_array.from_string(pwd),
+      salt: salt,
+      iterations: aex_pbkdf2_iterations,
+      dk_len: key_len * 2 + 2,
+    )
+  let assert Ok(aes_key) = bit_array.slice(derived, 0, key_len)
+  let assert Ok(hmac_key) = bit_array.slice(derived, key_len, key_len)
+  let assert Ok(expected_verifier) = bit_array.slice(derived, key_len * 2, 2)
+  use <- bool.guard(
+    when: verifier != expected_verifier,
+    return: Error(error.ArchiveInvalid(
+      message: "ZIP AE-x wrong password for entry \"" <> name <> "\"",
+    )),
+  )
+  let computed_full = checksum.hmac_sha1(key: hmac_key, data: ciphertext)
+  let assert Ok(computed_tag) = bit_array.slice(computed_full, 0, 10)
+  use <- bool.guard(
+    when: computed_tag != hmac_tag,
+    return: Error(error.ArchiveInvalid(
+      message: "ZIP AE-x HMAC mismatch for entry \"" <> name <> "\"",
+    )),
+  )
+  use expanded <- result.try(case aes.expand_key(aes_key) {
+    Ok(value) -> Ok(value)
+    Error(_) ->
+      Error(error.ArchiveInvalid(
+        message: "ZIP AE-x AES key expansion failed for \"" <> name <> "\"",
+      ))
+  })
+  use plaintext <- result.try(aes_ctr_xor(expanded, ciphertext, name))
+  Ok(#(0, ciphertext_len, plaintext, params.real_method))
+}
+
+fn parse_aex_extra(
+  extras: BitArray,
+  name: String,
+) -> Result(AexParams, error.ArchiveError) {
+  case find_extra_field(extras, aex_extra_id) {
+    Error(_) ->
+      Error(error.ArchiveInvalid(
+        message: "ZIP AE-x marker entry \""
+        <> name
+        <> "\" missing the 0x9901 extra field",
+      ))
+    Ok(body) ->
+      case body {
+        <<
+          version:little-size(16),
+          0x41,
+          0x45,
+          strength,
+          real_method:little-size(16),
+        >> ->
+          Ok(AexParams(
+            version: version,
+            strength: strength,
+            real_method: real_method,
+          ))
+        _ ->
+          Error(error.ArchiveInvalid(
+            message: "ZIP AE-x 0x9901 extra is malformed for \"" <> name <> "\"",
+          ))
+      }
+  }
+}
+
+fn aex_key_length(
+  strength: Int,
+  name: String,
+) -> Result(Int, error.ArchiveError) {
+  case strength {
+    0x01 -> Ok(16)
+    0x02 -> Ok(24)
+    0x03 -> Ok(32)
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "ZIP AE-x unknown AES strength byte "
+        <> int.to_string(strength)
+        <> " for \""
+        <> name
+        <> "\"",
+      ))
+  }
+}
+
+// AES-CTR keystream XOR.  The counter is a 128-bit little-endian
+// value starting at 1, incremented per 16-byte block.  packkit
+// emits it as `<<counter_low:little-size(64), counter_high:little-size(64)>>`
+// — since the practical limit on a single ZIP entry is well under
+// 2^64 blocks (4 GiB / 16 B = 2^28), the high half stays at 0 and
+// we just need to step the low half.
+fn aes_ctr_xor(
+  key: aes.ExpandedKey,
+  ciphertext: BitArray,
+  name: String,
+) -> Result(BitArray, error.ArchiveError) {
+  aes_ctr_loop(key, ciphertext, 1, <<>>, name)
+}
+
+fn aes_ctr_loop(
+  key: aes.ExpandedKey,
+  ciphertext: BitArray,
+  counter: Int,
+  acc: BitArray,
+  name: String,
+) -> Result(BitArray, error.ArchiveError) {
+  case ciphertext {
+    <<>> -> Ok(acc)
+    _ -> {
+      let counter_block = <<counter:little-size(64), 0:little-size(64)>>
+      use keystream <- result.try(case aes.encrypt_block(key, counter_block) {
+        Ok(value) -> Ok(value)
+        Error(_) ->
+          Error(error.ArchiveInvalid(
+            message: "ZIP AE-x CTR block encrypt failed for \"" <> name <> "\"",
+          ))
+      })
+      let chunk_size = case bit_array.byte_size(ciphertext) {
+        n if n < 16 -> n
+        _ -> 16
+      }
+      let assert Ok(chunk) = bit_array.slice(ciphertext, 0, chunk_size)
+      let assert Ok(keystream_chunk) = bit_array.slice(keystream, 0, chunk_size)
+      let xored = xor_bit_arrays_zip(chunk, keystream_chunk, <<>>)
+      let assert Ok(rest) =
+        bit_array.slice(
+          ciphertext,
+          chunk_size,
+          bit_array.byte_size(ciphertext) - chunk_size,
+        )
+      aes_ctr_loop(key, rest, counter + 1, bit_array.concat([acc, xored]), name)
+    }
+  }
+}
+
+fn xor_bit_arrays_zip(
+  left: BitArray,
+  right: BitArray,
+  acc: BitArray,
+) -> BitArray {
+  case left, right {
+    <<l, l_rest:bytes>>, <<r, r_rest:bytes>> -> {
+      let mixed = int.bitwise_exclusive_or(l, r)
+      xor_bit_arrays_zip(l_rest, r_rest, bit_array.concat([acc, <<mixed>>]))
+    }
+    _, _ -> acc
   }
 }
 
