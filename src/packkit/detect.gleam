@@ -27,6 +27,25 @@ pub fn from_filename(path: String) -> Result(Detected, error.DetectError) {
   }
 }
 
+/// Try filename detection first, then fall back to magic-byte
+/// detection on the supplied content.  Mirrors the resolution order
+/// most CLI tools use: a meaningful extension is a strong signal, but
+/// when the path is uninformative (`-`, `/dev/stdin`, an arbitrary
+/// upload, etc.) the file's first bytes still pin the format.
+///
+/// The returned `Detected` carries whichever path produced the hit; on
+/// failure the typed error mentions the path attempted last so the
+/// message stays specific to the user's input.
+pub fn from_path_or_bytes(
+  path path: String,
+  bytes bytes: BitArray,
+) -> Result(Detected, error.DetectError) {
+  case from_filename(path) {
+    Ok(detected) -> Ok(detected)
+    Error(_) -> from_bytes(bytes)
+  }
+}
+
 /// Filename rules, ordered most-specific first so the first match wins.
 /// Compound extensions (`.tar.gz`, `.tar.bz2`, …) must precede the
 /// single extensions (`.gz`, `.bz2`, …) for the obvious reason.

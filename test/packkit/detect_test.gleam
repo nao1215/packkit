@@ -4,6 +4,7 @@ import packkit/archive
 import packkit/codec
 import packkit/detect
 import packkit/error
+import packkit/recipe
 
 pub fn from_filename_recognizes_compound_tar_xz_test() -> Nil {
   let assert Ok(info) = detect.from_filename("release.tar.xz")
@@ -116,4 +117,50 @@ pub fn from_bytes_snappy_framed_stream_identifier_test() -> Nil {
   let assert Ok(info) = detect.from_bytes(real_snappy)
   detect.codec(info)
   |> should.equal(Some(codec.snappy()))
+}
+
+// -- from_path_or_bytes ----------------------------------------------
+//
+// The convenience wrapper tries filename detection first and falls
+// back to magic-byte detection when the path is uninformative.  These
+// tests pin the resolution order so future tweaks to either lookup
+// path don't silently change which side wins for each input shape.
+
+pub fn from_path_or_bytes_prefers_filename_match_test() -> Nil {
+  // Filename matches a known recipe; bytes are gibberish (would fail
+  // magic-byte detection).  The filename hit must win.
+  let assert Ok(info) =
+    detect.from_path_or_bytes(path: "archive.tar.gz", bytes: <<
+      "this is not a gzip stream":utf8,
+    >>)
+  detect.recipe(info)
+  |> should.equal(Some(recipe.tar_gzip()))
+}
+
+pub fn from_path_or_bytes_falls_back_to_bytes_test() -> Nil {
+  // Path is the conventional "no useful extension" placeholder; the
+  // bytes carry a real gzip magic + valid DEFLATE method byte so the
+  // fallback resolves to gzip.
+  let real_gzip = <<
+    0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  >>
+  let assert Ok(info) = detect.from_path_or_bytes(path: "-", bytes: real_gzip)
+  detect.codec(info)
+  |> should.equal(Some(codec.gzip()))
+}
+
+pub fn from_path_or_bytes_surfaces_bytes_error_when_both_unknown_test() -> Nil {
+  // Both the filename and the bytes are uninformative; the wrapper
+  // surfaces the bytes-side error so the message reflects the more
+  // specific signal (the actual data that failed magic-byte
+  // detection), not the path placeholder.
+  case
+    detect.from_path_or_bytes(path: "mystery.bin", bytes: <<
+      "definitely not a recognised header":utf8,
+    >>)
+  {
+    Error(error.DetectUnknownFormat(input: "byte-signature scan")) -> Nil
+    _ -> should.fail()
+  }
 }
