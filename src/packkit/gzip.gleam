@@ -270,9 +270,7 @@ fn measure_extra_subfields(
 /// `decode_payload`, mirroring every other codec's `encode/1` shape.
 /// Use [encode_with_header] when you need to attach a filename,
 /// comment, or mtime to the stream.
-pub fn encode(
-  bytes bytes: BitArray,
-) -> Result(BitArray, error.CodecError) {
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   encode_with_header(bytes: bytes, header: default_header())
 }
 

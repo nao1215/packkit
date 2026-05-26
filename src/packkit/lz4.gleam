@@ -518,26 +518,47 @@ fn collect_bytes(
   }
 }
 
+// Legacy-frame block driver.  Same Step/Continue trampoline as the
+// modern `decode_blocks` so a multi-MB `.lz4` legacy stream decoded on
+// the JS target does not exhaust the call stack.
 fn decode_legacy_blocks(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
+  case decode_legacy_blocks_step(bytes, output, limits) {
+    Error(err) -> Error(err)
+    Ok(LegacyBlocksDone(out)) -> Ok(out)
+    Ok(LegacyBlocksContinue(next_bytes, next_output)) ->
+      decode_legacy_blocks(next_bytes, next_output, limits)
+  }
+}
+
+type LegacyBlocksStep {
+  LegacyBlocksDone(output: BitArray)
+  LegacyBlocksContinue(bytes: BitArray, output: BitArray)
+}
+
+fn decode_legacy_blocks_step(
+  bytes: BitArray,
+  output: BitArray,
+  limits: limit.Limits,
+) -> Result(LegacyBlocksStep, error.CodecError) {
   case bytes {
     // Stream ends at EOF — there is no terminator block in the
     // legacy format.
-    <<>> -> Ok(output)
+    <<>> -> Ok(LegacyBlocksDone(output))
     <<block_size:size(32)-little, _rest:bytes>> if block_size == 0 ->
       // Some implementations write an explicit terminator block;
       // accept it for robustness.
-      Ok(output)
+      Ok(LegacyBlocksDone(output))
     <<block_size:size(32)-little, _rest:bytes>>
       if block_size > legacy_max_block_size
     ->
       // Per the legacy spec, a "block size" past 8 MiB indicates
       // either a new concatenated frame magic or junk — stop
       // decoding cleanly rather than allocating a huge slice.
-      Ok(output)
+      Ok(LegacyBlocksDone(output))
     <<block_size:size(32)-little, rest:bytes>> -> {
       case bit_array.byte_size(rest) < block_size {
         True ->
@@ -553,7 +574,7 @@ fn decode_legacy_blocks(
               bit_array.byte_size(rest) - block_size,
             )
           use new_output <- result.try(decode_block(block, output, limits))
-          decode_legacy_blocks(after_block, new_output, limits)
+          Ok(LegacyBlocksContinue(after_block, new_output))
         }
       }
     }
@@ -564,6 +585,11 @@ fn decode_legacy_blocks(
   }
 }
 
+// Frame-level driver: one iteration consumes a single block.  Same
+// Step/Continue trampoline shape as `decode_block_loop` so the JS
+// target stays in constant stack for frames that ship many blocks
+// (e.g. a 64 MiB payload at the default 64 KiB block size hits 1024
+// blocks, well past the JS recursion budget without the trampoline).
 fn decode_blocks(
   bytes: BitArray,
   output: BitArray,
@@ -572,9 +598,49 @@ fn decode_blocks(
   block_max: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
+  case
+    decode_blocks_step(
+      bytes,
+      output,
+      block_checksum,
+      content_checksum,
+      block_max,
+      limits,
+    )
+  {
+    Error(err) -> Error(err)
+    Ok(BlocksDone(out)) -> Ok(out)
+    Ok(BlocksContinue(next_bytes, next_output)) ->
+      decode_blocks(
+        next_bytes,
+        next_output,
+        block_checksum,
+        content_checksum,
+        block_max,
+        limits,
+      )
+  }
+}
+
+type BlocksStep {
+  BlocksDone(output: BitArray)
+  BlocksContinue(bytes: BitArray, output: BitArray)
+}
+
+fn decode_blocks_step(
+  bytes: BitArray,
+  output: BitArray,
+  block_checksum: Bool,
+  content_checksum: Bool,
+  block_max: Int,
+  limits: limit.Limits,
+) -> Result(BlocksStep, error.CodecError) {
   case bytes {
     <<0:size(32)-little, rest:bytes>> ->
-      finalize(rest, output, content_checksum)
+      case finalize(rest, output, content_checksum) {
+        Ok(out) -> Ok(BlocksDone(out))
+        Error(err) -> Error(err)
+      }
     <<header:size(32)-little, rest:bytes>> -> {
       let uncompressed = int.bitwise_and(header, uncompressed_block_bit) != 0
       let block_size =
@@ -626,14 +692,7 @@ fn decode_blocks(
             False -> decode_block(block, output, limits)
           })
 
-          decode_blocks(
-            after_block,
-            new_output,
-            block_checksum,
-            content_checksum,
-            block_max,
-            limits,
-          )
+          Ok(BlocksContinue(after_block, new_output))
         }
       }
     }
@@ -668,11 +727,37 @@ fn decode_block(
   }
 }
 
+// Token-level driver for one LZ4 block.  Wrapped in a Step/Continue
+// trampoline (`decode_block_step` / `BlockStep`) because every
+// `use ... <- result.try(...)` desugars to a closure on the JS target —
+// Gleam's JS backend only rewrites a self-tail-call to a `while` when
+// the recursive call sits at the function body's true tail position.
+// Without the trampoline, a block carrying more than ~1500 LZ77
+// sequences blows up the JS stack (`RangeError: Maximum call stack size
+// exceeded`), mirroring the deflate/bzip2 fix in commit 2adc249.
 fn decode_block_loop(
   block: BitArray,
   output: BitArray,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
+  case decode_block_step(block, output, limits) {
+    Error(err) -> Error(err)
+    Ok(BlockDone(out)) -> Ok(out)
+    Ok(BlockContinue(next_block, next_output)) ->
+      decode_block_loop(next_block, next_output, limits)
+  }
+}
+
+type BlockStep {
+  BlockDone(output: BitArray)
+  BlockContinue(block: BitArray, output: BitArray)
+}
+
+fn decode_block_step(
+  block: BitArray,
+  output: BitArray,
+  limits: limit.Limits,
+) -> Result(BlockStep, error.CodecError) {
   case block {
     <<token, rest:bytes>> -> {
       let lit_len_base = int.bitwise_shift_right(token, 4)
@@ -696,7 +781,7 @@ fn decode_block_loop(
           use output <- result.try(append_with_limit(output, literals, limits))
 
           case bit_array.byte_size(after_literals) {
-            0 -> Ok(output)
+            0 -> Ok(BlockDone(output))
             _ ->
               case after_literals {
                 <<offset:size(16)-little, after_offset:bytes>> -> {
@@ -730,7 +815,7 @@ fn decode_block_loop(
                     limits,
                   ))
 
-                  decode_block_loop(after_offset, output, limits)
+                  Ok(BlockContinue(after_offset, output))
                 }
                 _ ->
                   Error(error.CodecInvalidData(
@@ -741,7 +826,7 @@ fn decode_block_loop(
         }
       }
     }
-    <<>> -> Ok(output)
+    <<>> -> Ok(BlockDone(output))
     _ -> Error(error.CodecInvalidData(message: "lz4: malformed block"))
   }
 }
@@ -782,19 +867,43 @@ fn copy_match(
   }
 }
 
+// Byte-by-byte overlapping-match copy.  This is the hot path for any
+// run-length-encoded payload (`a × N` compresses to a single token
+// with `offset = 1`), and the loop iterates once per output byte —
+// 15 KiB of repeated input is ~15 000 iterations.  Without the
+// trampoline, that's 15 000 JS stack frames.
 fn copy_match_byte_by_byte(
   output: BitArray,
   offset: Int,
   length: Int,
   limits: limit.Limits,
 ) -> Result(BitArray, error.CodecError) {
+  case copy_match_byte_step(output, offset, length, limits) {
+    Error(err) -> Error(err)
+    Ok(CopyDone(out)) -> Ok(out)
+    Ok(CopyContinue(new_output, new_length)) ->
+      copy_match_byte_by_byte(new_output, offset, new_length, limits)
+  }
+}
+
+type CopyStep {
+  CopyDone(output: BitArray)
+  CopyContinue(output: BitArray, length: Int)
+}
+
+fn copy_match_byte_step(
+  output: BitArray,
+  offset: Int,
+  length: Int,
+  limits: limit.Limits,
+) -> Result(CopyStep, error.CodecError) {
   case length {
-    0 -> Ok(output)
+    0 -> Ok(CopyDone(output))
     _ -> {
       let size = bit_array.byte_size(output)
       let assert Ok(byte_slice) = bit_array.slice(output, size - offset, 1)
       use new_output <- result.try(append_with_limit(output, byte_slice, limits))
-      copy_match_byte_by_byte(new_output, offset, length - 1, limits)
+      Ok(CopyContinue(new_output, length - 1))
     }
   }
 }
