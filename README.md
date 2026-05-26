@@ -51,7 +51,15 @@ Implemented codecs and archive families:
   payload to the internal LZMA decoder.  Entries protected by
   PKWARE traditional ("ZipCrypto") encryption decode via
   `zip.decode_with_password` (the strong-encryption gp flag bit
-  is rejected explicitly rather than decoded as ZipCrypto)
+  is rejected explicitly rather than decoded as ZipCrypto).
+  Per-entry mtimes round-trip in both directions: the encoder
+  writes the DOS date/time fields *and* an InfoZIP Extended
+  Timestamp extra field (header_id 0x5455) carrying the original
+  Unix seconds at 1-second resolution; the decoder prefers the UT
+  extra when present and falls back to the DOS pair otherwise.
+  Pre-1980 mtimes fall outside the DOS-date window so they are
+  clamped to the "no mtime" sentinel in the DOS slots but still
+  carried losslessly in the UT extra
 - **7z**: single-folder reader.  Recognised single-coder ids:
   LZMA (`0x03 0x01 0x01`), LZMA2 (`0x21`), Copy (`0x00`),
   Deflate (`0x04 0x01 0x08`), and BZip2 (`0x04 0x02 0x02`) — so

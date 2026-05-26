@@ -14,6 +14,32 @@ import packkit/xz
 import packkit/zip
 import packkit/zstd
 
+// Reusable helper: build a single-file archive whose only entry has
+// the requested Unix mtime, encode it through `zip.encode`, then
+// decode through `zip.decode` and return the round-tripped
+// `modified_at_unix` value.  Returns -1 on any error path so the
+// assertions stay one-liners.
+fn zip_roundtrip_mtime(unix_seconds: Int) -> Int {
+  let entry_value =
+    entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
+    |> entry.with_modified_at(unix_seconds: unix_seconds)
+  let archive_value =
+    archive.add(zip.new(), entry: entry_value)
+  case zip.encode(archive: archive_value) {
+    Error(_) -> -1
+    Ok(bytes) ->
+      case zip.decode(bytes: bytes) {
+        Error(_) -> -1
+        Ok(decoded) ->
+          case archive.entries(decoded) {
+            [single] ->
+              single |> entry.metadata |> entry.modified_at_unix
+            _ -> -1
+          }
+      }
+  }
+}
+
 pub fn roundtrip_single_file_test() -> Nil {
   let original =
     zip.new()
@@ -616,3 +642,80 @@ fn zip_method_round_trip(
     _ -> should.fail()
   }
 }
+
+
+// -- entry mtime round-trip ------------------------------------------
+//
+// Before the DOS date/time + InfoZIP Extended Timestamp wiring,
+// `zip.encode` dropped every entry's `modified_at_unix` and wrote a
+// hard-coded 1980-01-01 placeholder.  These tests pin the new
+// behaviour: any mtime that fits the DOS-date window (1980..2107
+// inclusive) survives encode->decode untouched, sub-DOS-epoch values
+// are clamped to 0, and a system `zip` archive that uses the UT
+// extra is decoded at full 1-second resolution.
+
+pub fn roundtrip_preserves_entry_mtime_test() -> Nil {
+  // 2025-06-15 12:34:56 UTC.  Even-second so the DOS-time field's
+  // 2-second resolution doesn't matter even when the UT extra is
+  // dropped; the InfoZIP UT extra carries the same value too, so we
+  // exercise both paths simultaneously.
+  zip_roundtrip_mtime(1_749_990_896)
+  |> should.equal(1_749_990_896)
+}
+
+pub fn roundtrip_preserves_dos_epoch_boundary_test() -> Nil {
+  // 1980-01-01 00:00:00 UTC — the lower edge of the DOS-date window.
+  // The UT extra captures it exactly.
+  zip_roundtrip_mtime(315_532_800)
+  |> should.equal(315_532_800)
+}
+
+pub fn roundtrip_clamps_pre_dos_epoch_when_ut_extra_unavailable_test() -> Nil {
+  // 1970-01-01 00:00:00 UTC is below the DOS-date window (year < 1980).
+  // The DOS slots get the "no mtime" sentinel, but the UT extra still
+  // carries the exact Unix seconds and the decoder honours it, so the
+  // round-trip is lossless even pre-1980.
+  zip_roundtrip_mtime(0)
+  |> should.equal(0)
+  zip_roundtrip_mtime(100)
+  |> should.equal(100)
+}
+
+pub fn decodes_system_zip_with_unix_extended_timestamp_test() -> Nil {
+  // `touch -d '2025-06-15 12:34:56 UTC' greeting.txt && zip mtime.zip
+  //  greeting.txt` (Info-ZIP 3.0).  The archive carries both a DOS
+  // pair (in local time, which depends on the producing host's TZ)
+  // and an InfoZIP Extended Timestamp extra (header_id 0x5455) with
+  // the exact Unix mtime in UTC.  packkit prefers the UT extra, so
+  // the decoded mtime matches the original timestamp regardless of
+  // the producer's timezone.
+  let fixture = <<
+    0x50, 0x4B, 0x03, 0x04, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5C, 0xAC,
+    0xCF, 0x5A, 0x0B, 0x69, 0xF2, 0x97, 0x0B, 0x00, 0x00, 0x00, 0x0B, 0x00,
+    0x00, 0x00, 0x0C, 0x00, 0x1C, 0x00, 0x67, 0x72, 0x65, 0x65, 0x74, 0x69,
+    0x6E, 0x67, 0x2E, 0x74, 0x78, 0x74, 0x55, 0x54, 0x09, 0x00, 0x03, 0xF0,
+    0xBD, 0x4E, 0x68, 0x9C, 0xEA, 0x14, 0x6A, 0x75, 0x78, 0x0B, 0x00, 0x01,
+    0x04, 0xE8, 0x03, 0x00, 0x00, 0x04, 0xE8, 0x03, 0x00, 0x00, 0x6D, 0x74,
+    0x69, 0x6D, 0x65, 0x20, 0x74, 0x65, 0x73, 0x74, 0x0A, 0x50, 0x4B, 0x01,
+    0x02, 0x1E, 0x03, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5C, 0xAC, 0xCF,
+    0x5A, 0x0B, 0x69, 0xF2, 0x97, 0x0B, 0x00, 0x00, 0x00, 0x0B, 0x00, 0x00,
+    0x00, 0x0C, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0xA4, 0x81, 0x00, 0x00, 0x00, 0x00, 0x67, 0x72, 0x65, 0x65, 0x74,
+    0x69, 0x6E, 0x67, 0x2E, 0x74, 0x78, 0x74, 0x55, 0x54, 0x05, 0x00, 0x03,
+    0xF0, 0xBD, 0x4E, 0x68, 0x75, 0x78, 0x0B, 0x00, 0x01, 0x04, 0xE8, 0x03,
+    0x00, 0x00, 0x04, 0xE8, 0x03, 0x00, 0x00, 0x50, 0x4B, 0x05, 0x06, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x52, 0x00, 0x00, 0x00, 0x51,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+  >>
+  let assert Ok(decoded) = zip.decode(bytes: fixture)
+  let assert [single] = archive.entries(decoded)
+  entry.to_string(entry.path(single))
+  |> should.equal("greeting.txt")
+  entry.body(single)
+  |> should.equal(<<"mtime test\n":utf8>>)
+  single
+  |> entry.metadata
+  |> entry.modified_at_unix
+  |> should.equal(1_749_990_896)
+}
+

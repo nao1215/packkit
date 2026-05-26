@@ -59,6 +59,16 @@ const zip64_eocd_signature: Int = 0x06064b50
 
 const zip64_extra_id: Int = 0x0001
 
+// InfoZIP "Extended Timestamp" extra field (header_id 'UT' = 0x5455).
+// Carries up to three Unix-epoch timestamps (mtime, atime, ctime) at
+// second resolution, supplementing the 2-second-resolution DOS fields
+// in the local + central headers.  packkit only emits the mtime slot
+// since archive entries do not yet track access / creation time, but
+// the decoder honours whatever flags the field advertises.
+const unix_ts_extra_id: Int = 0x5455
+
+const unix_ts_flag_mtime: Int = 0x01
+
 const method_store: Int = 0
 
 const method_deflate: Int = 8
@@ -100,9 +110,32 @@ const version_needed_lzma_family: Int = 63
 
 const external_attr_dir: Int = 0x4000_0000
 
+// DOS date/time sentinel returned by `unix_to_dos_pair` when the
+// entry has no recorded mtime or the mtime predates the DOS epoch
+// (year 1980).  0x0021 in both fields decodes as 1980-01-01 00:01:02
+// — the historic PKZIP convention and what packkit has emitted from
+// day one for "no mtime".  The decoder short-circuits this exact pair
+// back to `modified_at_unix = 0` so a round-trip with no mtime stays
+// at zero rather than rehydrating as an artificial 1980 timestamp.
 const default_mtime_dos: Int = 0x0021
 
 const default_mdate_dos: Int = 0x0021
+
+// 315_532_800 = Unix seconds of 1980-01-01 00:00:00 UTC, i.e. the
+// DOS-date epoch.  Earlier mtimes do not fit DOS date/time (year - 1980
+// would underflow the 7-bit year field) and are clamped to this
+// sentinel in the DOS slots; the InfoZIP Extended Timestamp extra
+// field still carries the original value for full-fidelity round-trips.
+const dos_epoch_unix: Int = 315_532_800
+
+// 4_354_819_200 = Unix seconds of 2108-01-01 00:00:00 UTC, one second
+// past the DOS-date ceiling (year 2107 = 1980 + 127 inclusive).  An
+// mtime at or beyond this is clamped to the DOS-epoch sentinel; the
+// Extended Timestamp extra carries the real value (its int32 LE field
+// still fits any second in [-2^31, 2^31 - 1] which covers 1901..2038
+// in signed interpretation and 1970..2106 in unsigned, both narrower
+// than the clamp window — so future cleanup may relax this).
+const dos_epoch_ceiling_unix: Int = 4_354_819_200
 
 /// ZIP-specific entry method marker. This stays distinct from the
 /// top-level recipe model because ZIP is an archive family, not a
@@ -604,7 +637,20 @@ fn encode_entry(
     False -> offset
   }
 
-  let local_extra = case local_needs_zip64 {
+  // Derive per-entry timestamp fields from `entry.modified_at_unix`.
+  // The DOS pair is written into the fixed-width header slots; when
+  // the entry has a usable mtime we additionally emit an InfoZIP
+  // Extended Timestamp extra (header_id 0x5455) so the original
+  // 1-second-resolution Unix value survives the 2-second DOS rounding
+  // and the pre-1980 / post-2107 clamping.
+  let mtime_unix = entry.modified_at_unix(metadata)
+  let #(dos_time, dos_date) = unix_to_dos_pair(mtime_unix)
+  let unix_ts_extra = case mtime_unix > 0 {
+    True -> build_unix_ts_extra_mtime(mtime_unix)
+    False -> <<>>
+  }
+
+  let zip64_local_extra = case local_needs_zip64 {
     False -> <<>>
     True ->
       // The local Zip64 extra MUST include BOTH size fields per
@@ -612,7 +658,7 @@ fn encode_entry(
       // overflow.
       build_zip64_extra(Some(uncomp_size), Some(comp_size), None)
   }
-  let central_extra = case central_needs_zip64 {
+  let zip64_central_extra = case central_needs_zip64 {
     False -> <<>>
     True ->
       build_zip64_extra(
@@ -630,6 +676,12 @@ fn encode_entry(
         },
       )
   }
+  // Concatenate Zip64 extras (when present) with the Extended
+  // Timestamp extra.  APPNOTE.TXT does not mandate any ordering
+  // between extra fields, but it's conventional to write Zip64 first
+  // because some legacy decoders bail at the first unknown id.
+  let local_extra = bit_array.concat([zip64_local_extra, unix_ts_extra])
+  let central_extra = bit_array.concat([zip64_central_extra, unix_ts_extra])
 
   let version_needed = case
     local_needs_zip64 || central_needs_zip64,
@@ -660,8 +712,8 @@ fn encode_entry(
       le16(version_needed),
       le16(gp_flag),
       le16(method_code),
-      le16(default_mtime_dos),
-      le16(default_mdate_dos),
+      le16(dos_time),
+      le16(dos_date),
       le32(crc),
       le32(local_comp_slot),
       le32(local_uncomp_slot),
@@ -681,8 +733,8 @@ fn encode_entry(
       le16(version_needed),
       le16(gp_flag),
       le16(method_code),
-      le16(default_mtime_dos),
-      le16(default_mdate_dos),
+      le16(dos_time),
+      le16(dos_date),
       le32(crc),
       le32(local_comp_slot),
       le32(local_uncomp_slot),
@@ -698,6 +750,160 @@ fn encode_entry(
     ])
 
   Ok(#(local_record, central_record, local_record_size))
+}
+
+// -- MS-DOS date/time <-> Unix seconds -------------------------------
+//
+// The DOS time field (2 bytes LE) packs hour/minute/second as:
+//   bits 0..4  : second / 2  (0..29 means 0..58 sec, 2-sec resolution)
+//   bits 5..10 : minute      (0..59)
+//   bits 11..15: hour        (0..23)
+// The DOS date field (2 bytes LE) packs year/month/day as:
+//   bits 0..4  : day         (1..31)
+//   bits 5..8  : month       (1..12)
+//   bits 9..15 : year - 1980 (0..127 → 1980..2107 inclusive)
+//
+// The conversion algorithms are Howard Hinnant's date routines from
+// http://howardhinnant.github.io/date_algorithms.html, adapted to
+// integer arithmetic.  They are exact for any civil date in the
+// supported window and use no calendar tables.
+fn unix_to_dos_pair(seconds: Int) -> #(Int, Int) {
+  case seconds < dos_epoch_unix || seconds >= dos_epoch_ceiling_unix {
+    True -> #(default_mtime_dos, default_mdate_dos)
+    False -> {
+      let days = seconds / 86_400
+      let sod = seconds - days * 86_400
+      let #(year, month, day) = civil_from_days(days)
+      let hour = sod / 3600
+      let minute = { sod - hour * 3600 } / 60
+      let second = sod - hour * 3600 - minute * 60
+      let dos_time =
+        int.bitwise_or(
+          int.bitwise_or(
+            int.bitwise_shift_left(hour, 11),
+            int.bitwise_shift_left(minute, 5),
+          ),
+          second / 2,
+        )
+      let dos_date =
+        int.bitwise_or(
+          int.bitwise_or(
+            int.bitwise_shift_left(year - 1980, 9),
+            int.bitwise_shift_left(month, 5),
+          ),
+          day,
+        )
+      #(dos_time, dos_date)
+    }
+  }
+}
+
+fn dos_pair_to_unix(time_code: Int, date_code: Int) -> Int {
+  let day = int.bitwise_and(date_code, 0x1F)
+  let month = int.bitwise_and(int.bitwise_shift_right(date_code, 5), 0x0F)
+  let year = int.bitwise_shift_right(date_code, 9) + 1980
+  let second_pair = int.bitwise_and(time_code, 0x1F)
+  let minute = int.bitwise_and(int.bitwise_shift_right(time_code, 5), 0x3F)
+  let hour = int.bitwise_shift_right(time_code, 11)
+  // DOS allows day=0 / month=0 only on the "no mtime" sentinel pair.
+  // Anything else with day < 1 or month < 1 is a producer bug; fall
+  // back to the DOS epoch rather than feeding bogus values to
+  // `days_from_civil`.
+  case day < 1 || month < 1 || month > 12 {
+    True -> dos_epoch_unix
+    False -> {
+      let days = days_from_civil(year, month, day)
+      days * 86_400 + hour * 3600 + minute * 60 + second_pair * 2
+    }
+  }
+}
+
+// civil_from_days: convert a count of days since 1970-01-01 into a
+// proleptic-Gregorian (year, month, day) triple.  Valid for any int.
+fn civil_from_days(z: Int) -> #(Int, Int, Int) {
+  // Shift the epoch to 0000-03-01 so the leap-year math falls on a
+  // year boundary; the +719_468 lifts 1970-01-01 to that origin.
+  let z = z + 719_468
+  let era = case z >= 0 {
+    True -> z / 146_097
+    False -> { z - 146_096 } / 146_097
+  }
+  let doe = z - era * 146_097
+  let yoe = { doe - doe / 1460 + doe / 36_524 - doe / 146_096 } / 365
+  let y = yoe + era * 400
+  let doy = doe - { 365 * yoe + yoe / 4 - yoe / 100 }
+  let mp = { 5 * doy + 2 } / 153
+  let d = doy - { 153 * mp + 2 } / 5 + 1
+  let m = case mp < 10 {
+    True -> mp + 3
+    False -> mp - 9
+  }
+  let year = case m <= 2 {
+    True -> y + 1
+    False -> y
+  }
+  #(year, m, d)
+}
+
+// days_from_civil: inverse of `civil_from_days`.  Returns days since
+// 1970-01-01.
+fn days_from_civil(year: Int, month: Int, day: Int) -> Int {
+  let y = case month <= 2 {
+    True -> year - 1
+    False -> year
+  }
+  let era = case y >= 0 {
+    True -> y / 400
+    False -> { y - 399 } / 400
+  }
+  let yoe = y - era * 400
+  let mp = case month > 2 {
+    True -> month - 3
+    False -> month + 9
+  }
+  let doy = { 153 * mp + 2 } / 5 + day - 1
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146_097 + doe - 719_468
+}
+
+// -- InfoZIP Extended Timestamp extra field --------------------------
+
+// Build a UT extra carrying mtime only.  Layout per InfoZIP
+// proginfo/extrafld.txt:
+//   header_id (LE16)   : 0x5455
+//   data_size (LE16)   : 1 + 4 * popcount(flags)
+//   flags     (1 byte) : bit 0 = mtime present, bit 1 = atime, bit 2 = ctime
+//   mtime     (LE32)   : signed Unix seconds (when flag bit 0 set)
+//   [atime / ctime follow only in the local extra; the central extra
+//    contains mtime only.]
+// We emit the central form (mtime only) in both places.  The
+// decoder side already handles arbitrary flag combinations.
+fn build_unix_ts_extra_mtime(mtime: Int) -> BitArray {
+  let body = <<unix_ts_flag_mtime, mtime:little-size(32)>>
+  bit_array.concat([
+    le16(unix_ts_extra_id),
+    le16(bit_array.byte_size(body)),
+    body,
+  ])
+}
+
+// Scan the extras blob for a UT field and return the mtime if the
+// field is present and its `mtime` flag bit is set.  Other flag bits
+// (atime, ctime) are skipped — packkit's entry model has no atime /
+// ctime fields yet.
+fn find_unix_ts_extra_mtime(extra: BitArray) -> Option(Int) {
+  case find_extra_field(extra, unix_ts_extra_id) {
+    Error(_) -> None
+    Ok(body) ->
+      case body {
+        <<flags, mtime:little-size(32), _:bytes>> ->
+          case int.bitwise_and(flags, unix_ts_flag_mtime) == unix_ts_flag_mtime {
+            True -> Some(mtime)
+            False -> None
+          }
+        _ -> None
+      }
+  }
 }
 
 /// Build a Zip64 extended-information extra-field record.  Each of
@@ -924,6 +1130,8 @@ fn parse_central_directory(
 
       use gp_flag <- result.try(read_le16_at(bytes, 8))
       use method <- result.try(read_le16_at(bytes, 10))
+      use dos_time <- result.try(read_le16_at(bytes, 12))
+      use dos_date <- result.try(read_le16_at(bytes, 14))
       use crc <- result.try(read_le32_at(bytes, 16))
       use comp_size <- result.try(read_le32_at(bytes, 20))
       use uncomp_size <- result.try(read_le32_at(bytes, 24))
@@ -972,6 +1180,26 @@ fn parse_central_directory(
         None -> local_offset
       }
 
+      // Resolve the entry's mtime.  The InfoZIP Extended Timestamp
+      // extra (header_id 0x5455) carries the original Unix seconds at
+      // full 1-second resolution; the DOS time/date fields in the
+      // fixed header carry the same instant at 2-second resolution
+      // and only between 1980 and 2107.  Prefer the UT extra when
+      // present, otherwise reconstruct from the DOS pair.  Entries
+      // with no recorded mtime are serialised as the packkit "no
+      // mtime" sentinel (`default_mtime_dos`, `default_mdate_dos`);
+      // short-circuit that pair back to 0 so the round-trip keeps
+      // `modified_at_unix = 0` instead of rehydrating an artificial
+      // 1980-01-01 00:01:02 stamp.
+      let mtime_resolved = case find_unix_ts_extra_mtime(extra_bits) {
+        Some(v) if v >= 0 -> v
+        _ ->
+          case dos_time == default_mtime_dos && dos_date == default_mdate_dos {
+            True -> 0
+            False -> dos_pair_to_unix(dos_time, dos_date)
+          }
+      }
+
       use <- bool.guard(
         when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
         return: Error(error.ArchiveLimitExceeded(
@@ -1008,6 +1236,7 @@ fn parse_central_directory(
         limits,
         gp_flag,
         password,
+        mtime_resolved,
       ))
 
       // Adversarial archives can pack many independently-bounded
@@ -1064,6 +1293,7 @@ fn read_local_entry(
   limits: limit.Limits,
   gp_flag: Int,
   password: Option(String),
+  mtime_unix: Int,
 ) -> Result(entry.Entry, error.ArchiveError) {
   use signature <- result.try(read_le32_at(full, local_offset))
   use <- bool.guard(
@@ -1208,25 +1438,26 @@ fn read_local_entry(
   let mode =
     int.bitwise_and(int.bitwise_shift_right(external_attrs, 16), 0xFFFF)
 
+  let apply_metadata = fn(e: entry.Entry) -> entry.Entry {
+    let with_mode = case mode {
+      0 -> e
+      _ -> entry.with_mode(e, mode: mode)
+    }
+    case mtime_unix > 0 {
+      True -> entry.with_modified_at(with_mode, unix_seconds: mtime_unix)
+      False -> with_mode
+    }
+  }
+
   case is_directory {
     True ->
       entry.directory_checked(path: strip_trailing_slash(name))
       |> result.map_error(entry_error_to_archive_error(_, name))
-      |> result.map(fn(e) {
-        case mode {
-          0 -> e
-          _ -> entry.with_mode(e, mode: mode)
-        }
-      })
+      |> result.map(apply_metadata)
     False ->
       entry.file_checked(path: name, body: body)
       |> result.map_error(entry_error_to_archive_error(_, name))
-      |> result.map(fn(e) {
-        case mode {
-          0 -> e
-          _ -> entry.with_mode(e, mode: mode)
-        }
-      })
+      |> result.map(apply_metadata)
   }
 }
 
