@@ -298,17 +298,12 @@ pub fn decode_system_archive_with_empty_file_test() -> Nil {
   >>
   let assert Ok(decoded) = seven_z.decode(bytes: fixture)
   let entries = archive.entries(decoded)
-  let empty_entry =
+  let assert Ok(empty) =
     list.find(entries, fn(e) {
       entry.path(e) |> entry.to_string == "empty2.txt"
     })
-  case empty_entry {
-    Ok(e) -> {
-      entry.kind(e) |> should.equal(entry.File)
-      entry.body(e) |> should.equal(<<>>)
-    }
-    Error(_) -> should.fail()
-  }
+  entry.kind(empty) |> should.equal(entry.File)
+  entry.body(empty) |> should.equal(<<>>)
 }
 
 // -- new coder ids (Copy / Deflate / BZip2) ---------------------------

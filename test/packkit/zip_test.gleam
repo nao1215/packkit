@@ -17,25 +17,18 @@ import packkit/zstd
 // Reusable helper: build a single-file archive whose only entry has
 // the requested Unix mtime, encode it through `zip.encode`, then
 // decode through `zip.decode` and return the round-tripped
-// `modified_at_unix` value.  Returns -1 on any error path so the
-// assertions stay one-liners.
+// `modified_at_unix` value.  Uses `let assert` so any encode / decode
+// failure halts the surrounding test with a stack trace rather than
+// silently coercing to a sentinel.
 fn zip_roundtrip_mtime(unix_seconds: Int) -> Int {
   let entry_value =
     entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
     |> entry.with_modified_at(unix_seconds: unix_seconds)
   let archive_value = archive.add(zip.new(), entry: entry_value)
-  case zip.encode(archive: archive_value) {
-    Error(_) -> -1
-    Ok(bytes) ->
-      case zip.decode(bytes: bytes) {
-        Error(_) -> -1
-        Ok(decoded) ->
-          case archive.entries(decoded) {
-            [single] -> single |> entry.metadata |> entry.modified_at_unix
-            _ -> -1
-          }
-      }
-  }
+  let assert Ok(bytes) = zip.encode(archive: archive_value)
+  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert [single] = archive.entries(decoded)
+  single |> entry.metadata |> entry.modified_at_unix
 }
 
 pub fn roundtrip_single_file_test() -> Nil {

@@ -833,50 +833,68 @@ fn dos_pair_to_unix(time_code: Int, date_code: Int) -> Int {
 
 // civil_from_days: convert a count of days since 1970-01-01 into a
 // proleptic-Gregorian (year, month, day) triple.  Valid for any int.
+//
+// The local names (`days_shifted`, `day_of_era`, `year_of_era`,
+// `march_year`, `day_of_year`, `month_prime`) are spelled out in
+// full to keep the lint happy; the original Hinnant paper uses the
+// terse mnemonics (z / doe / yoe / y / doy / mp) and the comments
+// preserve the mapping so the algorithm stays auditable.
 fn civil_from_days(z: Int) -> #(Int, Int, Int) {
   // Shift the epoch to 0000-03-01 so the leap-year math falls on a
   // year boundary; the +719_468 lifts 1970-01-01 to that origin.
-  let z = z + 719_468
-  let era = case z >= 0 {
-    True -> z / 146_097
-    False -> { z - 146_096 } / 146_097
+  let days_shifted = z + 719_468
+  let era = case days_shifted >= 0 {
+    True -> days_shifted / 146_097
+    False -> { days_shifted - 146_096 } / 146_097
   }
-  let doe = z - era * 146_097
-  let yoe = { doe - doe / 1460 + doe / 36_524 - doe / 146_096 } / 365
-  let y = yoe + era * 400
-  let doy = doe - { 365 * yoe + yoe / 4 - yoe / 100 }
-  let mp = { 5 * doy + 2 } / 153
-  let d = doy - { 153 * mp + 2 } / 5 + 1
-  let m = case mp < 10 {
-    True -> mp + 3
-    False -> mp - 9
+  let day_of_era = days_shifted - era * 146_097
+  let year_of_era =
+    {
+      day_of_era
+      - day_of_era
+      / 1460
+      + day_of_era
+      / 36_524
+      - day_of_era
+      / 146_096
+    }
+    / 365
+  let march_year = year_of_era + era * 400
+  let day_of_year =
+    day_of_era - { 365 * year_of_era + year_of_era / 4 - year_of_era / 100 }
+  let month_prime = { 5 * day_of_year + 2 } / 153
+  let day = day_of_year - { 153 * month_prime + 2 } / 5 + 1
+  let month = case month_prime < 10 {
+    True -> month_prime + 3
+    False -> month_prime - 9
   }
-  let year = case m <= 2 {
-    True -> y + 1
-    False -> y
+  let year = case month <= 2 {
+    True -> march_year + 1
+    False -> march_year
   }
-  #(year, m, d)
+  #(year, month, day)
 }
 
 // days_from_civil: inverse of `civil_from_days`.  Returns days since
 // 1970-01-01.
 fn days_from_civil(year: Int, month: Int, day: Int) -> Int {
-  let y = case month <= 2 {
+  let march_year = case month <= 2 {
     True -> year - 1
     False -> year
   }
-  let era = case y >= 0 {
-    True -> y / 400
-    False -> { y - 399 } / 400
+  let era = case march_year >= 0 {
+    True -> march_year / 400
+    False -> { march_year - 399 } / 400
   }
-  let yoe = y - era * 400
-  let mp = case month > 2 {
+  let year_of_era = march_year - era * 400
+  let month_prime = case month > 2 {
     True -> month - 3
     False -> month + 9
   }
-  let doy = { 153 * mp + 2 } / 5 + day - 1
-  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
-  era * 146_097 + doe - 719_468
+  let day_of_year = { 153 * month_prime + 2 } / 5 + day - 1
+  let day_of_era =
+    year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+  era * 146_097 + day_of_era - 719_468
 }
 
 // -- InfoZIP Extended Timestamp extra field --------------------------
