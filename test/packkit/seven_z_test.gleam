@@ -1,3 +1,4 @@
+import gleam/bit_array
 import gleam/list
 import gleam/result
 import gleeunit/should
@@ -709,4 +710,88 @@ pub fn decode_system_non_solid_archive_with_delta_chain_test() -> Nil {
   entry.body(first) |> should.equal(<<"AAAA\nBBBB\n":utf8>>)
   entry.to_string(entry.path(second)) |> should.equal("b.dat")
   entry.body(second) |> should.equal(<<"CCCCCCCC\nDDDDDDDD\n":utf8>>)
+}
+
+// -- encoder method choice (Copy / Deflate / BZip2 / LZMA) ------------
+//
+// The 1-arg `encode/1` API stays at the historical LZMA1 default
+// (covered by the existing `encode_*` tests above).  `encode_with_method`
+// lets callers pick Copy, Deflate, BZip2, or LZMA explicitly — each
+// produces a single-folder, single-coder archive that the same
+// `decode/1` reader accepts via the coder-id dispatcher.
+
+fn seven_z_roundtrip_with_method(
+  body: BitArray,
+  method: seven_z.Method,
+) -> Result(BitArray, error.ArchiveError) {
+  let assert Ok(file_entry) =
+    entry.file_checked(path: "payload.bin", body: body)
+  let archive_value = archive.add(seven_z.new(), entry: file_entry)
+  use bytes <- result.try(seven_z.encode_with_method(
+    archive: archive_value,
+    method: method,
+  ))
+  use decoded <- result.try(seven_z.decode(bytes: bytes))
+  case archive.entries(decoded) {
+    [single] -> Ok(entry.body(single))
+    _ -> Error(error.ArchiveInvalid(message: "expected exactly one entry"))
+  }
+}
+
+pub fn encode_with_method_copy_roundtrips_test() -> Nil {
+  let payload = <<"copy-method round trip payload":utf8>>
+  let assert Ok(restored) =
+    seven_z_roundtrip_with_method(payload, seven_z.copy())
+  restored |> should.equal(payload)
+}
+
+pub fn encode_with_method_deflate_roundtrips_test() -> Nil {
+  // Use a repetitive payload so DEFLATE actually compresses (not
+  // that the test asserts a compression ratio — just exercises the
+  // codec rather than the stored-block fallback path).
+  let payload = repeat_bytes(<<"deflate-method payload ":utf8>>, 30)
+  let assert Ok(restored) =
+    seven_z_roundtrip_with_method(payload, seven_z.deflate())
+  restored |> should.equal(payload)
+}
+
+pub fn encode_with_method_bzip2_roundtrips_test() -> Nil {
+  let payload = repeat_bytes(<<"bzip2-method payload ":utf8>>, 30)
+  let assert Ok(restored) =
+    seven_z_roundtrip_with_method(payload, seven_z.bzip2())
+  restored |> should.equal(payload)
+}
+
+pub fn encode_with_method_lzma_roundtrips_test() -> Nil {
+  // `seven_z.lzma()` is the explicit constructor for what `encode/1`
+  // emits by default; both paths must produce a round-trip-able
+  // archive.
+  let payload = repeat_bytes(<<"lzma-method payload ":utf8>>, 30)
+  let assert Ok(restored) =
+    seven_z_roundtrip_with_method(payload, seven_z.lzma())
+  restored |> should.equal(payload)
+}
+
+pub fn encode_with_method_default_matches_encode_test() -> Nil {
+  // `encode/1` must be observably equal to `encode_with_method(_,
+  // lzma())` — same bytes out for the same input, since both paths
+  // share `encode_via_method(MethodLzma)`.
+  let payload = <<"default method equality fixture":utf8>>
+  let assert Ok(file_entry) = entry.file_checked(path: "a.bin", body: payload)
+  let archive_value = archive.add(seven_z.new(), entry: file_entry)
+  let assert Ok(default_bytes) = seven_z.encode(archive: archive_value)
+  let assert Ok(explicit_bytes) =
+    seven_z.encode_with_method(archive: archive_value, method: seven_z.lzma())
+  default_bytes |> should.equal(explicit_bytes)
+}
+
+fn repeat_bytes(chunk: BitArray, times: Int) -> BitArray {
+  repeat_bytes_loop(chunk, times, <<>>)
+}
+
+fn repeat_bytes_loop(chunk: BitArray, times: Int, acc: BitArray) -> BitArray {
+  case times {
+    0 -> acc
+    _ -> repeat_bytes_loop(chunk, times - 1, bit_array.concat([acc, chunk]))
+  }
 }

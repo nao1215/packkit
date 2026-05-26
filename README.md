@@ -97,8 +97,11 @@ Implemented codecs and archive families:
   `FilesInfo` UTF-16 LE name table.  Multi-file archives
   round-trip; non-`File` entries are rejected because the encoder
   does not emit `EmptyStream` / `Attribute` blocks yet, and the
-  encoder still emits LZMA only (the new Copy / Deflate / BZip2
-  coverage is decode-side).  Per-entry mtimes round-trip in both
+  encoder accepts an explicit `Method` on the `encode_with_method`
+  variant: `seven_z.lzma()` (the historic default), `seven_z.copy()`,
+  `seven_z.deflate()`, and `seven_z.bzip2()` all produce a
+  single-folder, single-coder archive whose coder id matches what
+  `7z a -m0=<method>` would write.  Per-entry mtimes round-trip in both
   directions: the encoder emits a `FilesInfo` Mtime block
   (NID 0x14) packing each entry's Unix seconds as a Windows
   FILETIME (100-nanosecond ticks since 1601-01-01 UTC); the

@@ -158,6 +158,47 @@ pub fn new() -> archives.Archive {
   archives.new(format: format())
 }
 
+/// Coder selection for the single-folder 7z encoder.  Mirrors the
+/// `7z a -m0=<method>` CLI option: every entry's body is concatenated,
+/// then the whole buffer is fed through the chosen coder and emitted
+/// as one folder.  The decoder side accepts the same set plus extra
+/// coder ids it doesn't yet have an encoder for (LZMA2, BCJ family,
+/// Delta).
+pub opaque type Method {
+  MethodLzma
+  MethodCopy
+  MethodDeflate
+  MethodBzip2
+}
+
+/// Default `Method`: raw LZMA1 with the historical `7z a` defaults
+/// (lc=3 / lp=0 / pb=2, 64 KiB dictionary).  Equivalent to passing
+/// `seven_z.lzma()` to `encode_with_method`.
+pub fn lzma() -> Method {
+  MethodLzma
+}
+
+/// `Method` constructor: identity (no compression).  Equivalent to
+/// `7z a -m0=Copy`.  The packed bytes stored in the folder are the
+/// concatenated entry bodies verbatim.
+pub fn copy() -> Method {
+  MethodCopy
+}
+
+/// `Method` constructor: raw DEFLATE (no zlib / gzip wrapper).  The
+/// concatenated entry bodies go through `packkit/deflate.encode`.
+/// Equivalent to `7z a -m0=Deflate`.
+pub fn deflate() -> Method {
+  MethodDeflate
+}
+
+/// `Method` constructor: full bzip2 stream (with `BZh` magic and CRCs).
+/// The concatenated entry bodies go through `packkit/bzip2.encode`.
+/// Equivalent to `7z a -m0=BZip2`.
+pub fn bzip2() -> Method {
+  MethodBzip2
+}
+
 /// Encode a logical archive to a 7z byte stream.
 ///
 /// The encoder produces a single-folder, single-coder archive that
@@ -177,6 +218,18 @@ pub fn new() -> archives.Archive {
 pub fn encode(
   archive archive_value: archives.Archive,
 ) -> Result(BitArray, error.ArchiveError) {
+  encode_with_method(archive: archive_value, method: lzma())
+}
+
+/// Same as `encode/1` but lets the caller pick the coder.  All four
+/// methods produce a single-folder, single-coder archive — Copy is
+/// just the raw bytes; Deflate / BZip2 / LZMA dispatch to the
+/// corresponding packkit codec.  Cross-method round-trips work
+/// because the decoder accepts each of these coder ids.
+pub fn encode_with_method(
+  archive archive_value: archives.Archive,
+  method method: Method,
+) -> Result(BitArray, error.ArchiveError) {
   let entries = archives.entries(archive_value)
   case entries {
     [] ->
@@ -184,12 +237,13 @@ pub fn encode(
         path: "<archive>",
         reason: "7z encoder requires at least one entry",
       ))
-    _ -> encode_entries(entries)
+    _ -> encode_entries(entries, method)
   }
 }
 
 fn encode_entries(
   entries: List(entry.Entry),
+  method: Method,
 ) -> Result(BitArray, error.ArchiveError) {
   use _ <- result.try(validate_entries_for_encode(entries))
 
@@ -199,10 +253,10 @@ fn encode_entries(
   let total_unpack = sum_list(unpack_sizes, 0)
   let concatenated = bit_array.concat(bodies)
 
-  // LZMA1 properties + dictionary size that mirror the standard 7z
-  // archive defaults (`lc=3 / lp=0 / pb=2`, 64 KiB dictionary).
-  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
-  let compressed = lzma.encode_with_lz77(bytes: concatenated, props: props)
+  use #(compressed, coder_def) <- result.try(encode_via_method(
+    concatenated,
+    method,
+  ))
   let pack_size = bit_array.byte_size(compressed)
 
   // -- PackInfo ----------------------------------------------------
@@ -217,9 +271,6 @@ fn encode_entries(
   let pack_info = <<nid_pack_info, pack_info_body:bits>>
 
   // -- CodersInfo / UnPackInfo -------------------------------------
-  let prop_byte = lzma.properties_to_byte(props)
-  let dict_size_bytes = <<0x10000:little-size(32)>>
-  let coder_attrs = <<prop_byte, dict_size_bytes:bits>>
   let folder_def =
     bit_array.concat([
       // num_folders = 1, external = inline.
@@ -227,11 +278,8 @@ fn encode_entries(
       <<0x00>>,
       // num_coders = 1.
       write_varint(1),
-      // Coder flags: id_size=3, simple, has_attrs.
-      <<0x23>>,
-      <<lzma_coder_id_high, lzma_coder_id_mid, lzma_coder_id_low>>,
-      write_varint(5),
-      coder_attrs,
+      // Coder definition (flags + id + optional attrs); per-method.
+      coder_def,
     ])
   let unpack_info_body =
     bit_array.concat([
@@ -330,6 +378,73 @@ fn validate_entries_for_encode(
             reason: "7z encoder currently supports File entries only",
           ))
       }
+  }
+}
+
+// Encode the concatenated entry bodies via the requested method and
+// emit the matching coder definition (flags + id + optional attrs).
+// Each branch returns `#(packed_bytes, coder_definition_bytes)`; the
+// surrounding encoder splices the coder definition into the folder
+// header and the packed bytes into the pack region.  Codec failures
+// (deflate / bzip2) propagate as `ArchiveError` via `codec_to_archive`.
+fn encode_via_method(
+  bytes: BitArray,
+  method: Method,
+) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+  case method {
+    MethodLzma -> {
+      // LZMA1 with the historical `7z a` defaults (`lc=3 / lp=0 /
+      // pb=2`, 64 KiB dictionary).  Coder flags 0x23 = id_size=3 +
+      // attrs present.
+      let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
+      let compressed = lzma.encode_with_lz77(bytes: bytes, props: props)
+      let prop_byte = lzma.properties_to_byte(props)
+      let dict_size_bytes = <<0x10000:little-size(32)>>
+      let coder_def = <<
+        0x23,
+        lzma_coder_id_high,
+        lzma_coder_id_mid,
+        lzma_coder_id_low,
+        write_varint(5):bits,
+        prop_byte,
+        dict_size_bytes:bits,
+      >>
+      Ok(#(compressed, coder_def))
+    }
+    MethodCopy -> {
+      // Identity coder: packed bytes ARE the unpack bytes.  Coder
+      // flags 0x01 = id_size=1, no attrs.
+      let coder_def = <<0x01, copy_coder_id>>
+      Ok(#(bytes, coder_def))
+    }
+    MethodDeflate -> {
+      // Raw DEFLATE (no zlib / gzip wrapper).  Coder id is the 3-byte
+      // `04 01 08`; flags 0x03 = id_size=3, no attrs.
+      use compressed <- result.try(
+        deflate.encode(bytes: bytes) |> result.map_error(codec_to_archive),
+      )
+      let coder_def = <<
+        0x03,
+        deflate_coder_id_high,
+        deflate_coder_id_mid,
+        deflate_coder_id_low,
+      >>
+      Ok(#(compressed, coder_def))
+    }
+    MethodBzip2 -> {
+      // Full `BZh` bzip2 stream (with magic + CRCs).  Coder id is
+      // the 3-byte `04 02 02`; flags 0x03 = id_size=3, no attrs.
+      use compressed <- result.try(
+        bzip2.encode(bytes: bytes) |> result.map_error(codec_to_archive),
+      )
+      let coder_def = <<
+        0x03,
+        bzip2_coder_id_high,
+        bzip2_coder_id_mid,
+        bzip2_coder_id_low,
+      >>
+      Ok(#(compressed, coder_def))
+    }
   }
 }
 
