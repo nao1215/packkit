@@ -38,6 +38,7 @@ import packkit/entry
 import packkit/error
 import packkit/internal/aes
 import packkit/internal/bcj
+import packkit/internal/bcj2
 import packkit/internal/lzma
 import packkit/limit
 
@@ -101,6 +102,18 @@ const bzip2_coder_id_high: Int = 0x04
 const bzip2_coder_id_mid: Int = 0x02
 
 const bzip2_coder_id_low: Int = 0x02
+
+// BCJ2 coder id (`03 03 01 1B`) — the multi-stream demux p7zip uses
+// for x86 binaries when `-m0=BCJ2` is set (default for binary input).
+// Coder topology: 4 inputs (main, call, jump, range-coder) → 1
+// output.  See `packkit/internal/bcj2` for the algorithm.
+const bcj2_coder_id_byte_0: Int = 0x03
+
+const bcj2_coder_id_byte_1: Int = 0x03
+
+const bcj2_coder_id_byte_2: Int = 0x01
+
+const bcj2_coder_id_byte_3: Int = 0x1B
 
 // 7z AES coder id (`06 F1 07 01`) — AES-256-CBC with the SHA-256-based
 // key derivation described in p7zip's `CPP/7zip/Crypto/7zAes.cpp`.
@@ -1290,11 +1303,24 @@ type ParsedHeader {
 }
 
 type ParsedFolder {
-  ParsedFolder(coders: List(CoderSpec))
+  ParsedFolder(
+    coders: List(CoderSpec),
+    /// For BCJ2-shaped folders (and any future non-linear topology),
+    /// `packed_stream_indices` records which global "in-slot" each
+    /// packed stream feeds.  An empty list (the common case) means
+    /// the folder has one packed stream that feeds the only unbound
+    /// input — `decode_folder` falls back to the linear-chain path.
+    packed_stream_indices: List(Int),
+  )
 }
 
 type CoderSpec {
-  CoderSpec(id: CoderId, properties: BitArray)
+  CoderSpec(
+    id: CoderId,
+    properties: BitArray,
+    num_in_streams: Int,
+    num_out_streams: Int,
+  )
 }
 
 type CoderId {
@@ -1311,6 +1337,7 @@ type CoderId {
   BcjArmT
   BcjSparc
   Aes256Sha256
+  Bcj2
 }
 
 // -- top-level header parser -------------------------------------------
@@ -1694,13 +1721,20 @@ fn split_unpack_sizes_by_folder(
 }
 
 // Parse a single folder definition: NumCoders varint, N coder defs,
-// then (when NumCoders > 1) NumBindPairs = NumOutStreams - 1 bind
-// pairs and (when NumPackedStreams > 1) the packed-stream indices.
-// packkit supports linear 1-, 2-, or 3-coder chains where every
-// coder has a single input + single output and the bind pairs wire
-// them in straight order.  Non-linear graphs (BCJ2's 4-stream demux,
-// or any non-(i, i-1) bind pair shape) and 4+-coder folders are
-// rejected with typed `ArchiveNotImplemented`.
+// then (when total OutStreams > 1) NumBindPairs = TotalOutStreams - 1
+// bind pairs, and (when NumPackedStreams > 1) the packed-stream
+// indices.  packkit accepts two folder shapes:
+//   - **Linear chain** (1 to 3 coders, each (1 in, 1 out)) with
+//     bind pairs (i, i-1) for i in 1..N-1.  Packed bytes feed coder
+//     0; coder N-1's output is the folder output.  Single packed
+//     stream — index list omitted.
+//   - **BCJ2 demux** (the only non-linear topology p7zip emits): one
+//     simple coder (LZMA / LZMA2 / Copy) wraps the main x86 stream,
+//     and one complex BCJ2 coder takes 4 inputs (main + call + jump
+//     + range-coder) → 1 output.  Bind pair (in_idx=1, out_idx=0)
+//     wires the simple coder's output to BCJ2 input 0; 4 packed
+//     streams feed the remaining unbound inputs.
+// Anything else falls through to `ArchiveNotImplemented`.
 fn parse_one_folder(
   bytes: BitArray,
 ) -> Result(#(ParsedFolder, BitArray), error.ArchiveError) {
@@ -1718,22 +1752,85 @@ fn parse_one_folder(
     )),
   )
   use #(coders, rest) <- result.try(parse_coders_loop(rest, num_coders, []))
-  case num_coders {
-    1 -> Ok(#(ParsedFolder(coders: coders), rest))
-    _ -> {
-      // For an N-coder linear chain we expect N - 1 bind pairs in the
-      // canonical order: (in_idx = i, out_idx = i - 1) for i in 1..N-1.
-      // Packed bytes feed coder 0; coder N-1's output is the folder
-      // output.  Anything else (BCJ2 demux etc) is non-linear and
-      // rejected.  NumPackedStreams = NumInStreams - NumBindPairs = 1
-      // so the spec omits the explicit packed-stream index list.
-      let num_bind_pairs = num_coders - 1
+  let total_in = sum_coder_in_streams(coders, 0)
+  let total_out = sum_coder_out_streams(coders, 0)
+  let num_bind_pairs = total_out - 1
+  let num_packed_streams = total_in - num_bind_pairs
+  case num_coders, total_in == total_out {
+    1, _ -> Ok(#(ParsedFolder(coders:, packed_stream_indices: []), rest))
+    _, True -> {
+      // Linear chain (every coder is (1 in, 1 out)) → use the
+      // canonical (i, i-1) bind pair sequence and a single packed
+      // stream.
       use #(after_bind_pairs, _) <- result.try(consume_linear_bind_pairs(
         rest,
         1,
         num_bind_pairs,
       ))
-      Ok(#(ParsedFolder(coders: coders), after_bind_pairs))
+      Ok(#(ParsedFolder(coders:, packed_stream_indices: []), after_bind_pairs))
+    }
+    _, False -> {
+      // Non-linear (BCJ2-shaped) — read all bind pairs raw, then the
+      // explicit packed-stream index list when num_packed_streams > 1.
+      // `decode_folder` validates the resulting shape against the
+      // canonical BCJ2 layout (`[simple, BCJ2(4,1)]` with bind (1,0)
+      // and packed [0, 2, 3, 4]).
+      use #(_bind_pairs, after_bind_pairs) <- result.try(
+        read_bind_pairs(rest, num_bind_pairs, []),
+      )
+      use #(packed_indices, after_packed) <- result.try(
+        case num_packed_streams > 1 {
+          True -> read_varint_list(after_bind_pairs, num_packed_streams, [])
+          False -> Ok(#([], after_bind_pairs))
+        },
+      )
+      Ok(#(
+        ParsedFolder(coders:, packed_stream_indices: packed_indices),
+        after_packed,
+      ))
+    }
+  }
+}
+
+fn sum_coder_in_streams(coders: List(CoderSpec), acc: Int) -> Int {
+  case coders {
+    [] -> acc
+    [head, ..rest] -> sum_coder_in_streams(rest, acc + head.num_in_streams)
+  }
+}
+
+fn sum_coder_out_streams(coders: List(CoderSpec), acc: Int) -> Int {
+  case coders {
+    [] -> acc
+    [head, ..rest] -> sum_coder_out_streams(rest, acc + head.num_out_streams)
+  }
+}
+
+fn read_bind_pairs(
+  bytes: BitArray,
+  remaining: Int,
+  acc: List(#(Int, Int)),
+) -> Result(#(List(#(Int, Int)), BitArray), error.ArchiveError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), bytes))
+    _ -> {
+      use #(in_idx, after_in) <- result.try(read_number(bytes))
+      use #(out_idx, after_out) <- result.try(read_number(after_in))
+      read_bind_pairs(after_out, remaining - 1, [#(in_idx, out_idx), ..acc])
+    }
+  }
+}
+
+fn read_varint_list(
+  bytes: BitArray,
+  remaining: Int,
+  acc: List(Int),
+) -> Result(#(List(Int), BitArray), error.ArchiveError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), bytes))
+    _ -> {
+      use #(value, after_value) <- result.try(read_number(bytes))
+      read_varint_list(after_value, remaining - 1, [value, ..acc])
     }
   }
 }
@@ -1786,31 +1883,47 @@ fn parse_one_coder(
       let id_size = int.bitwise_and(flags, 0x0F)
       let is_complex = int.bitwise_and(flags, 0x10) != 0
       let has_attrs = int.bitwise_and(flags, 0x20) != 0
-      use <- bool.guard(
-        when: is_complex,
-        return: Error(error.ArchiveNotImplemented(
-          feature: "7z complex coders (multiple streams)",
-        )),
-      )
       use coder_id_bytes <- result.try(slice_required(
         after_flags,
         0,
         id_size,
         "7z coder id",
       ))
-      let assert Ok(after_coder_id) =
+      use after_coder_id <- result.try(
         bit_array.slice(
           after_flags,
           id_size,
           bit_array.byte_size(after_flags) - id_size,
         )
+        |> result.replace_error(error.ArchiveInvalid(
+          message: "7z coder id slice failed",
+        )),
+      )
       use coder_id <- result.try(classify_coder_id(coder_id_bytes))
+      use #(num_in, num_out, after_streams) <- result.try(case is_complex {
+        False -> Ok(#(1, 1, after_coder_id))
+        True -> {
+          use #(num_in_streams, rest_a) <- result.try(read_number(
+            after_coder_id,
+          ))
+          use #(num_out_streams, rest_b) <- result.try(read_number(rest_a))
+          Ok(#(num_in_streams, num_out_streams, rest_b))
+        }
+      })
       case has_attrs {
         False ->
-          Ok(#(CoderSpec(id: coder_id, properties: <<>>), after_coder_id))
+          Ok(#(
+            CoderSpec(
+              id: coder_id,
+              properties: <<>>,
+              num_in_streams: num_in,
+              num_out_streams: num_out,
+            ),
+            after_streams,
+          ))
         True -> {
           use #(attrs_size, after_attrs_size) <- result.try(read_number(
-            after_coder_id,
+            after_streams,
           ))
           use attrs <- result.try(slice_required(
             after_attrs_size,
@@ -1818,13 +1931,25 @@ fn parse_one_coder(
             attrs_size,
             "7z coder attributes",
           ))
-          let assert Ok(after_attrs) =
+          use after_attrs <- result.try(
             bit_array.slice(
               after_attrs_size,
               attrs_size,
               bit_array.byte_size(after_attrs_size) - attrs_size,
             )
-          Ok(#(CoderSpec(id: coder_id, properties: attrs), after_attrs))
+            |> result.replace_error(error.ArchiveInvalid(
+              message: "7z coder attrs slice failed",
+            )),
+          )
+          Ok(#(
+            CoderSpec(
+              id: coder_id,
+              properties: attrs,
+              num_in_streams: num_in,
+              num_out_streams: num_out,
+            ),
+            after_attrs,
+          ))
         }
       }
     }
@@ -1858,6 +1983,12 @@ fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) 
       && b3 == aes_coder_id_byte_2
       && b4 == aes_coder_id_byte_3
     -> Ok(Aes256Sha256)
+    <<b1, b2, b3, b4>>
+      if b1 == bcj2_coder_id_byte_0
+      && b2 == bcj2_coder_id_byte_1
+      && b3 == bcj2_coder_id_byte_2
+      && b4 == bcj2_coder_id_byte_3
+    -> Ok(Bcj2)
     <<b1, b2, b3, b4>> if b1 == bcj_prefix_byte_0 && b2 == bcj_prefix_byte_1 ->
       case b3, b4 {
         v3, v4 if v3 == bcj_x86_byte_2 && v4 == bcj_x86_byte_3 -> Ok(BcjX86)
@@ -2562,40 +2693,68 @@ fn decode_all_folders(
   pack_cursor: Int,
   acc: List(BitArray),
 ) -> Result(BitArray, error.ArchiveError) {
-  case folders, folder_unpack_sizes, pack_sizes {
-    [], [], _ -> Ok(bit_array.concat(list.reverse(acc)))
-    [folder, ..rest_folders],
-      [unpack_sizes, ..rest_unpack],
-      [pack_size, ..rest_pack]
-    -> {
-      use folder_packed <- result.try(slice_required(
-        packed,
-        pack_cursor,
-        pack_size,
-        "7z per-folder packed bytes",
-      ))
+  case folders, folder_unpack_sizes {
+    [], [] -> Ok(bit_array.concat(list.reverse(acc)))
+    [folder, ..rest_folders], [unpack_sizes, ..rest_unpack] -> {
+      // A folder consumes `num_packed_streams` entries from the
+      // global `pack_sizes` list.  Linear-chain folders take 1; BCJ2
+      // folders take 4.
+      let stream_count = folder_packed_stream_count(folder)
+      let folder_pack_sizes = list.take(pack_sizes, stream_count)
+      let rest_pack_sizes = list.drop(pack_sizes, stream_count)
+      use folder_streams <- result.try(
+        slice_folder_streams(packed, pack_cursor, folder_pack_sizes, []),
+      )
       use folder_plain <- result.try(decode_folder(
-        folder_packed,
+        folder_streams,
         folder,
         unpack_sizes,
         password,
         limits,
       ))
+      let next_cursor = pack_cursor + sum_list(folder_pack_sizes, 0)
       decode_all_folders(
         packed,
         rest_folders,
         rest_unpack,
-        rest_pack,
+        rest_pack_sizes,
         password,
         limits,
-        pack_cursor + pack_size,
+        next_cursor,
         [folder_plain, ..acc],
       )
     }
-    _, _, _ ->
+    _, _ ->
       Error(error.ArchiveInvalid(
-        message: "7z folder / unpack-size / pack-size lists are misaligned",
+        message: "7z folder / unpack-size lists are misaligned",
       ))
+  }
+}
+
+fn folder_packed_stream_count(folder: ParsedFolder) -> Int {
+  case folder.packed_stream_indices {
+    [] -> 1
+    list_value -> list.length(list_value)
+  }
+}
+
+fn slice_folder_streams(
+  packed: BitArray,
+  cursor: Int,
+  sizes: List(Int),
+  acc: List(BitArray),
+) -> Result(List(BitArray), error.ArchiveError) {
+  case sizes {
+    [] -> Ok(list.reverse(acc))
+    [size, ..rest] -> {
+      use stream <- result.try(slice_required(
+        packed,
+        cursor,
+        size,
+        "7z per-folder packed stream",
+      ))
+      slice_folder_streams(packed, cursor + size, rest, [stream, ..acc])
+    }
   }
 }
 
@@ -2612,19 +2771,89 @@ fn enforce_max_output(
 }
 
 fn decode_folder(
-  packed: BitArray,
+  packed_streams: List(BitArray),
   folder: ParsedFolder,
   unpack_sizes: List(Int),
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
-  // N-coder linear chain: packed bytes feed coder 0, whose output
-  // feeds coder 1, and so on through coder N-1 whose output is the
-  // folder output.  CodersUnPackSize entries match that ordering, one
-  // varint per coder output (entry i = coder i's declared output
-  // size).  `parse_one_folder` already enforced the canonical linear
-  // bind-pair ordering, so we can simply walk both lists in lockstep.
-  decode_linear_chain(packed, folder.coders, unpack_sizes, password, limits)
+  // Dispatch by folder shape:
+  //   - 1 packed stream (the common case): linear N-coder chain.
+  //   - 4 packed streams + BCJ2 as the second coder: the canonical
+  //     `[simple, BCJ2(4,1)]` demux.
+  case packed_streams, folder.coders {
+    [single_packed], _ ->
+      decode_linear_chain(
+        single_packed,
+        folder.coders,
+        unpack_sizes,
+        password,
+        limits,
+      )
+    [main_packed, call_packed, jump_packed, rc_packed], [inner_spec, bcj2_spec]
+      if bcj2_spec.id == Bcj2 && bcj2_spec.num_in_streams == 4
+    ->
+      decode_bcj2_folder(
+        main_packed,
+        call_packed,
+        jump_packed,
+        rc_packed,
+        inner_spec,
+        unpack_sizes,
+        password,
+        limits,
+      )
+    _, _ ->
+      Error(error.ArchiveNotImplemented(
+        feature: "7z folder topology with "
+        <> int.to_string(list.length(packed_streams))
+        <> " packed streams and "
+        <> int.to_string(list.length(folder.coders))
+        <> " coders",
+      ))
+  }
+}
+
+// Canonical BCJ2 folder dispatch: `inner_spec` (LZMA / LZMA2 / Copy
+// usually) decompresses `main_packed` into the x86 binary's "main"
+// stream, then BCJ2 takes that plus the three remaining packed
+// streams (call destinations, jump destinations, range-coder bits)
+// and demuxes them into the final binary.
+fn decode_bcj2_folder(
+  main_packed: BitArray,
+  call_packed: BitArray,
+  jump_packed: BitArray,
+  rc_packed: BitArray,
+  inner_spec: CoderSpec,
+  unpack_sizes: List(Int),
+  password: Option(String),
+  limits: limit.Limits,
+) -> Result(BitArray, error.ArchiveError) {
+  // The folder's CodersUnPackSize block records two entries: the
+  // inner coder's output size (= BCJ2's main-stream input length)
+  // and BCJ2's output size (= the final binary).
+  let #(inner_unpack_size, bcj2_output_size) = case unpack_sizes {
+    [first, second, ..] -> #(first, second)
+    [only] -> #(only, only)
+    [] -> #(0, 0)
+  }
+  use main_stream <- result.try(dispatch_coder(
+    main_packed,
+    inner_spec,
+    [inner_unpack_size],
+    password,
+    limits,
+  ))
+  bcj2.decode(
+    main: main_stream,
+    call: call_packed,
+    jump: jump_packed,
+    range_coder: rc_packed,
+    output_size: bcj2_output_size,
+  )
+  |> result.map_error(fn(_) {
+    error.ArchiveInvalid(message: "7z BCJ2 decoder rejected the packed streams")
+  })
 }
 
 fn decode_linear_chain(
@@ -2692,6 +2921,15 @@ fn dispatch_coder(
       decode_bcj_coder(packed, unpack_sizes, bcj.sparc_decode, "SPARC")
     Aes256Sha256 ->
       decode_aes_coder(packed, spec.properties, unpack_sizes, password)
+    Bcj2 ->
+      // BCJ2 is a 4-input demux; `decode_folder` short-circuits the
+      // canonical `[simple, BCJ2(4,1)]` layout before the linear-chain
+      // dispatch runs.  Reaching this arm means the folder topology
+      // declared `Bcj2` but doesn't match the canonical shape — fall
+      // through to a typed error instead of corrupt output.
+      Error(error.ArchiveNotImplemented(
+        feature: "7z BCJ2 outside its canonical [simple, BCJ2(4,1)] folder layout",
+      ))
   }
 }
 
