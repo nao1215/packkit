@@ -8,6 +8,7 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
+import gleam/result
 
 const adler32_base: Int = 65_521
 
@@ -841,12 +842,9 @@ pub fn pbkdf2_hmac_sha1(
   let raw = pbkdf2_blocks(password, salt, iterations, block_count, 1, <<>>)
   // `pbkdf2_blocks` always emits `block_count * 20 >= dk_len` bytes
   // (block_count = ceil(dk_len / 20)), so the slice is in-bounds by
-  // construction; the `Error` arm only fires on an unreachable
-  // negative dk_len which `bit_array.slice` would reject.
-  case bit_array.slice(raw, 0, dk_len) {
-    Ok(truncated) -> truncated
-    Error(_) -> raw
-  }
+  // construction; the default only kicks in on an unreachable
+  // negative `dk_len` which `bit_array.slice` would reject.
+  result.unwrap(bit_array.slice(raw, 0, dk_len), or: raw)
 }
 
 fn pbkdf2_blocks(
