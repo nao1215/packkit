@@ -91,8 +91,8 @@ pub fn decode_without_password_rejects_header_encryption_test() -> Nil {
   let archive_bytes = fixture_bytes_header_encrypted()
 
   case seven_z.decode(bytes: archive_bytes) {
-    Error(_) -> Nil
     Ok(_) -> should.fail()
+    _ -> Nil
   }
 }
 
