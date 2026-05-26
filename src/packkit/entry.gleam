@@ -228,6 +228,27 @@ pub fn kind(entry: Entry) -> EntryKind {
   entry.kind
 }
 
+/// Short-circuit predicate for `kind(entry) == File`.  Saves callers
+/// from importing `EntryKind` just to filter a list of entries.
+pub fn is_file(entry: Entry) -> Bool {
+  entry.kind == File
+}
+
+/// Short-circuit predicate for `kind(entry) == Directory`.
+pub fn is_directory(entry: Entry) -> Bool {
+  entry.kind == Directory
+}
+
+/// Short-circuit predicate for `kind(entry) == Symlink`.
+pub fn is_symlink(entry: Entry) -> Bool {
+  entry.kind == Symlink
+}
+
+/// Short-circuit predicate for `kind(entry) == Hardlink`.
+pub fn is_hardlink(entry: Entry) -> Bool {
+  entry.kind == Hardlink
+}
+
 /// Read the validated entry path.
 pub fn path(entry: Entry) -> EntryPath {
   entry.path

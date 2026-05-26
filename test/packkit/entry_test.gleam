@@ -88,3 +88,34 @@ pub fn entry_kind_is_a_transparent_enum_test() -> Nil {
   entry.kind(sym_e) |> should.equal(entry.Symlink)
   entry.kind(hard_e) |> should.equal(entry.Hardlink)
 }
+
+pub fn is_kind_predicates_match_kind_test() -> Nil {
+  // The four `is_*` helpers are short-circuits over `kind(entry) ==
+  // <variant>`; assert every kind triggers exactly the matching
+  // predicate and nothing else, so adding a new EntryKind doesn't
+  // silently break the contract.
+  let assert Ok(file_e) = entry.file_checked(path: "f", body: <<>>)
+  let assert Ok(dir_e) = entry.directory_checked(path: "d")
+  let assert Ok(sym_e) = entry.symlink_checked(path: "s", target: "t")
+  let assert Ok(hard_e) = entry.hardlink_checked(path: "h", target: "t")
+
+  entry.is_file(file_e) |> should.be_true
+  entry.is_directory(file_e) |> should.be_false
+  entry.is_symlink(file_e) |> should.be_false
+  entry.is_hardlink(file_e) |> should.be_false
+
+  entry.is_file(dir_e) |> should.be_false
+  entry.is_directory(dir_e) |> should.be_true
+  entry.is_symlink(dir_e) |> should.be_false
+  entry.is_hardlink(dir_e) |> should.be_false
+
+  entry.is_file(sym_e) |> should.be_false
+  entry.is_directory(sym_e) |> should.be_false
+  entry.is_symlink(sym_e) |> should.be_true
+  entry.is_hardlink(sym_e) |> should.be_false
+
+  entry.is_file(hard_e) |> should.be_false
+  entry.is_directory(hard_e) |> should.be_false
+  entry.is_symlink(hard_e) |> should.be_false
+  entry.is_hardlink(hard_e) |> should.be_true
+}
