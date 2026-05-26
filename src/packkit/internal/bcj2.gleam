@@ -27,6 +27,7 @@
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/int
+import gleam/order
 import gleam/result
 
 /// Decoder failure reasons.  Always typed so callers can map to
@@ -125,9 +126,14 @@ type State {
 }
 
 fn init_probs(index: Int, acc: Dict(Int, Int)) -> Dict(Int, Int) {
-  case index == num_probs {
-    True -> acc
-    False -> init_probs(index + 1, dict.insert(acc, index, bit_model_total / 2))
+  // Tail-recursive self call → branch via `int.compare` rather than
+  // `bool.guard`, otherwise the JS backend can't rewrite the call to
+  // a `while` loop.  See feedback-gleam-tail-call-bool-guard in
+  // memory.
+  case int.compare(index, num_probs) {
+    order.Lt ->
+      init_probs(index + 1, dict.insert(acc, index, bit_model_total / 2))
+    _ -> acc
   }
 }
 
@@ -157,23 +163,41 @@ fn init_range_coder(rc: BitArray) -> Result(#(Int, BitArray), Bcj2Error) {
 // -- main loop ------------------------------------------------------
 
 fn decode_loop(state: State) -> Result(State, Bcj2Error) {
-  case bit_array.byte_size(state.output) >= state.output_size {
-    True -> Ok(state)
-    False ->
-      case state.main {
-        <<>> -> Ok(state)
-        <<byte, main_rest:bytes>> -> {
-          let after_consume = consume_main_byte(state, byte, main_rest)
-          case is_branch_candidate(byte, state.prev_byte) {
-            False -> decode_loop(after_consume)
-            True -> {
-              use stepped <- result.try(decode_branch(after_consume, byte))
-              decode_loop(stepped)
-            }
-          }
-        }
-        _ -> Error(StreamExhausted(stream_name: "main"))
-      }
+  // Self-recursive tail call — keep the exit check as `int.compare`
+  // so the JS backend rewrites this to a `while` (see
+  // feedback-gleam-tail-call-bool-guard).  For the same reason the
+  // step is split into `decode_loop_step` so the nesting stays under
+  // the lint's deep_nesting threshold.
+  case int.compare(bit_array.byte_size(state.output), state.output_size) {
+    order.Lt -> decode_loop_step(state)
+    _ -> Ok(state)
+  }
+}
+
+fn decode_loop_step(state: State) -> Result(State, Bcj2Error) {
+  case state.main {
+    <<>> -> Ok(state)
+    <<byte, main_rest:bytes>> -> {
+      let after_consume = consume_main_byte(state, byte, main_rest)
+      use stepped <- result.try(decode_main_byte(
+        after_consume,
+        byte,
+        state.prev_byte,
+      ))
+      decode_loop(stepped)
+    }
+    _ -> Error(StreamExhausted(stream_name: "main"))
+  }
+}
+
+fn decode_main_byte(
+  state: State,
+  byte: Int,
+  prev_byte_before_consume: Int,
+) -> Result(State, Bcj2Error) {
+  case is_branch_candidate(byte, prev_byte_before_consume) {
+    False -> Ok(state)
+    True -> decode_branch(state, byte)
   }
 }
 
@@ -216,10 +240,12 @@ fn decode_branch(state: State, opcode: Int) -> Result(State, Bcj2Error) {
     0xE9 -> prob_jmp
     _ -> prob_jcc
   }
-  let prob = case dict.get(state.probs, prob_index) {
-    Ok(value) -> value
-    Error(_) -> bit_model_total / 2
-  }
+  // `init_probs` seeded every slot in 0..258 so this `result.unwrap`
+  // never falls back in practice; the `or:` value matches the seed
+  // so we stay correct even if a future refactor changes the table
+  // shape.
+  let prob =
+    dict.get(state.probs, prob_index) |> result.unwrap(or: bit_model_total / 2)
   let #(bit, range_after, code_after, prob_after) =
     range_decode_bit(state.range, state.code, prob)
   let probs_after = dict.insert(state.probs, prob_index, prob_after)
@@ -278,22 +304,27 @@ fn range_decode_bit(range: Int, code: Int, prob: Int) -> #(Int, Int, Int, Int) {
 // normalises by shifting the next rc-stream byte into the low byte
 // of `code` and the range.  Loops until `range >= top_value`.
 fn maybe_refill_rc(state: State) -> Result(State, Bcj2Error) {
-  case state.range < top_value {
-    False -> Ok(state)
-    True ->
-      case state.rc {
-        <<next, rc_rest:bytes>> -> {
-          let new_range =
-            int.bitwise_shift_left(state.range, 8) |> int.bitwise_and(u32_mask)
-          let new_code =
-            int.bitwise_or(int.bitwise_shift_left(state.code, 8), next)
-            |> int.bitwise_and(u32_mask)
-          maybe_refill_rc(
-            State(..state, range: new_range, code: new_code, rc: rc_rest),
-          )
-        }
-        _ -> Error(StreamExhausted(stream_name: "range_coder"))
-      }
+  // Self-recursive — branch on `int.compare` to keep the JS tail
+  // call alive (see feedback-gleam-tail-call-bool-guard).
+  case int.compare(state.range, top_value) {
+    order.Lt -> refill_rc_step(state)
+    _ -> Ok(state)
+  }
+}
+
+fn refill_rc_step(state: State) -> Result(State, Bcj2Error) {
+  case state.rc {
+    <<next, rc_rest:bytes>> -> {
+      let new_range =
+        int.bitwise_shift_left(state.range, 8) |> int.bitwise_and(u32_mask)
+      let new_code =
+        int.bitwise_or(int.bitwise_shift_left(state.code, 8), next)
+        |> int.bitwise_and(u32_mask)
+      maybe_refill_rc(
+        State(..state, range: new_range, code: new_code, rc: rc_rest),
+      )
+    }
+    _ -> Error(StreamExhausted(stream_name: "range_coder"))
   }
 }
 

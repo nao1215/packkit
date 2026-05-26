@@ -2851,9 +2851,27 @@ fn decode_bcj2_folder(
     range_coder: rc_packed,
     output_size: bcj2_output_size,
   )
-  |> result.map_error(fn(_) {
-    error.ArchiveInvalid(message: "7z BCJ2 decoder rejected the packed streams")
-  })
+  |> result.map_error(bcj2_error_to_archive)
+}
+
+fn bcj2_error_to_archive(err: bcj2.Bcj2Error) -> error.ArchiveError {
+  case err {
+    bcj2.RangeCoderHeaderInvalid ->
+      error.ArchiveInvalid(
+        message: "7z BCJ2: range-coder header invalid (first 5 bytes)",
+      )
+    bcj2.StreamExhausted(stream_name: name) ->
+      error.ArchiveInvalid(
+        message: "7z BCJ2: stream \"" <> name <> "\" exhausted mid-decode",
+      )
+    bcj2.OutputSizeMismatch(declared: declared, actual: actual) ->
+      error.ArchiveInvalid(
+        message: "7z BCJ2: decoded "
+        <> int.to_string(actual)
+        <> " bytes, expected "
+        <> int.to_string(declared),
+      )
+  }
 }
 
 fn decode_linear_chain(
