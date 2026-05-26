@@ -612,7 +612,19 @@ fn decode_encoded_header(
       Error(error.ArchiveInvalid(
         message: "7z encoded next header has no StreamsInfo",
       ))
-    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, _) -> {
+    HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
+      // The encoded-header path always uses exactly one folder per
+      // spec: the next-header bytes are a single LZMA-coded stream.
+      // Reject the (unobserved-in-the-wild) multi-folder shape with a
+      // typed error rather than silently picking the first folder.
+      use <- bool.guard(
+        when: list.length(folders) != 1,
+        return: Error(error.ArchiveNotImplemented(
+          feature: "7z encoded header spread across multiple folders",
+        )),
+      )
+      let assert [folder, ..] = folders
+      let assert [unpack_sizes, ..] = folder_unpack_sizes
       let pack_offset = signature_size + pack_pos
       let pack_size = sum_list(pack_sizes, 0)
       use packed <- result.try(slice_required(
@@ -667,8 +679,19 @@ type ParsedHeader {
   ParsedHeader(
     pack_pos: Int,
     pack_sizes: List(Int),
-    folder: ParsedFolder,
-    unpack_sizes: List(Int),
+    /// One `ParsedFolder` per `Folder` definition in the 7z header.
+    /// Solid-mode archives (the `7z a` default) have exactly one folder
+    /// containing every member; non-solid archives (`7z a -ms=off`)
+    /// have one folder per member.  The folder list and the pack-stream
+    /// list always have the same length when each folder declares a
+    /// single packed input (which is the only shape packkit accepts —
+    /// multi-packed-stream folders remain `ArchiveNotImplemented`).
+    folders: List(ParsedFolder),
+    /// One unpack-size list per folder: `folder_unpack_sizes[i]` holds
+    /// the per-coder unpack sizes for folder `i`.  For a 1-coder folder
+    /// the list has a single element (the folder's final output size);
+    /// for a 2-coder simple chain it has two (intermediate + final).
+    folder_unpack_sizes: List(List(Int)),
     substream_sizes: List(Int),
     file_names: List(String),
     empty_streams: List(Bool),
@@ -736,8 +759,8 @@ type HeaderStreams {
   HeaderStreamsParsed(
     pack_pos: Int,
     pack_sizes: List(Int),
-    folder: ParsedFolder,
-    unpack_sizes: List(Int),
+    folders: List(ParsedFolder),
+    folder_unpack_sizes: List(List(Int)),
     substream_sizes: List(Int),
   )
 }
@@ -785,29 +808,29 @@ fn finalize_parsed_header(
   parser: HeaderParser,
 ) -> Result(ParsedHeader, error.ArchiveError) {
   case parser.streams, parser.files {
-    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
+    HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, sub),
       HeaderFilesParsed(names, empty_streams, empty_files, mtimes_unix)
     ->
       Ok(ParsedHeader(
         pack_pos: pack_pos,
         pack_sizes: pack_sizes,
-        folder: folder,
-        unpack_sizes: unpack_sizes,
+        folders: folders,
+        folder_unpack_sizes: folder_unpack_sizes,
         substream_sizes: sub,
         file_names: names,
         empty_streams: empty_streams,
         empty_files: empty_files,
         mtimes_unix: mtimes_unix,
       ))
-    HeaderStreamsParsed(pack_pos, pack_sizes, folder, unpack_sizes, sub),
+    HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, sub),
       HeaderFilesNone
     ->
       Ok(
         ParsedHeader(
           pack_pos: pack_pos,
           pack_sizes: pack_sizes,
-          folder: folder,
-          unpack_sizes: unpack_sizes,
+          folders: folders,
+          folder_unpack_sizes: folder_unpack_sizes,
           substream_sizes: sub,
           file_names: [],
           empty_streams: [],
@@ -829,8 +852,8 @@ fn parse_main_streams_info(
     StreamsParser(
       pack_pos: 0,
       pack_sizes: [],
-      folder: None,
-      unpack_sizes: [],
+      folders: [],
+      folder_unpack_sizes: [],
       substream_sizes: [],
       have_pack: False,
       have_unpack: False,
@@ -842,17 +865,12 @@ type StreamsParser {
   StreamsParser(
     pack_pos: Int,
     pack_sizes: List(Int),
-    folder: OptionalFolder,
-    unpack_sizes: List(Int),
+    folders: List(ParsedFolder),
+    folder_unpack_sizes: List(List(Int)),
     substream_sizes: List(Int),
     have_pack: Bool,
     have_unpack: Bool,
   )
-}
-
-type OptionalFolder {
-  None
-  Some(folder: ParsedFolder)
 }
 
 fn parse_streams_loop(
@@ -863,21 +881,21 @@ fn parse_streams_loop(
     <<nid, rest:bytes>> ->
       case nid {
         n if n == nid_end ->
-          case state.folder {
-            Some(folder) ->
+          case state.folders {
+            [] ->
+              Error(error.ArchiveInvalid(
+                message: "7z MainStreamsInfo missing UnPackInfo",
+              ))
+            _ ->
               Ok(#(
                 HeaderStreamsParsed(
                   pack_pos: state.pack_pos,
                   pack_sizes: state.pack_sizes,
-                  folder: folder,
-                  unpack_sizes: state.unpack_sizes,
+                  folders: state.folders,
+                  folder_unpack_sizes: state.folder_unpack_sizes,
                   substream_sizes: state.substream_sizes,
                 ),
                 rest,
-              ))
-            None ->
-              Error(error.ArchiveInvalid(
-                message: "7z MainStreamsInfo missing UnPackInfo",
               ))
           }
         n if n == nid_pack_info -> {
@@ -893,22 +911,34 @@ fn parse_streams_loop(
           )
         }
         n if n == nid_unpack_info -> {
-          use #(folder, unpack_sizes, rest) <- result.try(parse_unpack_info(
-            rest,
-          ))
+          use #(folders, folder_unpack_sizes, rest) <- result.try(
+            parse_unpack_info(rest),
+          )
           parse_streams_loop(
             rest,
             StreamsParser(
               ..state,
-              folder: Some(folder),
-              unpack_sizes: unpack_sizes,
+              folders: folders,
+              folder_unpack_sizes: folder_unpack_sizes,
               have_unpack: True,
             ),
           )
         }
         n if n == nid_sub_streams_info -> {
+          // SubStreamsInfo describes how each folder's decoded bytes
+          // are split into per-file substreams.  The per-folder
+          // substream counts (and any explicit substream sizes) are
+          // derived from the folder-final unpack sizes — for each
+          // folder we take the last coder's unpack size, which is the
+          // folder's final output and therefore the sum of its
+          // substreams.
+          let folder_totals = list.map(state.folder_unpack_sizes, last_of_list)
           use #(_per_folder, substream_sizes, rest) <- result.try(
-            parse_sub_streams_info(rest, 1, state.unpack_sizes),
+            parse_sub_streams_info(
+              rest,
+              list.length(state.folders),
+              folder_totals,
+            ),
           )
           parse_streams_loop(
             rest,
@@ -968,47 +998,54 @@ fn parse_pack_info_body(
 
 fn parse_unpack_info(
   bytes: BitArray,
-) -> Result(#(ParsedFolder, List(Int), BitArray), error.ArchiveError) {
-  parse_unpack_info_body(bytes, None, [])
+) -> Result(
+  #(List(ParsedFolder), List(List(Int)), BitArray),
+  error.ArchiveError,
+) {
+  parse_unpack_info_body(bytes, [], [])
 }
 
 fn parse_unpack_info_body(
   bytes: BitArray,
-  folder: OptionalFolder,
-  unpack_sizes: List(Int),
-) -> Result(#(ParsedFolder, List(Int), BitArray), error.ArchiveError) {
+  folders: List(ParsedFolder),
+  folder_unpack_sizes: List(List(Int)),
+) -> Result(
+  #(List(ParsedFolder), List(List(Int)), BitArray),
+  error.ArchiveError,
+) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
         n if n == nid_end ->
-          case folder {
-            Some(f) -> Ok(#(f, unpack_sizes, rest))
-            None ->
+          case folders {
+            [] ->
               Error(error.ArchiveInvalid(
                 message: "7z UnPackInfo missing Folder section",
               ))
+            _ -> Ok(#(folders, folder_unpack_sizes, rest))
           }
         n if n == nid_folder -> {
-          use #(folder, rest) <- result.try(parse_folders(rest))
-          parse_unpack_info_body(rest, Some(folder), unpack_sizes)
+          use #(parsed_folders, rest) <- result.try(parse_folders(rest))
+          parse_unpack_info_body(rest, parsed_folders, folder_unpack_sizes)
         }
         n if n == nid_coders_unpack_size -> {
-          // One UnPackSize per coder output stream (each coder we
-          // accept is "simple" → 1 in / 1 out, so the count equals
-          // NumCoders).  The 7z spec lists Folder before
-          // CodersUnPackSize, so the folder is always set here in
-          // practice; default to 1 size for safety if a producer
-          // ever inverts the order on a single-coder folder.
-          let coder_count = case folder {
-            Some(f) -> list.length(f.coders)
-            None -> 1
-          }
-          use #(sizes, rest) <- result.try(read_numbers(rest, coder_count))
-          parse_unpack_info_body(rest, folder, sizes)
+          // One UnPackSize per coder output stream per folder.  Each
+          // accepted coder is "simple" (1 in / 1 out), so a folder
+          // contributes `list.length(folder.coders)` unpack sizes.
+          // The 7z spec lists `Folder` before `CodersUnPackSize`, so
+          // `folders` is populated by the time we get here.
+          let total_size_count =
+            list.fold(folders, 0, fn(acc, f) { acc + list.length(f.coders) })
+          use #(flat_sizes, rest) <- result.try(read_numbers(
+            rest,
+            total_size_count,
+          ))
+          let grouped = split_unpack_sizes_by_folder(flat_sizes, folders, [])
+          parse_unpack_info_body(rest, folders, grouped)
         }
         n if n == nid_crc -> {
-          use rest <- result.try(skip_crc_block(rest, 1))
-          parse_unpack_info_body(rest, folder, unpack_sizes)
+          use rest <- result.try(skip_crc_block(rest, list.length(folders)))
+          parse_unpack_info_body(rest, folders, folder_unpack_sizes)
         }
         _ ->
           Error(error.ArchiveInvalid(
@@ -1021,12 +1058,12 @@ fn parse_unpack_info_body(
 
 fn parse_folders(
   bytes: BitArray,
-) -> Result(#(ParsedFolder, BitArray), error.ArchiveError) {
+) -> Result(#(List(ParsedFolder), BitArray), error.ArchiveError) {
   use #(num_folders, rest) <- result.try(read_number(bytes))
   use <- bool.guard(
-    when: num_folders != 1,
-    return: Error(error.ArchiveNotImplemented(
-      feature: "7z archives with multiple folders",
+    when: num_folders < 1,
+    return: Error(error.ArchiveInvalid(
+      message: "7z UnPackInfo declares zero folders",
     )),
   )
   case rest {
@@ -1037,9 +1074,42 @@ fn parse_folders(
           feature: "7z external folder definitions",
         )),
       )
-      parse_one_folder(after_external)
+      parse_folders_loop(after_external, num_folders, [])
     }
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z folder section"))
+  }
+}
+
+fn parse_folders_loop(
+  bytes: BitArray,
+  remaining: Int,
+  acc: List(ParsedFolder),
+) -> Result(#(List(ParsedFolder), BitArray), error.ArchiveError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), bytes))
+    _ -> {
+      use #(folder, rest) <- result.try(parse_one_folder(bytes))
+      parse_folders_loop(rest, remaining - 1, [folder, ..acc])
+    }
+  }
+}
+
+// Split a flat per-coder unpack-size list across folders, taking
+// `list.length(folder.coders)` from the front for each folder in
+// order.  Returns folder-aligned size lists in folder order.
+fn split_unpack_sizes_by_folder(
+  flat: List(Int),
+  folders: List(ParsedFolder),
+  acc: List(List(Int)),
+) -> List(List(Int)) {
+  case folders {
+    [] -> list.reverse(acc)
+    [folder, ..rest] -> {
+      let count = list.length(folder.coders)
+      let group = list.take(flat, count)
+      let leftover = list.drop(flat, count)
+      split_unpack_sizes_by_folder(leftover, rest, [group, ..acc])
+    }
   }
 }
 
@@ -1830,11 +1900,14 @@ fn decode_archive(
 ) -> Result(archives.Archive, error.ArchiveError) {
   let _ = parsed.pack_pos
 
-  // The declared unpack size lives in the header, so we can refuse an
+  // The declared unpack sizes live in the header, so we can refuse an
   // oversized payload before the LZMA range coder runs — a malicious
   // archive that advertises a multi-GB unpack size shouldn't be able
   // to make us allocate it just to be rejected at the end.
-  use _ <- result.try(enforce_max_output(parsed.unpack_sizes, limits))
+  use _ <- result.try(enforce_max_output(
+    list.flatten(parsed.folder_unpack_sizes),
+    limits,
+  ))
 
   // Likewise refuse archives that advertise more members than the
   // caller is willing to materialise — independent of the unpack
@@ -1848,13 +1921,69 @@ fn decode_archive(
     )),
   )
 
-  use plain <- result.try(decode_folder(
-    packed,
-    parsed.folder,
-    parsed.unpack_sizes,
-    limits,
-  ))
+  // Multi-folder archives ship one packed stream per folder.  Walk
+  // both lists in lockstep, slicing the per-folder pack region from
+  // the catenated `packed` buffer (the regions are written
+  // back-to-back in folder order) and decoding each folder
+  // independently.  The decoded outputs are concatenated in folder
+  // order so the downstream entry builder sees a single buffer that
+  // matches the file order.
+  use plain <- result.try(
+    decode_all_folders(
+      packed,
+      parsed.folders,
+      parsed.folder_unpack_sizes,
+      parsed.pack_sizes,
+      limits,
+      0,
+      [],
+    ),
+  )
   build_archive_entries(plain, parsed, limits)
+}
+
+fn decode_all_folders(
+  packed: BitArray,
+  folders: List(ParsedFolder),
+  folder_unpack_sizes: List(List(Int)),
+  pack_sizes: List(Int),
+  limits: limit.Limits,
+  pack_cursor: Int,
+  acc: List(BitArray),
+) -> Result(BitArray, error.ArchiveError) {
+  case folders, folder_unpack_sizes, pack_sizes {
+    [], [], _ -> Ok(bit_array.concat(list.reverse(acc)))
+    [folder, ..rest_folders],
+      [unpack_sizes, ..rest_unpack],
+      [pack_size, ..rest_pack]
+    -> {
+      use folder_packed <- result.try(slice_required(
+        packed,
+        pack_cursor,
+        pack_size,
+        "7z per-folder packed bytes",
+      ))
+      use folder_plain <- result.try(decode_folder(
+        folder_packed,
+        folder,
+        unpack_sizes,
+        limits,
+      ))
+      decode_all_folders(
+        packed,
+        rest_folders,
+        rest_unpack,
+        rest_pack,
+        limits,
+        pack_cursor + pack_size,
+        [folder_plain, ..acc],
+      )
+    }
+    _, _, _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z folder / unpack-size / pack-size lists are misaligned",
+      ))
+  }
 }
 
 fn enforce_max_output(
@@ -2300,13 +2429,23 @@ fn build_archive_entries(
   parsed: ParsedHeader,
   limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
+  // SubStreamsInfo is optional: it's only emitted when ≥ 2 files share
+  // a single folder (the solid-mode case).  Non-solid archives — and
+  // single-file solid archives — omit it entirely.  Derive a synthetic
+  // substream size list from the folder unpack sizes so the rest of
+  // the entry loop has one size per file regardless of which shape the
+  // producer wrote.
+  let substream_sizes = case parsed.substream_sizes {
+    [] -> derive_substream_sizes_from_folders(parsed.folder_unpack_sizes)
+    values -> values
+  }
   build_entries_loop(
     plain,
     parsed.file_names,
     parsed.empty_streams,
     parsed.empty_files,
     parsed.mtimes_unix,
-    parsed.substream_sizes,
+    substream_sizes,
     0,
     [],
     limits,
@@ -2314,6 +2453,26 @@ fn build_archive_entries(
   |> result.map(fn(entries) {
     archives.from_entries(format: format(), entries: entries)
   })
+}
+
+// Each folder's "final" output size lives at the end of its
+// `coders_unpack_size` list (the last coder in the chain emits the
+// folder output).  For a 1-coder folder that's the only entry; for a
+// 2-coder simple chain it's the second one.  We assume one file per
+// folder, which is the only multi-folder shape packkit currently
+// accepts.
+fn derive_substream_sizes_from_folders(
+  folder_unpack_sizes: List(List(Int)),
+) -> List(Int) {
+  list.map(folder_unpack_sizes, last_of_list)
+}
+
+fn last_of_list(values: List(Int)) -> Int {
+  case values {
+    [last] -> last
+    [_, ..rest] -> last_of_list(rest)
+    [] -> 0
+  }
 }
 
 fn build_entries_loop(

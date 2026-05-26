@@ -85,10 +85,13 @@ Implemented codecs and archive families:
   decode without complaint.  The BCJ branch-converter dispatches
   to the same `packkit/internal/bcj` decoders that xz already
   uses for its filter ids 0x04..0x09.
-  Multiple folders, 3+-coder chains, BCJ filters, non-linear
-  bind topologies, and encryption are still rejected with typed
-  `ArchiveNotImplemented` errors so the reader is easy to extend
-  incrementally.  The encoder builds a single-folder, single-coder
+  Non-solid (`7z a -ms=off`) archives that ship one folder per
+  member decode end-to-end as well: the folder list, per-folder
+  pack streams, and per-folder substream sizes are threaded
+  through `decode_archive` and concatenated in file order.
+  3+-coder chains, non-linear bind topologies, and encryption
+  are still rejected with typed `ArchiveNotImplemented` errors
+  so the reader is easy to extend incrementally.  The encoder builds a single-folder, single-coder
   archive with a raw LZMA1 coder, emitting the `PackInfo` /
   `UnPackInfo` / optional `SubStreamsInfo` blocks plus the
   `FilesInfo` UTF-16 LE name table.  Multi-file archives
