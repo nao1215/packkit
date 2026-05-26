@@ -1956,11 +1956,14 @@ fn resolve_aex_decryption(
       <> "\" is too short for salt + verifier + HMAC",
     )),
   )
-  let assert Ok(salt) = bit_array.slice(raw, 0, salt_len)
-  let assert Ok(verifier) = bit_array.slice(raw, salt_len, 2)
-  let assert Ok(ciphertext) = bit_array.slice(raw, salt_len + 2, ciphertext_len)
-  let assert Ok(hmac_tag) =
-    bit_array.slice(raw, salt_len + 2 + ciphertext_len, 10)
+  use salt <- result.try(slice_or_error(raw, 0, salt_len))
+  use verifier <- result.try(slice_or_error(raw, salt_len, 2))
+  use ciphertext <- result.try(slice_or_error(raw, salt_len + 2, ciphertext_len))
+  use hmac_tag <- result.try(slice_or_error(
+    raw,
+    salt_len + 2 + ciphertext_len,
+    10,
+  ))
   let derived =
     checksum.pbkdf2_hmac_sha1(
       password: bit_array.from_string(pwd),
@@ -1968,9 +1971,9 @@ fn resolve_aex_decryption(
       iterations: aex_pbkdf2_iterations,
       dk_len: key_len * 2 + 2,
     )
-  let assert Ok(aes_key) = bit_array.slice(derived, 0, key_len)
-  let assert Ok(hmac_key) = bit_array.slice(derived, key_len, key_len)
-  let assert Ok(expected_verifier) = bit_array.slice(derived, key_len * 2, 2)
+  use aes_key <- result.try(slice_or_error(derived, 0, key_len))
+  use hmac_key <- result.try(slice_or_error(derived, key_len, key_len))
+  use expected_verifier <- result.try(slice_or_error(derived, key_len * 2, 2))
   use <- bool.guard(
     when: verifier != expected_verifier,
     return: Error(error.ArchiveInvalid(
@@ -1978,7 +1981,7 @@ fn resolve_aex_decryption(
     )),
   )
   let computed_full = checksum.hmac_sha1(key: hmac_key, data: ciphertext)
-  let assert Ok(computed_tag) = bit_array.slice(computed_full, 0, 10)
+  use computed_tag <- result.try(slice_or_error(computed_full, 0, 10))
   use <- bool.guard(
     when: computed_tag != hmac_tag,
     return: Error(error.ArchiveInvalid(
@@ -2084,15 +2087,14 @@ fn aes_ctr_loop(
         n if n < 16 -> n
         _ -> 16
       }
-      let assert Ok(chunk) = bit_array.slice(ciphertext, 0, chunk_size)
-      let assert Ok(keystream_chunk) = bit_array.slice(keystream, 0, chunk_size)
+      use chunk <- result.try(slice_or_error(ciphertext, 0, chunk_size))
+      use keystream_chunk <- result.try(slice_or_error(keystream, 0, chunk_size))
       let xored = xor_bit_arrays_zip(chunk, keystream_chunk, <<>>)
-      let assert Ok(rest) =
-        bit_array.slice(
-          ciphertext,
-          chunk_size,
-          bit_array.byte_size(ciphertext) - chunk_size,
-        )
+      use rest <- result.try(slice_or_error(
+        ciphertext,
+        chunk_size,
+        bit_array.byte_size(ciphertext) - chunk_size,
+      ))
       aes_ctr_loop(key, rest, counter + 1, bit_array.concat([acc, xored]), name)
     }
   }

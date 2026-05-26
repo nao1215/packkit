@@ -306,7 +306,7 @@ fn bytes_to_words(bytes: List(Int)) -> List(Int) {
 fn bytes_to_words_loop(bytes: List(Int), acc: List(Int)) -> List(Int) {
   case bytes {
     [b0, b1, b2, b3, ..rest] -> {
-      let w =
+      let word =
         int.bitwise_or(
           int.bitwise_or(
             int.bitwise_or(
@@ -317,7 +317,7 @@ fn bytes_to_words_loop(bytes: List(Int), acc: List(Int)) -> List(Int) {
           ),
           b3,
         )
-      bytes_to_words_loop(rest, [w, ..acc])
+      bytes_to_words_loop(rest, [word, ..acc])
     }
     _ -> list.reverse(acc)
   }
