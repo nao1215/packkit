@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/result
 import gleeunit/should
 import packkit/brotli
 import packkit/bzip2
@@ -253,5 +254,163 @@ fn split_in_thirds(bytes: BitArray) -> List(BitArray) {
       let assert Ok(c) = bit_array.slice(bytes, part * 2, size - 2 * part)
       [a, b, c]
     }
+  }
+}
+
+// -- streaming encoders ----------------------------------------------
+//
+// The encoder API mirrors the decoder API: callers buffer plaintext
+// chunks via `push_encoder` and pay the actual encode cost once at
+// `finish_encoder` time.  Until the underlying codecs grow truly
+// incremental encoders, the API contract is just "the output equals
+// what the one-shot `<codec>.encode` would produce for the
+// catenated input".  The round-trip property is the stronger check:
+// stream-encoded → one-shot decode should reproduce the original
+// payload byte-for-byte.
+
+fn stream_encode_then_decode(
+  encoder: stream.Encoder,
+  chunks: List(BitArray),
+  decode: fn(BitArray) -> Result(BitArray, error.CodecError),
+) -> Result(BitArray, error.CodecError) {
+  use encoded <- result.try(stream.encode_chunks(
+    encoder: encoder,
+    chunks: chunks,
+  ))
+  decode(encoded)
+}
+
+pub fn stream_encoder_deflate_roundtrip_test() -> Nil {
+  let payload = <<"deflate stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(
+      stream.new_deflate_encoder(),
+      chunks,
+      deflate.decode(bytes: _),
+    )
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_zlib_roundtrip_test() -> Nil {
+  let payload = <<"zlib stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(stream.new_zlib_encoder(), chunks, zlib.decode(
+      bytes: _,
+    ))
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_gzip_roundtrip_test() -> Nil {
+  let payload = <<"gzip stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(encoded) =
+    stream.encode_chunks(encoder: stream.new_gzip_encoder(), chunks: chunks)
+  let assert Ok(decoded) = gzip.decode(bytes: encoded)
+  decoded.payload |> should.equal(payload)
+}
+
+pub fn stream_encoder_lz4_roundtrip_test() -> Nil {
+  let payload = <<"lz4 stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(stream.new_lz4_encoder(), chunks, lz4.decode(
+      bytes: _,
+    ))
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_snappy_roundtrip_test() -> Nil {
+  let payload = <<"snappy stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(
+      stream.new_snappy_encoder(),
+      chunks,
+      snappy.decode(bytes: _),
+    )
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_bzip2_roundtrip_test() -> Nil {
+  let payload = <<"bzip2 stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(stream.new_bzip2_encoder(), chunks, bzip2.decode(
+      bytes: _,
+    ))
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_lzw_roundtrip_test() -> Nil {
+  let payload = <<"lzw stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(stream.new_lzw_encoder(), chunks, lzw.decode(
+      bytes: _,
+    ))
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_xz_roundtrip_test() -> Nil {
+  let payload = <<"xz stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(stream.new_xz_encoder(), chunks, xz.decode(
+      bytes: _,
+    ))
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_zstd_roundtrip_test() -> Nil {
+  let payload = <<"zstd stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(stream.new_zstd_encoder(), chunks, zstd.decode(
+      bytes: _,
+    ))
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_brotli_roundtrip_test() -> Nil {
+  let payload = <<"brotli stream encoder round trip payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(decoded) =
+    stream_encode_then_decode(
+      stream.new_brotli_encoder(),
+      chunks,
+      brotli.decode(bytes: _),
+    )
+  decoded |> should.equal(payload)
+}
+
+pub fn stream_encoder_matches_one_shot_encode_test() -> Nil {
+  // The streaming encoder is just a buffer: the output of
+  // `encode_chunks` MUST equal `<codec>.encode(catenated_input)`
+  // byte-for-byte.  If this stops being true the streaming wrapper
+  // has started doing something the one-shot path doesn't, which is
+  // an API contract break worth catching.
+  let payload = <<"matches one-shot encode test payload":utf8>>
+  let chunks = split_in_thirds(payload)
+  let assert Ok(one_shot) = deflate.encode(bytes: payload)
+  let assert Ok(streamed) =
+    stream.encode_chunks(encoder: stream.new_deflate_encoder(), chunks: chunks)
+  streamed |> should.equal(one_shot)
+}
+
+pub fn stream_encoder_push_enforces_max_input_bytes_test() -> Nil {
+  // `push_encoder` must enforce `max_input_bytes` incrementally so a
+  // hostile producer can't feed an unbounded plaintext stream and
+  // trigger an unbounded `encode` allocation at `finish_encoder`
+  // time.  Tight limit (16) + first chunk slightly larger (20 bytes)
+  // = typed `CodecLimitExceeded`.
+  let tight = limit.default() |> limit.with_max_input_bytes(bytes: 16)
+  let encoder =
+    stream.new_deflate_encoder() |> stream.encoder_with_limits(limits: tight)
+  let chunk = <<"twenty-byte payload!":utf8>>
+  case stream.push_encoder(encoder, chunk) {
+    Error(error.CodecLimitExceeded(limit: "max_input_bytes", actual: _)) -> Nil
+    _ -> should.fail()
   }
 }

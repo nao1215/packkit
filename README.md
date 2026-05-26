@@ -202,6 +202,17 @@ delivers real compression on repetitive payloads — e.g. an 80
 KiB repeating-string xz file shrinks to ~388 bytes (0.49 %
 ratio), 9 KiB of repeated pangrams to 148 bytes (1.6 %).
 
+The `packkit/stream` module exposes `new_*_decoder` /
+`new_*_encoder` constructors for every codec (deflate, zlib,
+gzip, lz4, snappy, bzip2, lzw, xz, zstd, brotli) so callers can
+buffer chunks through `push` / `push_encoder` and pay the actual
+encode or decode cost once at `finish` / `finish_encoder` time.
+The streaming wrappers enforce `max_input_bytes` incrementally,
+matching the per-codec decoder behaviour so a hostile producer
+can't pile bytes past the budget before the limit fires.  The
+underlying codecs are still eager — when packkit grows true
+incremental codecs the public surface won't have to change.
+
 ## Install
 
 ```sh

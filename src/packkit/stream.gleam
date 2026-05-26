@@ -186,3 +186,174 @@ fn feed_all(
     }
   }
 }
+
+/// Opaque incremental encoder state.  Mirrors `Decoder`: callers
+/// buffer plaintext chunks via `push_encoder` and pay the actual
+/// compress cost once at `finish_encoder` time.  Buffering lets the
+/// API stay symmetric with `Decoder` even though the underlying
+/// codecs are still eager — when packkit grows true streaming
+/// encoders the public surface won't have to change.
+///
+/// `buffered_bytes` is tracked so `push_encoder` can enforce
+/// `max_input_bytes` incrementally against the input stream, matching
+/// the decoder-side limit semantics.
+pub opaque type Encoder {
+  Encoder(
+    kind: EncoderKind,
+    buffer: List(BitArray),
+    buffered_bytes: Int,
+    limits: limit.Limits,
+  )
+}
+
+type EncoderKind {
+  EncDeflate
+  EncZlib
+  EncGzip
+  EncLz4
+  EncSnappy
+  EncBzip2
+  EncLzw
+  EncXz
+  EncZstd
+  EncBrotli
+}
+
+/// Start a new incremental DEFLATE encoder using the default limits.
+pub fn new_deflate_encoder() -> Encoder {
+  new_encoder(EncDeflate, limit.default())
+}
+
+/// Start a new incremental zlib encoder using the default limits.
+pub fn new_zlib_encoder() -> Encoder {
+  new_encoder(EncZlib, limit.default())
+}
+
+/// Start a new incremental gzip encoder using the default limits.
+/// The output uses `gzip.default_header()` — callers that need
+/// per-stream metadata should keep using `gzip.encode` directly
+/// until the streaming API grows an explicit header constructor.
+pub fn new_gzip_encoder() -> Encoder {
+  new_encoder(EncGzip, limit.default())
+}
+
+/// Start a new incremental LZ4 frame encoder using the default limits.
+pub fn new_lz4_encoder() -> Encoder {
+  new_encoder(EncLz4, limit.default())
+}
+
+/// Start a new incremental Snappy (framed) encoder using the default
+/// limits.
+pub fn new_snappy_encoder() -> Encoder {
+  new_encoder(EncSnappy, limit.default())
+}
+
+/// Start a new incremental bzip2 encoder using the default limits.
+pub fn new_bzip2_encoder() -> Encoder {
+  new_encoder(EncBzip2, limit.default())
+}
+
+/// Start a new incremental Unix `.Z` (LZW) encoder using the default
+/// limits.
+pub fn new_lzw_encoder() -> Encoder {
+  new_encoder(EncLzw, limit.default())
+}
+
+/// Start a new incremental xz encoder using the default limits.
+pub fn new_xz_encoder() -> Encoder {
+  new_encoder(EncXz, limit.default())
+}
+
+/// Start a new incremental zstd encoder using the default limits.
+pub fn new_zstd_encoder() -> Encoder {
+  new_encoder(EncZstd, limit.default())
+}
+
+/// Start a new incremental brotli encoder using the default limits.
+pub fn new_brotli_encoder() -> Encoder {
+  new_encoder(EncBrotli, limit.default())
+}
+
+fn new_encoder(kind: EncoderKind, limits: limit.Limits) -> Encoder {
+  Encoder(kind: kind, buffer: [], buffered_bytes: 0, limits: limits)
+}
+
+/// Replace the limits used by an incremental encoder.
+pub fn encoder_with_limits(
+  encoder: Encoder,
+  limits limits: limit.Limits,
+) -> Encoder {
+  Encoder(..encoder, limits: limits)
+}
+
+/// Append a chunk of plaintext bytes to the encoder, enforcing
+/// `max_input_bytes` incrementally so an unbounded producer can't
+/// trigger an unbounded `encode` allocation at `finish_encoder` time.
+pub fn push_encoder(
+  encoder: Encoder,
+  chunk: BitArray,
+) -> Result(Encoder, error.CodecError) {
+  let chunk_size = bit_array.byte_size(chunk)
+  let new_total = encoder.buffered_bytes + chunk_size
+  case new_total > limit.max_input_bytes(encoder.limits) {
+    True ->
+      Error(error.CodecLimitExceeded(
+        limit: "max_input_bytes",
+        actual: new_total,
+      ))
+    False ->
+      Ok(
+        Encoder(
+          ..encoder,
+          buffer: [chunk, ..encoder.buffer],
+          buffered_bytes: new_total,
+        ),
+      )
+  }
+}
+
+/// Finalize the encoder and return the compressed payload.  Each
+/// codec is invoked through its default `encode/1` form; advanced
+/// per-codec options (gzip header metadata, deflate stored blocks,
+/// lz4 content size, bzip2 level) are not exposed through the
+/// streaming wrapper and remain accessible via the per-codec module.
+pub fn finish_encoder(encoder: Encoder) -> Result(BitArray, error.CodecError) {
+  let bytes = bit_array.concat(list.reverse(encoder.buffer))
+  case encoder.kind {
+    EncDeflate -> deflate.encode(bytes: bytes)
+    EncZlib -> zlib.encode(bytes: bytes)
+    EncGzip -> gzip.encode(bytes: bytes, header: gzip.default_header())
+    EncLz4 -> lz4.encode(bytes: bytes)
+    EncSnappy -> snappy.encode(bytes: bytes)
+    EncBzip2 -> bzip2.encode(bytes: bytes)
+    EncLzw -> lzw.encode(bytes: bytes)
+    EncXz -> xz.encode(bytes: bytes)
+    EncZstd -> zstd.encode(bytes: bytes)
+    EncBrotli -> brotli.encode(bytes: bytes)
+  }
+}
+
+/// Convenience helper that pushes every plaintext chunk through the
+/// encoder in order and returns the final compressed payload.  Mirrors
+/// `decode_chunks` so callers can drive both directions with the same
+/// shape (list of input chunks → single output buffer).
+pub fn encode_chunks(
+  encoder encoder: Encoder,
+  chunks chunks: List(BitArray),
+) -> Result(BitArray, error.CodecError) {
+  use fed <- result.try(feed_encoder_all(encoder, chunks))
+  finish_encoder(fed)
+}
+
+fn feed_encoder_all(
+  encoder: Encoder,
+  chunks: List(BitArray),
+) -> Result(Encoder, error.CodecError) {
+  case chunks {
+    [] -> Ok(encoder)
+    [head, ..rest] -> {
+      use next <- result.try(push_encoder(encoder, head))
+      feed_encoder_all(next, rest)
+    }
+  }
+}
