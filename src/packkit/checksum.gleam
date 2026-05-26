@@ -627,3 +627,290 @@ fn sha256_k(round: Int) -> Int {
     _ -> 0xC67178F2
   }
 }
+
+// -- SHA-1 -----------------------------------------------------------
+//
+// Implementation of FIPS 180-4 §6.1.  Used by HMAC-SHA1 (which in turn
+// drives PBKDF2-HMAC-SHA1) for ZIP AE-x decryption.  SHA-1 is broken
+// for collision resistance and MUST NOT be used for new constructions
+// — it lives here purely for compatibility with formats that already
+// specify it (WinZip AES, the InfoZIP CRC table descriptor, etc.).
+
+/// Compute the SHA-1 digest of `data` (FIPS 180-4 §6.1).  Returns a
+/// 20-byte `BitArray`.  Used by `hmac_sha1` for ZIP AE-x.
+pub fn sha1(data data: BitArray) -> BitArray {
+  let padded = sha256_pad(data)
+  let #(h0, h1, h2, h3, h4) =
+    sha1_process_blocks(
+      padded,
+      0x67452301,
+      0xEFCDAB89,
+      0x98BADCFE,
+      0x10325476,
+      0xC3D2E1F0,
+    )
+  <<h0:size(32), h1:size(32), h2:size(32), h3:size(32), h4:size(32)>>
+}
+
+fn sha1_process_blocks(
+  data: BitArray,
+  h0: Int,
+  h1: Int,
+  h2: Int,
+  h3: Int,
+  h4: Int,
+) -> #(Int, Int, Int, Int, Int) {
+  case data {
+    <<>> -> #(h0, h1, h2, h3, h4)
+    <<
+      w0:size(32)-big,
+      w1:size(32)-big,
+      w2:size(32)-big,
+      w3:size(32)-big,
+      w4:size(32)-big,
+      w5:size(32)-big,
+      w6:size(32)-big,
+      w7:size(32)-big,
+      w8:size(32)-big,
+      w9:size(32)-big,
+      w10:size(32)-big,
+      w11:size(32)-big,
+      w12:size(32)-big,
+      w13:size(32)-big,
+      w14:size(32)-big,
+      w15:size(32)-big,
+      rest:bytes,
+    >> -> {
+      // SHA-1 message schedule: extend 16 words to 80 with
+      //   W[t] = ROL(W[t-3] XOR W[t-8] XOR W[t-14] XOR W[t-16], 1)
+      let schedule_reversed = [
+        w15, w14, w13, w12, w11, w10, w9, w8, w7, w6, w5, w4, w3, w2, w1, w0,
+      ]
+      let full_reversed = sha1_expand_schedule(schedule_reversed, 16)
+      let full = list.reverse(full_reversed)
+      let #(a, b, c, d, e) = sha1_compress(full, h0, h1, h2, h3, h4, 0)
+      sha1_process_blocks(
+        rest,
+        u32_add(h0, a),
+        u32_add(h1, b),
+        u32_add(h2, c),
+        u32_add(h3, d),
+        u32_add(h4, e),
+      )
+    }
+    _ -> #(h0, h1, h2, h3, h4)
+  }
+}
+
+fn sha1_expand_schedule(reversed: List(Int), count: Int) -> List(Int) {
+  case count {
+    80 -> reversed
+    _ -> {
+      let w3 = nth_from_head(reversed, 2)
+      let w8 = nth_from_head(reversed, 7)
+      let w14 = nth_from_head(reversed, 13)
+      let w16 = nth_from_head(reversed, 15)
+      let mixed =
+        int.bitwise_exclusive_or(
+          int.bitwise_exclusive_or(w3, w8),
+          int.bitwise_exclusive_or(w14, w16),
+        )
+      sha1_expand_schedule([u32_rotl(mixed, 1), ..reversed], count + 1)
+    }
+  }
+}
+
+fn sha1_compress(
+  schedule: List(Int),
+  a: Int,
+  b: Int,
+  c: Int,
+  d: Int,
+  e: Int,
+  round: Int,
+) -> #(Int, Int, Int, Int, Int) {
+  case schedule {
+    [] -> #(a, b, c, d, e)
+    [w, ..rest] -> {
+      let #(f, k) = sha1_round_constants(round, b, c, d)
+      let t = u32_add(u32_add(u32_add(u32_add(u32_rotl(a, 5), f), e), k), w)
+      sha1_compress(rest, t, a, u32_rotl(b, 30), c, d, round + 1)
+    }
+  }
+}
+
+fn sha1_round_constants(round: Int, b: Int, c: Int, d: Int) -> #(Int, Int) {
+  case round {
+    n if n < 20 -> #(
+      int.bitwise_or(
+        int.bitwise_and(b, c),
+        int.bitwise_and(int.bitwise_exclusive_or(b, u32_mask), d),
+      ),
+      0x5A827999,
+    )
+    n if n < 40 -> #(
+      int.bitwise_exclusive_or(int.bitwise_exclusive_or(b, c), d),
+      0x6ED9EBA1,
+    )
+    n if n < 60 -> #(
+      int.bitwise_or(
+        int.bitwise_or(int.bitwise_and(b, c), int.bitwise_and(b, d)),
+        int.bitwise_and(c, d),
+      ),
+      0x8F1BBCDC,
+    )
+    _ -> #(
+      int.bitwise_exclusive_or(int.bitwise_exclusive_or(b, c), d),
+      0xCA62C1D6,
+    )
+  }
+}
+
+fn u32_rotl(x: Int, n: Int) -> Int {
+  let left = int.bitwise_and(int.bitwise_shift_left(x, n), u32_mask)
+  let right = int.bitwise_shift_right(x, 32 - n)
+  int.bitwise_or(left, right)
+}
+
+// -- HMAC-SHA1 -------------------------------------------------------
+//
+// RFC 2104.  The block size is the SHA-1 block size (64 bytes); the
+// digest size is 20 bytes.  HMAC-SHA1 is used by ZIP AE-x to derive
+// the AES key + HMAC key + 2-byte password verifier (via PBKDF2) and
+// to MAC the encrypted ciphertext.
+
+const hmac_sha1_block_size: Int = 64
+
+/// Compute the HMAC-SHA1 of `data` keyed by `key` (RFC 2104).
+/// Returns the 20-byte tag as a `BitArray`.
+pub fn hmac_sha1(key key: BitArray, data data: BitArray) -> BitArray {
+  let key_block = hmac_sha1_prepare_key(key)
+  let outer_pad = xor_with_byte(key_block, 0x5C)
+  let inner_pad = xor_with_byte(key_block, 0x36)
+  let inner = sha1(bit_array.concat([inner_pad, data]))
+  sha1(bit_array.concat([outer_pad, inner]))
+}
+
+fn hmac_sha1_prepare_key(key: BitArray) -> BitArray {
+  let key_size = bit_array.byte_size(key)
+  let normalised = case key_size > hmac_sha1_block_size {
+    True -> sha1(key)
+    False -> key
+  }
+  let normalised_size = bit_array.byte_size(normalised)
+  let padding_len = hmac_sha1_block_size - normalised_size
+  case padding_len {
+    0 -> normalised
+    _ -> bit_array.concat([normalised, pad_zeros(padding_len, <<>>)])
+  }
+}
+
+fn xor_with_byte(key_block: BitArray, mask: Int) -> BitArray {
+  xor_with_byte_loop(key_block, mask, <<>>)
+}
+
+fn xor_with_byte_loop(data: BitArray, mask: Int, acc: BitArray) -> BitArray {
+  case data {
+    <<b, rest:bytes>> -> {
+      let mixed = int.bitwise_exclusive_or(b, mask)
+      xor_with_byte_loop(rest, mask, bit_array.concat([acc, <<mixed>>]))
+    }
+    _ -> acc
+  }
+}
+
+// -- PBKDF2-HMAC-SHA1 ------------------------------------------------
+//
+// RFC 2898 §5.2.  The output is `dk_len` bytes built by concatenating
+// blocks T_i where each T_i = U_1 XOR U_2 XOR … XOR U_iterations and
+// U_1 = HMAC(password, salt || INT(i)), U_j = HMAC(password, U_{j-1}).
+// WinZip AES uses iterations = 1000.
+
+/// Derive `dk_len` bytes from `password` and `salt` via PBKDF2-HMAC-SHA1
+/// (RFC 2898).  Used by the ZIP AE-x scheme with `iterations = 1000`
+/// and `dk_len = key_len * 2 + 2` (encryption key + HMAC key +
+/// 2-byte password verifier).
+pub fn pbkdf2_hmac_sha1(
+  password password: BitArray,
+  salt salt: BitArray,
+  iterations iterations: Int,
+  dk_len dk_len: Int,
+) -> BitArray {
+  let block_count = { dk_len + 19 } / 20
+  let raw = pbkdf2_blocks(password, salt, iterations, block_count, 1, <<>>)
+  let assert Ok(truncated) = bit_array.slice(raw, 0, dk_len)
+  truncated
+}
+
+fn pbkdf2_blocks(
+  password: BitArray,
+  salt: BitArray,
+  iterations: Int,
+  block_count: Int,
+  index: Int,
+  acc: BitArray,
+) -> BitArray {
+  case index > block_count {
+    True -> acc
+    False -> {
+      let block = pbkdf2_one_block(password, salt, iterations, index)
+      pbkdf2_blocks(
+        password,
+        salt,
+        iterations,
+        block_count,
+        index + 1,
+        bit_array.concat([acc, block]),
+      )
+    }
+  }
+}
+
+fn pbkdf2_one_block(
+  password: BitArray,
+  salt: BitArray,
+  iterations: Int,
+  index: Int,
+) -> BitArray {
+  let initial =
+    hmac_sha1(password, bit_array.concat([salt, <<index:size(32)-big>>]))
+  pbkdf2_iterate(password, initial, initial, iterations - 1)
+}
+
+fn pbkdf2_iterate(
+  password: BitArray,
+  previous: BitArray,
+  accumulator: BitArray,
+  remaining: Int,
+) -> BitArray {
+  case remaining {
+    0 -> accumulator
+    _ -> {
+      let next = hmac_sha1(password, previous)
+      pbkdf2_iterate(
+        password,
+        next,
+        xor_bit_arrays(accumulator, next),
+        remaining - 1,
+      )
+    }
+  }
+}
+
+fn xor_bit_arrays(left: BitArray, right: BitArray) -> BitArray {
+  xor_bit_arrays_loop(left, right, <<>>)
+}
+
+fn xor_bit_arrays_loop(
+  left: BitArray,
+  right: BitArray,
+  acc: BitArray,
+) -> BitArray {
+  case left, right {
+    <<l, l_rest:bytes>>, <<r, r_rest:bytes>> -> {
+      let mixed = int.bitwise_exclusive_or(l, r)
+      xor_bit_arrays_loop(l_rest, r_rest, bit_array.concat([acc, <<mixed>>]))
+    }
+    _, _ -> acc
+  }
+}
