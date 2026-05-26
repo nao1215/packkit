@@ -1120,7 +1120,6 @@ fn verify_stream_footer(
       0x59,
       0x5A,
     >> -> {
-      let _ = backward_size
       use <- bool.guard(
         when: flag_zero != 0,
         return: Error(error.CodecInvalidData(

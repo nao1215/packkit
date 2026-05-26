@@ -2887,8 +2887,6 @@ fn decode_archive(
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
-  let _ = parsed.pack_pos
-
   // The declared unpack sizes live in the header, so we can refuse an
   // oversized payload before the LZMA range coder runs — a malicious
   // archive that advertises a multi-GB unpack size shouldn't be able
@@ -2917,6 +2915,13 @@ fn decode_archive(
   // independently.  The decoded outputs are concatenated in folder
   // order so the downstream entry builder sees a single buffer that
   // matches the file order.
+  //
+  // Cursor starts at `parsed.pack_pos` so MainStreamsInfo blocks that
+  // declare a non-zero offset (i.e. the main streams start somewhere
+  // inside the pack region instead of at its head) are read from the
+  // right slice.  p7zip's `7z a` always emits `pack_pos = 0`, but the
+  // spec allows it to be non-zero — synthetic archives that put data
+  // before MainStreamsInfo's payload need this offset honoured.
   use plain <- result.try(
     decode_all_folders(
       packed,
@@ -2925,7 +2930,7 @@ fn decode_archive(
       parsed.pack_sizes,
       password,
       limits,
-      0,
+      parsed.pack_pos,
       [],
     ),
   )
