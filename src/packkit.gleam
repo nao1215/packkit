@@ -480,6 +480,17 @@ pub fn detect_bytes(bytes: BitArray) -> Result(Detected, error.DetectError) {
   detect.from_bytes(bytes)
 }
 
+/// Detect via filename first, then fall back to magic-byte detection
+/// on the supplied content.  Re-exports
+/// `packkit/detect.from_path_or_bytes` from the top-level facade so
+/// most CLI integrations only need to import `packkit`.
+pub fn detect_path_or_bytes(
+  path path: String,
+  bytes bytes: BitArray,
+) -> Result(Detected, error.DetectError) {
+  detect.from_path_or_bytes(path: path, bytes: bytes)
+}
+
 fn apply_codec_chain_forward(
   bytes: BitArray,
   codecs: List(Codec),
