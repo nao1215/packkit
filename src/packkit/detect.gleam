@@ -1,6 +1,7 @@
 import gleam/bit_array
 import gleam/int
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import packkit/archive
 import packkit/codec
@@ -40,10 +41,8 @@ pub fn from_path_or_bytes(
   path path: String,
   bytes bytes: BitArray,
 ) -> Result(Detected, error.DetectError) {
-  case from_filename(path) {
-    Ok(detected) -> Ok(detected)
-    Error(_) -> from_bytes(bytes)
-  }
+  from_filename(path)
+  |> result.or(from_bytes(bytes))
 }
 
 /// Filename rules, ordered most-specific first so the first match wins.
