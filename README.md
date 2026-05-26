@@ -62,11 +62,15 @@ Implemented codecs and archive families:
   carried losslessly in the UT extra
 - **7z**: single-folder reader.  Recognised single-coder ids:
   LZMA (`0x03 0x01 0x01`), LZMA2 (`0x21`), Copy (`0x00`),
-  Deflate (`0x04 0x01 0x08`), and BZip2 (`0x04 0x02 0x02`) — so
-  archives produced with `7z a -m0=Copy / -m0=Deflate /
-  -m0=BZip2` decode end-to-end alongside the default LZMA family.
-  Multi-coder folders, multiple folders, BCJ/Delta filters, and
-  encryption are still rejected with typed
+  Deflate (`0x04 0x01 0x08`), BZip2 (`0x04 0x02 0x02`), and
+  Delta (`0x03`) — so archives produced with `7z a -m0=Copy /
+  -m0=Deflate / -m0=BZip2` decode end-to-end alongside the
+  default LZMA family.  Two-coder linear chains where coder 0 is
+  LZMA or LZMA2 and coder 1 is Delta are supported via the
+  standard bind-pair shape (in_idx=1, out_idx=0), so archives
+  produced with `7z a -mf=Delta:N` decode without complaint.
+  Multiple folders, 3+-coder chains, BCJ filters, non-linear
+  bind topologies, and encryption are still rejected with typed
   `ArchiveNotImplemented` errors so the reader is easy to extend
   incrementally.  The encoder builds a single-folder, single-coder
   archive with a raw LZMA1 coder, emitting the `PackInfo` /

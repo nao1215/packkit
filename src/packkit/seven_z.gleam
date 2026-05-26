@@ -47,6 +47,8 @@ const lzma_coder_id_low: Int = 0x01
 
 const copy_coder_id: Int = 0x00
 
+const delta_coder_id: Int = 0x03
+
 const deflate_coder_id_high: Int = 0x04
 
 const deflate_coder_id_mid: Int = 0x01
@@ -650,7 +652,11 @@ type ParsedHeader {
 }
 
 type ParsedFolder {
-  ParsedFolder(coder_id: CoderId, properties: BitArray)
+  ParsedFolder(coders: List(CoderSpec))
+}
+
+type CoderSpec {
+  CoderSpec(id: CoderId, properties: BitArray)
 }
 
 type CoderId {
@@ -659,6 +665,7 @@ type CoderId {
   Copy
   Deflate
   BZip2
+  Delta
 }
 
 // -- top-level header parser -------------------------------------------
@@ -944,7 +951,17 @@ fn parse_unpack_info_body(
           parse_unpack_info_body(rest, Some(folder), unpack_sizes)
         }
         n if n == nid_coders_unpack_size -> {
-          use #(sizes, rest) <- result.try(read_numbers(rest, 1))
+          // One UnPackSize per coder output stream (each coder we
+          // accept is "simple" → 1 in / 1 out, so the count equals
+          // NumCoders).  The 7z spec lists Folder before
+          // CodersUnPackSize, so the folder is always set here in
+          // practice; default to 1 size for safety if a producer
+          // ever inverts the order on a single-coder folder.
+          let coder_count = case folder {
+            Some(f) -> list.length(f.coders)
+            None -> 1
+          }
+          use #(sizes, rest) <- result.try(read_numbers(rest, coder_count))
           parse_unpack_info_body(rest, folder, sizes)
         }
         n if n == nid_crc -> {
@@ -978,23 +995,79 @@ fn parse_folders(
           feature: "7z external folder definitions",
         )),
       )
-      parse_single_folder(after_external)
+      parse_one_folder(after_external)
     }
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z folder section"))
   }
 }
 
-fn parse_single_folder(
+// Parse a single folder definition: NumCoders varint, N coder defs,
+// then (when NumCoders > 1) NumBindPairs = NumOutStreams - 1 bind
+// pairs and (when NumPackedStreams > 1) the packed-stream indices.
+// packkit supports linear 1- or 2-coder chains only; non-linear and
+// 3+-coder shapes are rejected with typed `ArchiveNotImplemented`.
+fn parse_one_folder(
   bytes: BitArray,
 ) -> Result(#(ParsedFolder, BitArray), error.ArchiveError) {
   use #(num_coders, rest) <- result.try(read_number(bytes))
   use <- bool.guard(
-    when: num_coders != 1,
-    return: Error(error.ArchiveNotImplemented(
-      feature: "7z folders with multiple coders",
+    when: num_coders < 1,
+    return: Error(error.ArchiveInvalid(
+      message: "7z folder declares zero coders",
     )),
   )
-  case rest {
+  use <- bool.guard(
+    when: num_coders > 2,
+    return: Error(error.ArchiveNotImplemented(
+      feature: "7z folders with " <> int.to_string(num_coders) <> " coders",
+    )),
+  )
+  use #(coders, rest) <- result.try(parse_coders_loop(rest, num_coders, []))
+  case num_coders {
+    1 -> Ok(#(ParsedFolder(coders: coders), rest))
+    _ -> {
+      // 2-coder simple chain: exactly 1 bind pair, in_idx = 1, out_idx = 0
+      // means "coder 1's input is wired from coder 0's output", i.e.
+      // packed bytes feed coder 0, coder 1's output is the folder
+      // output.  Any other indexing is non-linear (BCJ2 etc) and
+      // unsupported.  NumPackedStreams = NumInStreams - NumBindPairs
+      // = 2 - 1 = 1, so the spec omits the explicit packed-stream
+      // index list — we don't consume anything for it.
+      use #(in_idx, after_in) <- result.try(read_number(rest))
+      use #(out_idx, after_out) <- result.try(read_number(after_in))
+      use <- bool.guard(
+        when: in_idx != 1 || out_idx != 0,
+        return: Error(error.ArchiveNotImplemented(
+          feature: "7z non-linear 2-coder folder topology (bind in="
+          <> int.to_string(in_idx)
+          <> " out="
+          <> int.to_string(out_idx)
+          <> ")",
+        )),
+      )
+      Ok(#(ParsedFolder(coders: coders), after_out))
+    }
+  }
+}
+
+fn parse_coders_loop(
+  bytes: BitArray,
+  remaining: Int,
+  acc: List(CoderSpec),
+) -> Result(#(List(CoderSpec), BitArray), error.ArchiveError) {
+  case remaining {
+    0 -> Ok(#(list.reverse(acc), bytes))
+    _ -> {
+      use #(coder, rest) <- result.try(parse_one_coder(bytes))
+      parse_coders_loop(rest, remaining - 1, [coder, ..acc])
+    }
+  }
+}
+
+fn parse_one_coder(
+  bytes: BitArray,
+) -> Result(#(CoderSpec, BitArray), error.ArchiveError) {
+  case bytes {
     <<flags, after_flags:bytes>> -> {
       let id_size = int.bitwise_and(flags, 0x0F)
       let is_complex = int.bitwise_and(flags, 0x10) != 0
@@ -1020,10 +1093,7 @@ fn parse_single_folder(
       use coder_id <- result.try(classify_coder_id(coder_id_bytes))
       case has_attrs {
         False ->
-          Ok(#(
-            ParsedFolder(coder_id: coder_id, properties: <<>>),
-            after_coder_id,
-          ))
+          Ok(#(CoderSpec(id: coder_id, properties: <<>>), after_coder_id))
         True -> {
           use #(attrs_size, after_attrs_size) <- result.try(read_number(
             after_coder_id,
@@ -1040,7 +1110,7 @@ fn parse_single_folder(
               attrs_size,
               bit_array.byte_size(after_attrs_size) - attrs_size,
             )
-          Ok(#(ParsedFolder(coder_id: coder_id, properties: attrs), after_attrs))
+          Ok(#(CoderSpec(id: coder_id, properties: attrs), after_attrs))
         }
       }
     }
@@ -1052,6 +1122,7 @@ fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) 
   case id_bytes {
     <<b>> if b == copy_coder_id -> Ok(Copy)
     <<b>> if b == lzma2_coder_id -> Ok(Lzma2)
+    <<b>> if b == delta_coder_id -> Ok(Delta)
     <<b1, b2, b3>>
       if b1 == lzma_coder_id_high
       && b2 == lzma_coder_id_mid
@@ -1750,12 +1821,121 @@ fn decode_folder(
   unpack_sizes: List(Int),
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
-  case folder.coder_id {
-    Lzma2 -> decode_lzma2_payload(packed, folder.properties, unpack_sizes)
-    Lzma -> decode_raw_lzma(packed, folder.properties, unpack_sizes)
+  case folder.coders {
+    [single] -> dispatch_coder(packed, single, unpack_sizes, limits)
+    [first, second] -> {
+      // 2-coder linear chain: packed bytes feed `first`, its output
+      // feeds `second`, and `second`'s output is the folder output.
+      // The two CodersUnPackSize entries match that ordering — entry 0
+      // = first coder's output size, entry 1 = second coder's output
+      // size (= the folder unpack total we use for substream
+      // splitting).
+      let #(first_unpack, final_unpack) = case unpack_sizes {
+        [a, b, ..] -> #(a, b)
+        [a] -> #(a, a)
+        [] -> #(0, 0)
+      }
+      use intermediate <- result.try(dispatch_coder(
+        packed,
+        first,
+        [first_unpack],
+        limits,
+      ))
+      dispatch_coder(intermediate, second, [final_unpack], limits)
+    }
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z folder has unsupported coder count",
+      ))
+  }
+}
+
+fn dispatch_coder(
+  packed: BitArray,
+  spec: CoderSpec,
+  unpack_sizes: List(Int),
+  limits: limit.Limits,
+) -> Result(BitArray, error.ArchiveError) {
+  case spec.id {
+    Lzma2 -> decode_lzma2_payload(packed, spec.properties, unpack_sizes)
+    Lzma -> decode_raw_lzma(packed, spec.properties, unpack_sizes)
     Copy -> decode_copy_coder(packed, unpack_sizes)
     Deflate -> decode_deflate_coder(packed, unpack_sizes, limits)
     BZip2 -> decode_bzip2_coder(packed, unpack_sizes, limits)
+    Delta -> decode_delta_coder(packed, spec.properties, unpack_sizes)
+  }
+}
+
+// The Delta filter records the byte distance over which to take the
+// difference between adjacent samples.  7z stores the distance as a
+// single attribute byte that holds `distance - 1`, so values 0..255
+// span distances 1..256.  Decoding sums each input byte with the
+// byte `distance` positions earlier in the output, mod 256.  The
+// first `distance` bytes have no predecessor and pass through
+// unchanged.
+fn decode_delta_coder(
+  packed: BitArray,
+  properties: BitArray,
+  unpack_sizes: List(Int),
+) -> Result(BitArray, error.ArchiveError) {
+  let target = folder_unpack_total(unpack_sizes)
+  let distance = case properties {
+    <<d>> -> d + 1
+    _ -> 1
+  }
+  let decoded = delta_decode_seven_z(packed, distance)
+  verify_unpack_size(decoded, target, "Delta")
+}
+
+fn delta_decode_seven_z(bytes: BitArray, distance: Int) -> BitArray {
+  let byte_list = bit_array_to_byte_list_seven_z(bytes, [])
+  let decoded = delta_decode_seven_z_loop(byte_list, distance, [], 0)
+  byte_list_to_bit_array_seven_z(decoded, <<>>)
+}
+
+fn bit_array_to_byte_list_seven_z(bytes: BitArray, acc: List(Int)) -> List(Int) {
+  case bytes {
+    <<b, rest:bytes>> -> bit_array_to_byte_list_seven_z(rest, [b, ..acc])
+    _ -> list.reverse(acc)
+  }
+}
+
+fn byte_list_to_bit_array_seven_z(bytes: List(Int), acc: BitArray) -> BitArray {
+  case bytes {
+    [] -> acc
+    [b, ..rest] -> byte_list_to_bit_array_seven_z(rest, <<acc:bits, b>>)
+  }
+}
+
+fn delta_decode_seven_z_loop(
+  input: List(Int),
+  distance: Int,
+  output: List(Int),
+  index: Int,
+) -> List(Int) {
+  case input {
+    [] -> list.reverse(output)
+    [b, ..rest] ->
+      case index < distance {
+        True -> delta_decode_seven_z_loop(rest, distance, [b, ..output], index + 1)
+        False -> {
+          // `output` holds emitted bytes in reverse order (head =
+          // most recent).  The byte we emitted `distance` slots ago
+          // is always at offset `distance - 1` from the head, no
+          // matter how many bytes have been emitted overall.
+          let predecessor = nth_back(output, distance - 1)
+          let sum = int.bitwise_and(b + predecessor, 0xFF)
+          delta_decode_seven_z_loop(rest, distance, [sum, ..output], index + 1)
+        }
+      }
+  }
+}
+
+fn nth_back(values: List(Int), steps: Int) -> Int {
+  case values, steps {
+    [head, ..], 0 -> head
+    [_, ..tail], _ -> nth_back(tail, steps - 1)
+    [], _ -> 0
   }
 }
 
