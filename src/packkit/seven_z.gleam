@@ -1166,7 +1166,7 @@ fn decode_internal(
       decode_encoded_header(rest, bytes, password, limits)
     _ -> Ok(next_header_bytes)
   })
-  use parsed <- result.try(parse_header(header))
+  use parsed <- result.try(parse_header(header, bytes, limits))
   decode_archive(packed_streams, parsed, password, limits)
 }
 
@@ -1183,7 +1183,14 @@ fn decode_encoded_header(
   // Parse it through the same MainStreamsInfo parser, then decode the
   // packed stream using the declared coder and feed the result back
   // through parse_header.
-  use #(streams, _rest) <- result.try(parse_main_streams_info(bytes_after_nid))
+  // Encoded next-header's StreamsInfo can't reference external
+  // AdditionalStreamsInfo (the AdditionalStreamsInfo block lives
+  // INSIDE the post-decode next header).  Pass an empty list so any
+  // such reference surfaces as `ArchiveInvalid` rather than reading
+  // out-of-bounds.
+  use #(streams, _rest) <- result.try(
+    parse_main_streams_info(bytes_after_nid, []),
+  )
   case streams {
     HeaderStreamsNone ->
       Error(error.ArchiveInvalid(
@@ -1342,12 +1349,25 @@ type CoderId {
 
 // -- top-level header parser -------------------------------------------
 
-fn parse_header(header: BitArray) -> Result(ParsedHeader, error.ArchiveError) {
+fn parse_header(
+  header: BitArray,
+  full_archive: BitArray,
+  limits: limit.Limits,
+) -> Result(ParsedHeader, error.ArchiveError) {
   case header {
     <<head_nid, rest:bytes>> if head_nid == nid_header -> {
       let parser =
-        HeaderParser(streams: HeaderStreamsNone, files: HeaderFilesNone)
-      use parser <- result.try(parse_header_body(rest, parser))
+        HeaderParser(
+          additional_streams: [],
+          streams: HeaderStreamsNone,
+          files: HeaderFilesNone,
+        )
+      use parser <- result.try(parse_header_body(
+        rest,
+        parser,
+        full_archive,
+        limits,
+      ))
       finalize_parsed_header(parser)
     }
     _ ->
@@ -1358,7 +1378,17 @@ fn parse_header(header: BitArray) -> Result(ParsedHeader, error.ArchiveError) {
 }
 
 type HeaderParser {
-  HeaderParser(streams: HeaderStreams, files: HeaderFiles)
+  HeaderParser(
+    /// Decoded outputs of every folder declared in
+    /// `AdditionalStreamsInfo` (NID 0x03).  Empty when the archive
+    /// has no AdditionalStreamsInfo block — i.e. the canonical
+    /// p7zip output.  Each `BitArray` is one folder's plain bytes;
+    /// `external != 0` sites elsewhere in the header reference
+    /// these by 0-based index.
+    additional_streams: List(BitArray),
+    streams: HeaderStreams,
+    files: HeaderFiles,
+  )
 }
 
 type HeaderStreams {
@@ -1385,22 +1415,69 @@ type HeaderFiles {
 fn parse_header_body(
   bytes: BitArray,
   parser: HeaderParser,
+  full_archive: BitArray,
+  limits: limit.Limits,
 ) -> Result(HeaderParser, error.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
         n if n == nid_end -> Ok(parser)
         n if n == nid_main_streams_info -> {
-          use #(streams, rest) <- result.try(parse_main_streams_info(rest))
-          parse_header_body(rest, HeaderParser(..parser, streams: streams))
+          use #(streams, rest) <- result.try(parse_main_streams_info(
+            rest,
+            parser.additional_streams,
+          ))
+          parse_header_body(
+            rest,
+            HeaderParser(..parser, streams: streams),
+            full_archive,
+            limits,
+          )
         }
         n if n == nid_files_info -> {
-          use #(files, rest) <- result.try(parse_files_info(rest))
-          parse_header_body(rest, HeaderParser(..parser, files: files))
+          use #(files, rest) <- result.try(parse_files_info(
+            rest,
+            parser.additional_streams,
+          ))
+          parse_header_body(
+            rest,
+            HeaderParser(..parser, files: files),
+            full_archive,
+            limits,
+          )
         }
-        n if n == nid_archive_properties || n == nid_additional_streams_info ->
+        n if n == nid_additional_streams_info -> {
+          // Spec layout: `nid_additional_streams_info` carries a full
+          // StreamsInfo block whose folders, once decoded, become the
+          // bytes that subsequent `external != 0` sites elsewhere in
+          // the header reference by 0-based DataIndex.  We parse the
+          // StreamsInfo with an empty `additional_streams` context
+          // (nested external references in AdditionalStreamsInfo
+          // itself are intentionally unsupported — not observed in
+          // any p7zip-produced archive).
+          use #(streams_info, rest) <- result.try(
+            parse_main_streams_info(rest, []),
+          )
+          use decoded <- result.try(decode_additional_streams(
+            streams_info,
+            full_archive,
+            limits,
+          ))
+          parse_header_body(
+            rest,
+            HeaderParser(..parser, additional_streams: decoded),
+            full_archive,
+            limits,
+          )
+        }
+        n if n == nid_archive_properties ->
+          // ArchiveProperties is a free-form metadata blob that the
+          // spec says decoders SHOULD ignore unless they understand
+          // a specific property.  No p7zip-produced archive sets
+          // this; reject for now rather than silently skip with the
+          // wrong byte boundary.
           Error(error.ArchiveNotImplemented(
-            feature: "7z header section NID " <> int.to_string(n),
+            feature: "7z ArchiveProperties (NID 0x02)",
           ))
         _ ->
           Error(error.ArchiveInvalid(
@@ -1454,6 +1531,7 @@ fn finalize_parsed_header(
 
 fn parse_main_streams_info(
   bytes: BitArray,
+  additional_streams: List(BitArray),
 ) -> Result(#(HeaderStreams, BitArray), error.ArchiveError) {
   let state =
     StreamsParser(
@@ -1465,7 +1543,7 @@ fn parse_main_streams_info(
       have_pack: False,
       have_unpack: False,
     )
-  parse_streams_loop(bytes, state)
+  parse_streams_loop(bytes, state, additional_streams)
 }
 
 type StreamsParser {
@@ -1483,6 +1561,7 @@ type StreamsParser {
 fn parse_streams_loop(
   bytes: BitArray,
   state: StreamsParser,
+  additional_streams: List(BitArray),
 ) -> Result(#(HeaderStreams, BitArray), error.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
@@ -1515,11 +1594,12 @@ fn parse_streams_loop(
               pack_sizes: pack_sizes,
               have_pack: True,
             ),
+            additional_streams,
           )
         }
         n if n == nid_unpack_info -> {
           use #(folders, folder_unpack_sizes, rest) <- result.try(
-            parse_unpack_info(rest),
+            parse_unpack_info(rest, additional_streams),
           )
           parse_streams_loop(
             rest,
@@ -1529,6 +1609,7 @@ fn parse_streams_loop(
               folder_unpack_sizes: folder_unpack_sizes,
               have_unpack: True,
             ),
+            additional_streams,
           )
         }
         n if n == nid_sub_streams_info -> {
@@ -1550,6 +1631,7 @@ fn parse_streams_loop(
           parse_streams_loop(
             rest,
             StreamsParser(..state, substream_sizes: substream_sizes),
+            additional_streams,
           )
         }
         _ ->
@@ -1605,17 +1687,19 @@ fn parse_pack_info_body(
 
 fn parse_unpack_info(
   bytes: BitArray,
+  additional_streams: List(BitArray),
 ) -> Result(
   #(List(ParsedFolder), List(List(Int)), BitArray),
   error.ArchiveError,
 ) {
-  parse_unpack_info_body(bytes, [], [])
+  parse_unpack_info_body(bytes, [], [], additional_streams)
 }
 
 fn parse_unpack_info_body(
   bytes: BitArray,
   folders: List(ParsedFolder),
   folder_unpack_sizes: List(List(Int)),
+  additional_streams: List(BitArray),
 ) -> Result(
   #(List(ParsedFolder), List(List(Int)), BitArray),
   error.ArchiveError,
@@ -1632,8 +1716,16 @@ fn parse_unpack_info_body(
             _ -> Ok(#(folders, folder_unpack_sizes, rest))
           }
         n if n == nid_folder -> {
-          use #(parsed_folders, rest) <- result.try(parse_folders(rest))
-          parse_unpack_info_body(rest, parsed_folders, folder_unpack_sizes)
+          use #(parsed_folders, rest) <- result.try(parse_folders(
+            rest,
+            additional_streams,
+          ))
+          parse_unpack_info_body(
+            rest,
+            parsed_folders,
+            folder_unpack_sizes,
+            additional_streams,
+          )
         }
         n if n == nid_coders_unpack_size -> {
           // One UnPackSize per coder output stream per folder.  Each
@@ -1648,11 +1740,16 @@ fn parse_unpack_info_body(
             total_size_count,
           ))
           let grouped = split_unpack_sizes_by_folder(flat_sizes, folders, [])
-          parse_unpack_info_body(rest, folders, grouped)
+          parse_unpack_info_body(rest, folders, grouped, additional_streams)
         }
         n if n == nid_crc -> {
           use rest <- result.try(skip_crc_block(rest, list.length(folders)))
-          parse_unpack_info_body(rest, folders, folder_unpack_sizes)
+          parse_unpack_info_body(
+            rest,
+            folders,
+            folder_unpack_sizes,
+            additional_streams,
+          )
         }
         _ ->
           Error(error.ArchiveInvalid(
@@ -1665,6 +1762,7 @@ fn parse_unpack_info_body(
 
 fn parse_folders(
   bytes: BitArray,
+  additional_streams: List(BitArray),
 ) -> Result(#(List(ParsedFolder), BitArray), error.ArchiveError) {
   use #(num_folders, rest) <- result.try(read_number(bytes))
   use <- bool.guard(
@@ -1674,16 +1772,134 @@ fn parse_folders(
     )),
   )
   case rest {
-    <<external, after_external:bytes>> -> {
-      use <- bool.guard(
-        when: external != 0,
-        return: Error(error.ArchiveNotImplemented(
-          feature: "7z external folder definitions",
-        )),
-      )
-      parse_folders_loop(after_external, num_folders, [])
-    }
+    <<external, after_external:bytes>> ->
+      case external {
+        0 -> parse_folders_loop(after_external, num_folders, [])
+        _ -> {
+          // External folder defs: a varint DataIndex follows, then we
+          // parse the N folders out of the AdditionalStreamsInfo entry
+          // at that index.  The continuation byte stream after the
+          // `external` flag continues the regular section (it does NOT
+          // contain the folder definitions themselves).
+          use #(data_index, after_data_index) <- result.try(read_number(
+            after_external,
+          ))
+          use external_bytes <- result.try(get_additional_stream(
+            additional_streams,
+            data_index,
+          ))
+          use #(parsed_folders, _consumed) <- result.try(
+            parse_folders_loop(external_bytes, num_folders, []),
+          )
+          Ok(#(parsed_folders, after_data_index))
+        }
+      }
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z folder section"))
+  }
+}
+
+// Decode every folder declared in an `AdditionalStreamsInfo` block,
+// returning one `BitArray` per folder (in declaration order).  These
+// become the source bytes for later `external != 0` references —
+// e.g. `external` in the FilesInfo file-name section reads a varint
+// DataIndex and grabs `result[data_index]`.
+//
+// The pack region is shared with `MainStreamsInfo` (both reference
+// offsets within `full_archive` starting at `signature_size`); the
+// AdditionalStreamsInfo's `pack_pos` indicates where within that
+// region this set of streams lives.  No `password` is forwarded — the
+// canonical `7z a` never produces AES inside AdditionalStreamsInfo,
+// so we ignore it rather than introducing a separate parameter.
+fn decode_additional_streams(
+  streams_info: HeaderStreams,
+  full_archive: BitArray,
+  limits: limit.Limits,
+) -> Result(List(BitArray), error.ArchiveError) {
+  case streams_info {
+    HeaderStreamsNone ->
+      Error(error.ArchiveInvalid(
+        message: "7z AdditionalStreamsInfo has no StreamsInfo body",
+      ))
+    HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
+      let pack_offset = signature_size + pack_pos
+      let total_pack_size = sum_list(pack_sizes, 0)
+      use packed <- result.try(slice_required(
+        full_archive,
+        pack_offset,
+        total_pack_size,
+        "7z AdditionalStreamsInfo packed bytes",
+      ))
+      decode_additional_streams_loop(
+        packed,
+        folders,
+        folder_unpack_sizes,
+        pack_sizes,
+        limits,
+        0,
+        [],
+      )
+    }
+  }
+}
+
+fn decode_additional_streams_loop(
+  packed: BitArray,
+  folders: List(ParsedFolder),
+  folder_unpack_sizes: List(List(Int)),
+  pack_sizes: List(Int),
+  limits: limit.Limits,
+  pack_cursor: Int,
+  acc: List(BitArray),
+) -> Result(List(BitArray), error.ArchiveError) {
+  case folders, folder_unpack_sizes {
+    [], [] -> Ok(list.reverse(acc))
+    [folder, ..rest_folders], [unpack_sizes, ..rest_unpack] -> {
+      let stream_count = folder_packed_stream_count(folder)
+      let folder_pack_sizes = list.take(pack_sizes, stream_count)
+      let rest_pack_sizes = list.drop(pack_sizes, stream_count)
+      use folder_streams <- result.try(
+        slice_folder_streams(packed, pack_cursor, folder_pack_sizes, []),
+      )
+      use folder_plain <- result.try(decode_folder(
+        folder_streams,
+        folder,
+        unpack_sizes,
+        option.None,
+        limits,
+      ))
+      let next_cursor = pack_cursor + sum_list(folder_pack_sizes, 0)
+      decode_additional_streams_loop(
+        packed,
+        rest_folders,
+        rest_unpack,
+        rest_pack_sizes,
+        limits,
+        next_cursor,
+        [folder_plain, ..acc],
+      )
+    }
+    _, _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z AdditionalStreamsInfo folder/unpack-size lists misaligned",
+      ))
+  }
+}
+
+fn get_additional_stream(
+  streams: List(BitArray),
+  index: Int,
+) -> Result(BitArray, error.ArchiveError) {
+  case streams, index {
+    [head, ..], 0 -> Ok(head)
+    [_, ..rest], _ if index > 0 -> get_additional_stream(rest, index - 1)
+    _, _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z external DataIndex "
+        <> int.to_string(index)
+        <> " out of bounds (AdditionalStreamsInfo holds "
+        <> int.to_string(list.length(streams))
+        <> " stream(s))",
+      ))
   }
 }
 
@@ -2021,9 +2237,10 @@ fn describe_bit_array_hex(bytes: BitArray, acc: String) -> String {
 
 fn parse_files_info(
   bytes: BitArray,
+  additional_streams: List(BitArray),
 ) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
   use #(num_files, rest) <- result.try(read_number(bytes))
-  parse_files_loop(rest, num_files, [], [], [], [])
+  parse_files_loop(rest, num_files, [], [], [], [], additional_streams)
 }
 
 fn parse_files_loop(
@@ -2033,6 +2250,7 @@ fn parse_files_loop(
   empty_streams: List(Bool),
   empty_files: List(Bool),
   mtimes_unix: List(Option(Int)),
+  additional_streams: List(BitArray),
 ) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
@@ -2067,7 +2285,11 @@ fn parse_files_loop(
               size,
               bit_array.byte_size(after_size) - size,
             )
-          use parsed_names <- result.try(parse_name_block(payload, num_files))
+          use parsed_names <- result.try(parse_name_block(
+            payload,
+            num_files,
+            additional_streams,
+          ))
           parse_files_loop(
             after_payload,
             num_files,
@@ -2075,6 +2297,7 @@ fn parse_files_loop(
             empty_streams,
             empty_files,
             mtimes_unix,
+            additional_streams,
           )
         }
         n if n == nid_empty_stream -> {
@@ -2099,6 +2322,7 @@ fn parse_files_loop(
             flags,
             empty_files,
             mtimes_unix,
+            additional_streams,
           )
         }
         n if n == nid_empty_file -> {
@@ -2131,6 +2355,7 @@ fn parse_files_loop(
             empty_streams,
             flags,
             mtimes_unix,
+            additional_streams,
           )
         }
         n if n == nid_mtime -> {
@@ -2158,7 +2383,11 @@ fn parse_files_loop(
               size,
               bit_array.byte_size(after_size) - size,
             )
-          use parsed_mtimes <- result.try(parse_mtime_block(payload, num_files))
+          use parsed_mtimes <- result.try(parse_mtime_block(
+            payload,
+            num_files,
+            additional_streams,
+          ))
           parse_files_loop(
             after_payload,
             num_files,
@@ -2166,6 +2395,7 @@ fn parse_files_loop(
             empty_streams,
             empty_files,
             parsed_mtimes,
+            additional_streams,
           )
         }
         n
@@ -2191,6 +2421,7 @@ fn parse_files_loop(
             empty_streams,
             empty_files,
             mtimes_unix,
+            additional_streams,
           )
         }
         _ ->
@@ -2238,28 +2469,38 @@ fn filetime_to_unix(filetime: Int) -> Int {
 fn parse_mtime_block(
   payload: BitArray,
   num_files: Int,
+  additional_streams: List(BitArray),
 ) -> Result(List(Option(Int)), error.ArchiveError) {
   case payload {
     <<all_defined, external, after_header:bytes>> -> {
-      use <- bool.guard(
-        when: external != 0,
-        return: Error(error.ArchiveNotImplemented(
-          feature: "7z external Mtime block",
-        )),
-      )
+      use external_bytes <- result.try(case external {
+        0 -> Ok(after_header)
+        _ -> {
+          // External Mtime: a varint DataIndex follows the external
+          // flag, and the actual mtime body (post-`all_defined` + post-
+          // `external` byte position) lives in
+          // AdditionalStreamsInfo's referenced stream.  The continuation
+          // bytes after DataIndex are ignored for parsing purposes
+          // because the section's own size varint already framed it.
+          use #(data_index, _after_index) <- result.try(read_number(
+            after_header,
+          ))
+          get_additional_stream(additional_streams, data_index)
+        }
+      })
       use defined_flags <- result.try(case all_defined {
         1 -> Ok(list.repeat(True, num_files))
-        _ -> read_mtime_defined_flags(after_header, num_files)
+        _ -> read_mtime_defined_flags(external_bytes, num_files)
       })
       let body_after_flags = case all_defined {
-        1 -> after_header
+        1 -> external_bytes
         _ -> {
           let bitmap_size = { num_files + 7 } / 8
           let assert Ok(rest) =
             bit_array.slice(
-              after_header,
+              external_bytes,
               bitmap_size,
-              bit_array.byte_size(after_header) - bitmap_size,
+              bit_array.byte_size(external_bytes) - bitmap_size,
             )
           rest
         }
@@ -2328,15 +2569,23 @@ fn build_dummy_names(count: Int, index: Int, acc: List(String)) -> List(String) 
 fn parse_name_block(
   payload: BitArray,
   num_files: Int,
+  additional_streams: List(BitArray),
 ) -> Result(List(String), error.ArchiveError) {
   case payload {
     <<external, rest:bytes>> ->
       case external {
         0 -> decode_utf16_names(rest, num_files, [], [])
-        _ ->
-          Error(error.ArchiveNotImplemented(
-            feature: "7z external file-name table",
+        _ -> {
+          // External file-name table: varint DataIndex points at the
+          // AdditionalStreamsInfo entry whose decoded bytes hold the
+          // inline UTF-16LE name table.
+          use #(data_index, _after_index) <- result.try(read_number(rest))
+          use external_bytes <- result.try(get_additional_stream(
+            additional_streams,
+            data_index,
           ))
+          decode_utf16_names(external_bytes, num_files, [], [])
+        }
       }
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z file-name section"))
   }
