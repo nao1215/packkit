@@ -322,7 +322,7 @@ pub fn finish_encoder(encoder: Encoder) -> Result(BitArray, error.CodecError) {
   case encoder.kind {
     EncDeflate -> deflate.encode(bytes: bytes)
     EncZlib -> zlib.encode(bytes: bytes)
-    EncGzip -> gzip.encode(bytes: bytes, header: gzip.default_header())
+    EncGzip -> gzip.encode(bytes: bytes)
     EncLz4 -> lz4.encode(bytes: bytes)
     EncSnappy -> snappy.encode(bytes: bytes)
     EncBzip2 -> bzip2.encode(bytes: bytes)

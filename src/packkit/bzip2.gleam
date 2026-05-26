@@ -682,6 +682,14 @@ fn list_to_dict(
   }
 }
 
+// Trampolined symbol-decode loop.  See `inflate_huffman_block` in
+// packkit/deflate for the rationale — the recursive self-call has to
+// sit at the function's outer-`case` tail position (not buried inside
+// `use ... <- result.try(...)` closures) for Gleam's JS backend to
+// rewrite it to a `while`.  Splitting the body into `decode_huffman_step`
+// (returns Done/Continue) and a thin `case` outer keeps the JS stack
+// at a small constant regardless of how many symbols a bzip2 block
+// emits.
 fn decode_huffman_stream(
   reader: Reader,
   tables: dict.Dict(Int, HuffmanTable),
@@ -696,6 +704,80 @@ fn decode_huffman_stream(
   out_len: Int,
   limits: limit.Limits,
 ) -> Result(#(dict.Dict(Int, Int), Int, Reader), error.CodecError) {
+  case
+    decode_huffman_step(
+      reader,
+      tables,
+      selectors,
+      eob,
+      mtf,
+      symbol_count,
+      pending_run,
+      run_weight,
+      out_rev,
+      out_len,
+      limits,
+    )
+  {
+    Error(err) -> Error(err)
+    Ok(HuffmanStreamDone(final_out_rev, final_out_len, final_reader)) -> {
+      let _ = num_syms
+      let l_string =
+        list_to_indexed_dict(list.reverse(final_out_rev), 0, dict.new())
+      Ok(#(l_string, final_out_len, final_reader))
+    }
+    Ok(HuffmanStreamContinue(
+      next_reader,
+      next_mtf,
+      next_symbol_count,
+      next_pending_run,
+      next_run_weight,
+      next_out_rev,
+      next_out_len,
+    )) ->
+      decode_huffman_stream(
+        next_reader,
+        tables,
+        selectors,
+        eob,
+        next_mtf,
+        num_syms,
+        next_symbol_count,
+        next_pending_run,
+        next_run_weight,
+        next_out_rev,
+        next_out_len,
+        limits,
+      )
+  }
+}
+
+type HuffmanStreamStep {
+  HuffmanStreamDone(out_rev: List(Int), out_len: Int, reader: Reader)
+  HuffmanStreamContinue(
+    reader: Reader,
+    mtf: List(Int),
+    symbol_count: Int,
+    pending_run: Int,
+    run_weight: Int,
+    out_rev: List(Int),
+    out_len: Int,
+  )
+}
+
+fn decode_huffman_step(
+  reader: Reader,
+  tables: dict.Dict(Int, HuffmanTable),
+  selectors: dict.Dict(Int, Int),
+  eob: Int,
+  mtf: List(Int),
+  symbol_count: Int,
+  pending_run: Int,
+  run_weight: Int,
+  out_rev: List(Int),
+  out_len: Int,
+  limits: limit.Limits,
+) -> Result(HuffmanStreamStep, error.CodecError) {
   let group_index = symbol_count / group_size
   let selector = case dict.get(selectors, group_index) {
     Ok(v) -> v
@@ -722,40 +804,28 @@ fn decode_huffman_stream(
         pending_run,
         limits,
       ))
-      let _ = num_syms
-      let l_string = list_to_indexed_dict(list.reverse(out_rev), 0, dict.new())
-      Ok(#(l_string, out_len, reader))
+      Ok(HuffmanStreamDone(out_rev, out_len, reader))
     }
     0 ->
-      decode_huffman_stream(
+      Ok(HuffmanStreamContinue(
         reader,
-        tables,
-        selectors,
-        eob,
         mtf,
-        num_syms,
         symbol_count + 1,
         pending_run + run_weight,
         run_weight * 2,
         out_rev,
         out_len,
-        limits,
-      )
+      ))
     1 ->
-      decode_huffman_stream(
+      Ok(HuffmanStreamContinue(
         reader,
-        tables,
-        selectors,
-        eob,
         mtf,
-        num_syms,
         symbol_count + 1,
         pending_run + 2 * run_weight,
         run_weight * 2,
         out_rev,
         out_len,
-        limits,
-      )
+      ))
     other -> {
       use #(out_rev, out_len) <- result.try(flush_run(
         out_rev,
@@ -772,20 +842,15 @@ fn decode_huffman_stream(
         byte,
         limits,
       ))
-      decode_huffman_stream(
+      Ok(HuffmanStreamContinue(
         reader,
-        tables,
-        selectors,
-        eob,
         new_mtf,
-        num_syms,
         symbol_count + 1,
         0,
         1,
         out_rev,
         out_len,
-        limits,
-      )
+      ))
     }
   }
 }

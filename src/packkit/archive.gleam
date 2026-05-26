@@ -185,6 +185,26 @@ pub fn entries(archive: Archive) -> List(entry.Entry) {
   list.reverse(archive.reversed_entries)
 }
 
+/// Look up the first entry whose path matches `path`.  Returns
+/// `Error(Nil)` when no entry matches — keeps the result type close
+/// to `list.find` so callers can chain with `result.try`.  Paths are
+/// compared by their canonical string form (`entry.to_string`), so
+/// trailing-slash normalisation done at insert time is preserved.
+///
+/// Use this when you want to extract a known-named entry from a
+/// decoded archive — the alternative is `archives.entries(...) |>
+/// list.find(fn(e) { entry.to_string(entry.path(e)) == path })`,
+/// which every CLI extractor and "fetch one file" use case has to
+/// reinvent.
+pub fn entry_by_path(
+  archive: Archive,
+  path path: String,
+) -> Result(entry.Entry, Nil) {
+  list.find(archive.reversed_entries, fn(ent) {
+    entry.to_string(entry.path(ent)) == path
+  })
+}
+
 /// Read the optional archive comment.
 pub fn comment(archive: Archive) -> Option(String) {
   archive.comment

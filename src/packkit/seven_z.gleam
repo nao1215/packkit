@@ -3150,6 +3150,13 @@ fn decode_linear_chain(
         password,
         limits,
       ))
+      // When the first coder is AES, a wrong password produces
+      // garbage plaintext that the downstream coder (LZMA / LZMA2
+      // usually) rejects with a low-level message like "LZMA range
+      // coder must start with a zero byte".  That message is true
+      // but confusing — the actual user-level cause is "wrong
+      // password".  Wrap the downstream error so callers see the
+      // right diagnosis first.
       decode_linear_chain(
         intermediate,
         rest_coders,
@@ -3157,6 +3164,7 @@ fn decode_linear_chain(
         password,
         limits,
       )
+      |> result.map_error(maybe_wrap_aes_chain_error(_, head.id))
     }
     // CodersUnPackSize was shorter than the coder list — malformed
     // header; reject rather than silently splitting on a phantom
@@ -3166,6 +3174,31 @@ fn decode_linear_chain(
         message: "7z folder coder list longer than CodersUnPackSize block",
       ))
   }
+}
+
+fn maybe_wrap_aes_chain_error(
+  err: error.ArchiveError,
+  head_id: CoderId,
+) -> error.ArchiveError {
+  case head_id == Aes256Sha256 {
+    False -> err
+    True -> {
+      let original = case err {
+        error.ArchiveInvalid(message:) -> message
+        error.ArchiveNotImplemented(feature:) -> feature
+        other -> string_inspect(other)
+      }
+      error.ArchiveInvalid(
+        message: "7z AES decrypt produced invalid plaintext for the "
+        <> "downstream coder (wrong password or corrupt archive): "
+        <> original,
+      )
+    }
+  }
+}
+
+fn string_inspect(value: a) -> String {
+  string.inspect(value)
 }
 
 fn dispatch_coder(

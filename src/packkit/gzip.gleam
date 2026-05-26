@@ -264,6 +264,18 @@ fn measure_extra_subfields(
   }
 }
 
+/// Encode `bytes` as a gzip stream using the default header (no
+/// FNAME / FCOMMENT / FEXTRA / mtime).  Use this when you just want
+/// "compress these bytes" — the symmetric counterpart of
+/// `decode_payload`, mirroring every other codec's `encode/1` shape.
+/// Use [encode_with_header] when you need to attach a filename,
+/// comment, or mtime to the stream.
+pub fn encode(
+  bytes bytes: BitArray,
+) -> Result(BitArray, error.CodecError) {
+  encode_with_header(bytes: bytes, header: default_header())
+}
+
 /// Encode `bytes` as a gzip stream using `header`.  The DEFLATE body
 /// uses the dynamic-Huffman encoder, which on typical text and
 /// structured-data payloads shrinks ~10–30 % more than the fixed-
@@ -271,7 +283,7 @@ fn measure_extra_subfields(
 /// transparently falls back to fixed Huffman inside
 /// `deflate.encode_dynamic` so the stream is always a valid
 /// RFC 1951 BTYPE=01 or BTYPE=10 block.
-pub fn encode(
+pub fn encode_with_header(
   bytes bytes: BitArray,
   header header: Header,
 ) -> Result(BitArray, error.CodecError) {

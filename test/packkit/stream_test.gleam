@@ -38,7 +38,7 @@ pub fn stream_zlib_matches_eager_test() -> Nil {
 pub fn stream_gzip_matches_eager_test() -> Nil {
   let payload = <<"stream gzip fixture":utf8>>
   let assert Ok(compressed) =
-    gzip.encode(bytes: payload, header: gzip.default_header())
+    gzip.encode(bytes: payload)
   let chunks = split_in_thirds(compressed)
   let assert Ok(restored) =
     stream.decode_chunks(decoder: stream.new_gzip_decoder(), chunks: chunks)

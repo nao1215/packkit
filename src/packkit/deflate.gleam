@@ -434,11 +434,37 @@ fn decode_symbol_loop(
 
 // -- inflate driver ------------------------------------------------------
 
+// Block-level inflate loop.  Wrapped in a trampoline (`InflateStep`)
+// because every `use ... <- result.try(...)` desugars to a closure on
+// the JS target — Gleam's JS backend only rewrites a self-tail-call
+// to a `while` when the recursive call sits at the function body's
+// true tail position.  Putting it inside the `Continue` arm of a
+// case-on-Result keeps the call at tail position and the loop runs
+// in constant JS stack regardless of how many DEFLATE blocks are
+// concatenated (matters for raw-DEFLATE streams without a length
+// cap, e.g. 7z's Deflate coder over a multi-MB folder).
 fn inflate(
   reader: Reader,
   output: BitArray,
   limits: limit.Limits,
 ) -> Result(#(BitArray, Reader), error.CodecError) {
+  case inflate_one_block(reader, output, limits) {
+    Error(err) -> Error(err)
+    Ok(InflateDone(out, rdr)) -> Ok(#(out, rdr))
+    Ok(InflateContinue(out, rdr)) -> inflate(rdr, out, limits)
+  }
+}
+
+type InflateStep {
+  InflateDone(output: BitArray, reader: Reader)
+  InflateContinue(output: BitArray, reader: Reader)
+}
+
+fn inflate_one_block(
+  reader: Reader,
+  output: BitArray,
+  limits: limit.Limits,
+) -> Result(InflateStep, error.CodecError) {
   use #(bfinal, reader) <- result.try(read_bits(reader, 1))
   use #(btype, reader) <- result.try(read_bits(reader, 2))
 
@@ -450,8 +476,8 @@ fn inflate(
   })
 
   case bfinal {
-    1 -> Ok(#(output, reader))
-    _ -> inflate(reader, output, limits)
+    1 -> Ok(InflateDone(output, reader))
+    _ -> Ok(InflateContinue(output, reader))
   }
 }
 
@@ -691,6 +717,15 @@ fn pad_to_length(values: List(Int), target: Int) -> List(Int) {
   }
 }
 
+// Symbol-level Huffman-block loop.  Trampolined for the same reason
+// as `inflate`: the inner body uses `use ... <- result.try(...)` in
+// several places, which puts the would-be tail call inside multiple
+// JS closures.  Splitting the body into `inflate_huffman_step`
+// (returns Continue/Done) and a thin `case`-based outer loop puts the
+// recursive self-call at true tail position on the outer.  For a real-
+// world gzip payload (hundreds of thousands of symbols) the recursion
+// depth would otherwise crash Node with `Maximum call stack size
+// exceeded`.
 fn inflate_huffman_block(
   reader: Reader,
   output: BitArray,
@@ -698,14 +733,34 @@ fn inflate_huffman_block(
   dtree: Tree,
   limits: limit.Limits,
 ) -> Result(#(BitArray, Reader), error.CodecError) {
+  case inflate_huffman_step(reader, output, ltree, dtree, limits) {
+    Error(err) -> Error(err)
+    Ok(HuffmanDone(out, rdr)) -> Ok(#(out, rdr))
+    Ok(HuffmanContinue(out, rdr)) ->
+      inflate_huffman_block(rdr, out, ltree, dtree, limits)
+  }
+}
+
+type HuffmanStep {
+  HuffmanDone(output: BitArray, reader: Reader)
+  HuffmanContinue(output: BitArray, reader: Reader)
+}
+
+fn inflate_huffman_step(
+  reader: Reader,
+  output: BitArray,
+  ltree: Tree,
+  dtree: Tree,
+  limits: limit.Limits,
+) -> Result(HuffmanStep, error.CodecError) {
   use #(symbol, reader) <- result.try(decode_symbol(reader, ltree))
 
   case symbol {
     s if s < 256 -> {
       use new_output <- result.try(append_with_limit(output, <<s>>, limits))
-      inflate_huffman_block(reader, new_output, ltree, dtree, limits)
+      Ok(HuffmanContinue(new_output, reader))
     }
-    256 -> Ok(#(output, reader))
+    256 -> Ok(HuffmanDone(output, reader))
     s ->
       case s > max_length_code {
         True ->
@@ -740,7 +795,7 @@ fn inflate_huffman_block(
             length,
             limits,
           ))
-          inflate_huffman_block(reader, new_output, ltree, dtree, limits)
+          Ok(HuffmanContinue(new_output, reader))
         }
       }
   }

@@ -240,7 +240,7 @@ fn compress_gzip(
   // gzip.encode shares the zlib code path's lack of a level knob, so
   // we accept only the implicit default level for the same reason.
   use _ <- result.try(reject_non_default_level(codec_value, "gzip"))
-  gzip.encode(bytes: bytes, header: gzip.default_header())
+  gzip.encode(bytes: bytes)
 }
 
 fn compress_bzip2(

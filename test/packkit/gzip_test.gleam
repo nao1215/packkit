@@ -27,7 +27,7 @@ pub fn roundtrip_with_metadata_test() -> Nil {
     |> gzip.with_modified_at(unix_seconds: 1_700_000_000)
   let payload = <<"This is a longer body for gzip round-trip testing.":utf8>>
 
-  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(bytes) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) = gzip.decode(bytes: bytes)
 
   decoded.payload
@@ -46,7 +46,7 @@ pub fn decode_preserves_mtime_test() -> Nil {
   let header =
     gzip.default_header() |> gzip.with_modified_at(unix_seconds: 1_234_567_890)
   let payload = <<"mtime round trip":utf8>>
-  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(bytes) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) = gzip.decode(bytes: bytes)
   gzip.modified_at_unix(decoded.header)
   |> should.equal(Some(1_234_567_890))
@@ -55,7 +55,7 @@ pub fn decode_preserves_mtime_test() -> Nil {
 pub fn decode_with_limits_preserves_mtime_test() -> Nil {
   let header = gzip.default_header() |> gzip.with_modified_at(unix_seconds: 42)
   let payload = <<"mtime via decode_with_limits":utf8>>
-  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(bytes) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) =
     gzip.decode_with_limits(bytes: bytes, limits: limit.default())
   gzip.modified_at_unix(decoded.header)
@@ -66,7 +66,7 @@ pub fn decode_treats_zero_mtime_as_unset_test() -> Nil {
   // RFC 1952 §2.3.1: MTIME=0 means "no time stamp available".  We surface
   // that as `None` rather than `Some(0)` so callers can tell the cases apart.
   let assert Ok(bytes) =
-    gzip.encode(bytes: <<"no mtime":utf8>>, header: gzip.default_header())
+    gzip.encode(bytes: <<"no mtime":utf8>>)
   let assert Ok(decoded) = gzip.decode(bytes: bytes)
   gzip.modified_at_unix(decoded.header)
   |> should.equal(None)
@@ -84,7 +84,7 @@ pub fn decode_payload_returns_bitarray_for_parity_test() -> Nil {
   // exposes — no need to reach into a Decoded record for the common path.
   let payload = <<"parity check":utf8>>
   let assert Ok(encoded) =
-    gzip.encode(bytes: payload, header: gzip.default_header())
+    gzip.encode(bytes: payload)
   let assert Ok(plain) = gzip.decode_payload(bytes: encoded)
   plain
   |> should.equal(payload)
@@ -109,7 +109,7 @@ pub fn with_name_checked_accepts_nul_free_name_test() -> Nil {
   let assert Ok(header) =
     gzip.default_header() |> gzip.with_name_checked(name: "valid.txt")
   let payload = <<"checked-name round trip":utf8>>
-  let assert Ok(encoded) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(encoded) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) = gzip.decode(bytes: encoded)
   gzip.name(decoded.header)
   |> should.equal(Some("valid.txt"))
@@ -142,7 +142,7 @@ pub fn streaming_decoder_round_trips_test() -> Nil {
   // `Result(BitArray, _)`.
   let payload = <<"streaming gzip round trip":utf8>>
   let assert Ok(encoded) =
-    gzip.encode(bytes: payload, header: gzip.default_header())
+    gzip.encode(bytes: payload)
   let half = 6
   let total = bit_array.byte_size(encoded)
   let assert Ok(first_chunk) = bit_array.slice(encoded, 0, half)
@@ -160,11 +160,11 @@ pub fn decode_multi_member_concatenated_test() -> Nil {
   // multiple concatenated members (e.g. `cat a.gz b.gz > c.gz`).
   // The decoder must concatenate the per-member payloads.
   let assert Ok(member_a) =
-    gzip.encode(bytes: <<"alpha-":utf8>>, header: gzip.default_header())
+    gzip.encode(bytes: <<"alpha-":utf8>>)
   let assert Ok(member_b) =
-    gzip.encode(bytes: <<"bravo-":utf8>>, header: gzip.default_header())
+    gzip.encode(bytes: <<"bravo-":utf8>>)
   let assert Ok(member_c) =
-    gzip.encode(bytes: <<"charlie":utf8>>, header: gzip.default_header())
+    gzip.encode(bytes: <<"charlie":utf8>>)
   let combined = bit_array.concat([member_a, member_b, member_c])
   let assert Ok(decoded) = gzip.decode(bytes: combined)
   decoded.payload
@@ -173,9 +173,9 @@ pub fn decode_multi_member_concatenated_test() -> Nil {
 
 pub fn decode_multi_member_via_payload_helper_test() -> Nil {
   let assert Ok(member_a) =
-    gzip.encode(bytes: <<"x":utf8>>, header: gzip.default_header())
+    gzip.encode(bytes: <<"x":utf8>>)
   let assert Ok(member_b) =
-    gzip.encode(bytes: <<"y":utf8>>, header: gzip.default_header())
+    gzip.encode(bytes: <<"y":utf8>>)
   let assert Ok(plain) =
     gzip.decode_payload(bytes: bit_array.concat([member_a, member_b]))
   plain
@@ -192,7 +192,7 @@ pub fn decode_multi_member_enforces_max_output_bytes_test() -> Nil {
   let payload = <<"twenty-byte-payload!":utf8>>
   // 20 bytes per member; 3 members = 60 bytes total.
   let assert Ok(member) =
-    gzip.encode(bytes: payload, header: gzip.default_header())
+    gzip.encode(bytes: payload)
   let combined = bit_array.concat([member, member, member])
   // Limit allows up to 40 output bytes, so member 1 fits, member
   // 2 pushes the running total to 40, member 3 should overflow.
@@ -216,7 +216,7 @@ pub fn fextra_roundtrip_single_subfield_test() -> Nil {
     |> gzip.with_extra(subfields: [bgzf_subfield])
   let payload = <<"bgzf-test-payload":utf8>>
 
-  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(bytes) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) = gzip.decode(bytes: bytes)
   decoded.payload
   |> should.equal(payload)
@@ -232,7 +232,7 @@ pub fn fextra_roundtrip_multiple_subfields_test() -> Nil {
     |> gzip.with_extra(subfields: [s1, s2])
   let payload = <<"multi-subfield":utf8>>
 
-  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(bytes) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) = gzip.decode(bytes: bytes)
   decoded.payload
   |> should.equal(payload)
@@ -249,7 +249,7 @@ pub fn fextra_roundtrip_with_name_and_comment_test() -> Nil {
     |> gzip.with_name(name: "data.txt")
     |> gzip.with_comment(comment: "all fields populated")
   let payload = <<"all-fields":utf8>>
-  let assert Ok(bytes) = gzip.encode(bytes: payload, header: header)
+  let assert Ok(bytes) = gzip.encode_with_header(bytes: payload, header: header)
   let assert Ok(decoded) = gzip.decode(bytes: bytes)
   decoded.payload
   |> should.equal(payload)

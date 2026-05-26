@@ -59,7 +59,7 @@ pub fn property_gzip_round_trip_test() -> Nil {
     gen: bytes_gen(),
     name: "gzip",
     encode: fn(b) {
-      let assert Ok(out) = gzip.encode(bytes: b, header: gzip.default_header())
+      let assert Ok(out) = gzip.encode(bytes: b)
       out
     },
     decode: gzip.decode_payload,
@@ -205,7 +205,7 @@ pub fn all_codecs_handle_1k_zeros_test() -> Nil {
   check_round_trip(
     zeros,
     "gzip",
-    fn(b) { gzip.encode(bytes: b, header: gzip.default_header()) },
+    fn(b) { gzip.encode(bytes: b) },
     gzip.decode_payload,
   )
   check_round_trip(zeros, "lz4", lz4.encode, lz4.decode)
@@ -256,7 +256,7 @@ pub fn multi_stream_cumulative_output_limit_test() -> Nil {
 
   // gzip — already covered by a dedicated test, but exercised
   // again here for cross-codec uniformity.
-  let assert Ok(g) = gzip.encode(bytes: payload, header: gzip.default_header())
+  let assert Ok(g) = gzip.encode(bytes: payload)
   case
     gzip.decode_with_limits(
       bytes: bit_array.concat([g, g, g]),
