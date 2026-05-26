@@ -71,9 +71,14 @@ Implemented codecs and archive families:
   Delta (`0x03`) — so archives produced with `7z a -m0=Copy /
   -m0=Deflate / -m0=BZip2` decode end-to-end alongside the
   default LZMA family.  Two-coder linear chains where coder 0 is
-  LZMA or LZMA2 and coder 1 is Delta are supported via the
-  standard bind-pair shape (in_idx=1, out_idx=0), so archives
-  produced with `7z a -mf=Delta:N` decode without complaint.
+  LZMA or LZMA2 and coder 1 is one of {Delta, BCJ-x86,
+  BCJ-PowerPC, BCJ-IA-64, BCJ-ARM, BCJ-ARM-Thumb, BCJ-SPARC} are
+  supported via the standard bind-pair shape (in_idx=1,
+  out_idx=0), so archives produced with `7z a -mf=Delta:N` or
+  `7z a -mf=BCJ` (and the variant `-mf=PPC`, `-mf=ARM`, etc.)
+  decode without complaint.  The BCJ branch-converter dispatches
+  to the same `packkit/internal/bcj` decoders that xz already
+  uses for its filter ids 0x04..0x09.
   Multiple folders, 3+-coder chains, BCJ filters, non-linear
   bind topologies, and encryption are still rejected with typed
   `ArchiveNotImplemented` errors so the reader is easy to extend

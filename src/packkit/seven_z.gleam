@@ -32,6 +32,7 @@ import packkit/checksum
 import packkit/deflate
 import packkit/entry
 import packkit/error
+import packkit/internal/bcj
 import packkit/internal/lzma
 import packkit/limit
 
@@ -48,6 +49,41 @@ const lzma_coder_id_low: Int = 0x01
 const copy_coder_id: Int = 0x00
 
 const delta_coder_id: Int = 0x03
+
+// BCJ family coder ids (all 4 bytes, sharing the `0x03 0x03 0xNN
+// 0xMM` prefix that p7zip's source uses to namespace branch / call
+// converters).  The variant byte combinations come from
+// `CPP/7zip/Archive/7z/7zHandler.h` in p7zip: x86 = 03_03_01_03,
+// PPC = 03_03_02_05, IA-64 = 03_03_04_01, ARM = 03_03_05_01,
+// ARM-Thumb = 03_03_07_01, SPARC = 03_03_08_05.  We pattern-match
+// the 4-byte ids directly in `classify_coder_id`.
+const bcj_prefix_byte_0: Int = 0x03
+
+const bcj_prefix_byte_1: Int = 0x03
+
+const bcj_x86_byte_2: Int = 0x01
+
+const bcj_x86_byte_3: Int = 0x03
+
+const bcj_ppc_byte_2: Int = 0x02
+
+const bcj_ppc_byte_3: Int = 0x05
+
+const bcj_ia64_byte_2: Int = 0x04
+
+const bcj_ia64_byte_3: Int = 0x01
+
+const bcj_arm_byte_2: Int = 0x05
+
+const bcj_arm_byte_3: Int = 0x01
+
+const bcj_armt_byte_2: Int = 0x07
+
+const bcj_armt_byte_3: Int = 0x01
+
+const bcj_sparc_byte_2: Int = 0x08
+
+const bcj_sparc_byte_3: Int = 0x05
 
 const deflate_coder_id_high: Int = 0x04
 
@@ -666,6 +702,12 @@ type CoderId {
   Deflate
   BZip2
   Delta
+  BcjX86
+  BcjPpc
+  BcjIa64
+  BcjArm
+  BcjArmT
+  BcjSparc
 }
 
 // -- top-level header parser -------------------------------------------
@@ -1138,6 +1180,22 @@ fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) 
       && b2 == bzip2_coder_id_mid
       && b3 == bzip2_coder_id_low
     -> Ok(BZip2)
+    <<b1, b2, b3, b4>>
+      if b1 == bcj_prefix_byte_0 && b2 == bcj_prefix_byte_1
+    ->
+      case b3, b4 {
+        v3, v4 if v3 == bcj_x86_byte_2 && v4 == bcj_x86_byte_3 -> Ok(BcjX86)
+        v3, v4 if v3 == bcj_ppc_byte_2 && v4 == bcj_ppc_byte_3 -> Ok(BcjPpc)
+        v3, v4 if v3 == bcj_ia64_byte_2 && v4 == bcj_ia64_byte_3 -> Ok(BcjIa64)
+        v3, v4 if v3 == bcj_arm_byte_2 && v4 == bcj_arm_byte_3 -> Ok(BcjArm)
+        v3, v4 if v3 == bcj_armt_byte_2 && v4 == bcj_armt_byte_3 -> Ok(BcjArmT)
+        v3, v4 if v3 == bcj_sparc_byte_2 && v4 == bcj_sparc_byte_3 ->
+          Ok(BcjSparc)
+        _, _ ->
+          Error(error.ArchiveNotImplemented(
+            feature: "7z coder id " <> describe_bit_array_hex(id_bytes, ""),
+          ))
+      }
     _ ->
       Error(error.ArchiveNotImplemented(
         feature: "7z coder id " <> describe_bit_array_hex(id_bytes, ""),
@@ -1863,7 +1921,33 @@ fn dispatch_coder(
     Deflate -> decode_deflate_coder(packed, unpack_sizes, limits)
     BZip2 -> decode_bzip2_coder(packed, unpack_sizes, limits)
     Delta -> decode_delta_coder(packed, spec.properties, unpack_sizes)
+    BcjX86 -> decode_bcj_coder(packed, unpack_sizes, bcj.x86_decode, "x86")
+    BcjPpc ->
+      decode_bcj_coder(packed, unpack_sizes, bcj.powerpc_decode, "PowerPC")
+    BcjIa64 -> decode_bcj_coder(packed, unpack_sizes, bcj.ia64_decode, "IA-64")
+    BcjArm -> decode_bcj_coder(packed, unpack_sizes, bcj.arm_decode, "ARM")
+    BcjArmT ->
+      decode_bcj_coder(packed, unpack_sizes, bcj.armthumb_decode, "ARM-Thumb")
+    BcjSparc ->
+      decode_bcj_coder(packed, unpack_sizes, bcj.sparc_decode, "SPARC")
   }
+}
+
+// Every BCJ variant takes the same shape: a byte transform parameterised
+// by the architecture-specific decoder function, run with `now_pos = 0`
+// at every folder boundary (matching xz's per-block reset convention,
+// which the p7zip implementation also uses).  The folder's declared
+// unpack size is cross-checked afterwards so a corrupted upstream coder
+// can't silently feed a short buffer through.
+fn decode_bcj_coder(
+  packed: BitArray,
+  unpack_sizes: List(Int),
+  decoder: fn(BitArray, Int) -> BitArray,
+  arch_name: String,
+) -> Result(BitArray, error.ArchiveError) {
+  let target = folder_unpack_total(unpack_sizes)
+  let decoded = decoder(packed, 0)
+  verify_unpack_size(decoded, target, "BCJ " <> arch_name)
 }
 
 // The Delta filter records the byte distance over which to take the
