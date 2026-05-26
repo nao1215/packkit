@@ -12,12 +12,15 @@
 //// archive carries a `SubStreamsInfo` block — the parser reads the
 //// per-substream sizes from `kSize` (0x09), derives the final size
 //// from the folder's total, and splits the decoded stream
-//// accordingly.  Multi-coder folders, BCJ filters, multiple folders,
-//// encryption, and most encoded-header variants are intentionally
-//// rejected with typed `ArchiveNotImplemented` errors so the reader
-//// is easy to extend incrementally.  The encoder is unaffected —
-//// it still emits a single LZMA-coded folder regardless of which
-//// coders the decoder accepts.
+//// accordingly.  Multi-coder folders (BCJ filters in front of LZMA2,
+//// AES decryption in front of LZMA2), AES-256-CBC encryption with
+//// p7zip's SHA-256-based key derivation (`06 F1 07 01`), and multiple
+//// folders are supported.  Header encryption (`-mhe=on`, encrypts the
+//// next-header itself) is intentionally rejected with
+//// `ArchiveNotImplemented`.  AES-encrypted archives require the
+//// `decode_with_password` / `decode_with_password_and_limits` entry
+//// points.  The encoder is unaffected — it still emits a single
+//// LZMA-coded folder regardless of which coders the decoder accepts.
 
 import gleam/bit_array
 import gleam/bool
@@ -32,6 +35,7 @@ import packkit/checksum
 import packkit/deflate
 import packkit/entry
 import packkit/error
+import packkit/internal/aes
 import packkit/internal/bcj
 import packkit/internal/lzma
 import packkit/limit
@@ -96,6 +100,40 @@ const bzip2_coder_id_high: Int = 0x04
 const bzip2_coder_id_mid: Int = 0x02
 
 const bzip2_coder_id_low: Int = 0x02
+
+// 7z AES coder id (`06 F1 07 01`) — AES-256-CBC with the SHA-256-based
+// key derivation described in p7zip's `CPP/7zip/Crypto/7zAes.cpp`.
+const aes_coder_id_byte_0: Int = 0x06
+
+const aes_coder_id_byte_1: Int = 0xF1
+
+const aes_coder_id_byte_2: Int = 0x07
+
+const aes_coder_id_byte_3: Int = 0x01
+
+const aes_block_size: Int = 16
+
+// p7zip lays out the AES coder properties as:
+//   byte 0:  bits 0..5 = numCyclesPower, bit 6 = ivSize >= 1 flag,
+//            bit 7 = saltSize >= 1 flag
+//   byte 1 (only if either flag is set):
+//            high nibble = additional salt bytes, low nibble = additional
+//            iv bytes — the total salt / iv size is `(flag ? 1 : 0) +
+//            additional`.
+//   bytes 2.. : salt bytes followed immediately by iv bytes.
+const aes_num_cycles_mask: Int = 0x3F
+
+const aes_iv_flag_mask: Int = 0x40
+
+const aes_salt_flag_mask: Int = 0x80
+
+const aes_high_nibble_shift: Int = 4
+
+const aes_low_nibble_mask: Int = 0x0F
+
+// p7zip caps the per-second-byte "additional" salt + iv at one nibble
+// each, so 16 bytes total per field (1 flag bit + 15 nibble).
+const aes_max_field_bytes: Int = 16
 
 // NIDs from the 7z specification.
 const nid_end: Int = 0x00
@@ -665,7 +703,7 @@ fn int_pow(base: Int, exp: Int) -> Int {
 pub fn decode(
   bytes bytes: BitArray,
 ) -> Result(archives.Archive, error.ArchiveError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
+  decode_internal(bytes, option.None, limit.default())
 }
 
 /// Decode a 7z byte stream using explicit limits.  Enforces
@@ -676,6 +714,38 @@ pub fn decode(
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
+) -> Result(archives.Archive, error.ArchiveError) {
+  decode_internal(bytes, option.None, limits)
+}
+
+/// Decode a 7z byte stream that contains an AES-256 encrypted folder.
+/// `password` is applied to every AES-coded folder via the SHA-256
+/// key-derivation routine p7zip uses (`numCyclesPower` rounds of
+/// `sha256(salt || utf16le(password) || u64_le(counter))`); folders
+/// without an AES coder decode unchanged.  A wrong password produces
+/// garbage plaintext that the downstream coder (typically LZMA2)
+/// rejects with the usual typed `ArchiveInvalid` error — there's no
+/// authentication tag on the AES layer.
+pub fn decode_with_password(
+  bytes bytes: BitArray,
+  password password: String,
+) -> Result(archives.Archive, error.ArchiveError) {
+  decode_internal(bytes, option.Some(password), limit.default())
+}
+
+/// Same as `decode_with_password` but with explicit limits.
+pub fn decode_with_password_and_limits(
+  bytes bytes: BitArray,
+  password password: String,
+  limits limits: limit.Limits,
+) -> Result(archives.Archive, error.ArchiveError) {
+  decode_internal(bytes, option.Some(password), limits)
+}
+
+fn decode_internal(
+  bytes: BitArray,
+  password: Option(String),
+  limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
   use <- bool.guard(
     when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
@@ -706,7 +776,7 @@ pub fn decode_with_limits(
     _ -> Ok(next_header_bytes)
   })
   use parsed <- result.try(parse_header(header))
-  decode_archive(packed_streams, parsed, limits)
+  decode_archive(packed_streams, parsed, password, limits)
 }
 
 // -- encoded next header (NID 0x17) ------------------------------------
@@ -748,7 +818,12 @@ fn decode_encoded_header(
         pack_size,
         "7z encoded-header packed bytes",
       ))
-      decode_folder(packed, folder, unpack_sizes, limits)
+      // Encoded next-header decoding never carries a user password —
+      // header encryption (`-mhe=on`) is out of scope for now, and a
+      // legitimate non-encrypted encoded next-header is always
+      // LZMA-coded.  Threading `option.None` here keeps the AES branch
+      // unreachable on this path.
+      decode_folder(packed, folder, unpack_sizes, option.None, limits)
     }
   }
 }
@@ -846,6 +921,7 @@ type CoderId {
   BcjArm
   BcjArmT
   BcjSparc
+  Aes256Sha256
 }
 
 // -- top-level header parser -------------------------------------------
@@ -1365,6 +1441,12 @@ fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) 
       && b2 == bzip2_coder_id_mid
       && b3 == bzip2_coder_id_low
     -> Ok(BZip2)
+    <<b1, b2, b3, b4>>
+      if b1 == aes_coder_id_byte_0
+      && b2 == aes_coder_id_byte_1
+      && b3 == aes_coder_id_byte_2
+      && b4 == aes_coder_id_byte_3
+    -> Ok(Aes256Sha256)
     <<b1, b2, b3, b4>> if b1 == bcj_prefix_byte_0 && b2 == bcj_prefix_byte_1 ->
       case b3, b4 {
         v3, v4 if v3 == bcj_x86_byte_2 && v4 == bcj_x86_byte_3 -> Ok(BcjX86)
@@ -2011,6 +2093,7 @@ fn sum_list(values: List(Int), acc: Int) -> Int {
 fn decode_archive(
   packed: BitArray,
   parsed: ParsedHeader,
+  password: Option(String),
   limits: limit.Limits,
 ) -> Result(archives.Archive, error.ArchiveError) {
   let _ = parsed.pack_pos
@@ -2049,6 +2132,7 @@ fn decode_archive(
       parsed.folders,
       parsed.folder_unpack_sizes,
       parsed.pack_sizes,
+      password,
       limits,
       0,
       [],
@@ -2062,6 +2146,7 @@ fn decode_all_folders(
   folders: List(ParsedFolder),
   folder_unpack_sizes: List(List(Int)),
   pack_sizes: List(Int),
+  password: Option(String),
   limits: limit.Limits,
   pack_cursor: Int,
   acc: List(BitArray),
@@ -2082,6 +2167,7 @@ fn decode_all_folders(
         folder_packed,
         folder,
         unpack_sizes,
+        password,
         limits,
       ))
       decode_all_folders(
@@ -2089,6 +2175,7 @@ fn decode_all_folders(
         rest_folders,
         rest_unpack,
         rest_pack,
+        password,
         limits,
         pack_cursor + pack_size,
         [folder_plain, ..acc],
@@ -2117,10 +2204,11 @@ fn decode_folder(
   packed: BitArray,
   folder: ParsedFolder,
   unpack_sizes: List(Int),
+  password: Option(String),
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
   case folder.coders {
-    [single] -> dispatch_coder(packed, single, unpack_sizes, limits)
+    [single] -> dispatch_coder(packed, single, unpack_sizes, password, limits)
     [first, second] -> {
       // 2-coder linear chain: packed bytes feed `first`, its output
       // feeds `second`, and `second`'s output is the folder output.
@@ -2129,17 +2217,18 @@ fn decode_folder(
       // size (= the folder unpack total we use for substream
       // splitting).
       let #(first_unpack, final_unpack) = case unpack_sizes {
-        [a, b, ..] -> #(a, b)
-        [a] -> #(a, a)
+        [first_size, second_size, ..] -> #(first_size, second_size)
+        [only_size] -> #(only_size, only_size)
         [] -> #(0, 0)
       }
       use intermediate <- result.try(dispatch_coder(
         packed,
         first,
         [first_unpack],
+        password,
         limits,
       ))
-      dispatch_coder(intermediate, second, [final_unpack], limits)
+      dispatch_coder(intermediate, second, [final_unpack], password, limits)
     }
     _ ->
       Error(error.ArchiveInvalid(
@@ -2152,6 +2241,7 @@ fn dispatch_coder(
   packed: BitArray,
   spec: CoderSpec,
   unpack_sizes: List(Int),
+  password: Option(String),
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
   case spec.id {
@@ -2170,6 +2260,8 @@ fn dispatch_coder(
       decode_bcj_coder(packed, unpack_sizes, bcj.armthumb_decode, "ARM-Thumb")
     BcjSparc ->
       decode_bcj_coder(packed, unpack_sizes, bcj.sparc_decode, "SPARC")
+    Aes256Sha256 ->
+      decode_aes_coder(packed, spec.properties, unpack_sizes, password)
   }
 }
 
@@ -2261,6 +2353,285 @@ fn nth_back(values: List(Int), steps: Int) -> Int {
     [head, ..], 0 -> head
     [_, ..tail], _ -> nth_back(tail, steps - 1)
     [], _ -> 0
+  }
+}
+
+// -- 7z AES coder (id `06 F1 07 01`) ----------------------------------
+//
+// AES filter in the 7z folder chain: the packed bytes feed AES-CBC
+// (decrypt) under a SHA-256-derived 32-byte key, and the plaintext
+// output feeds the next coder in the chain (typically LZMA2).  There
+// is no MAC, so a wrong password surfaces as a decode error from the
+// downstream coder rather than as a typed error here.
+
+type AesProperties {
+  AesProperties(num_cycles_power: Int, salt: BitArray, iv: BitArray)
+}
+
+fn flag_to_int(flag: Bool) -> Int {
+  case flag {
+    True -> 1
+    False -> 0
+  }
+}
+
+fn decode_aes_coder(
+  packed: BitArray,
+  properties: BitArray,
+  unpack_sizes: List(Int),
+  password: Option(String),
+) -> Result(BitArray, error.ArchiveError) {
+  use password_value <- result.try(case password {
+    option.Some(value) -> Ok(value)
+    option.None ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES folder requires a password — call decode_with_password",
+      ))
+  })
+  use props <- result.try(parse_aes_properties(properties))
+  use key <- result.try(derive_aes_key(
+    password: password_value,
+    salt: props.salt,
+    num_cycles_power: props.num_cycles_power,
+  ))
+  use plaintext <- result.try(aes_cbc_decrypt(packed, key, props.iv))
+  // The upstream coder declares the post-decrypt byte count.  CBC
+  // output equals ciphertext length, but the *useful* bytes for the
+  // next coder are the declared `unpack_sizes` total (the trailing
+  // padding is what AES added on the encrypt side to round up to a
+  // 16-byte block).
+  let target = folder_unpack_total(unpack_sizes)
+  let plaintext_size = bit_array.byte_size(plaintext)
+  use <- bool.guard(
+    when: plaintext_size < target,
+    return: Error(error.ArchiveInvalid(
+      message: "7z AES decrypted "
+      <> int.to_string(plaintext_size)
+      <> " bytes < declared "
+      <> int.to_string(target),
+    )),
+  )
+  bit_array.slice(plaintext, 0, target)
+  |> result.replace_error(error.ArchiveInvalid(
+    message: "7z AES decrypted slice failed",
+  ))
+}
+
+fn parse_aes_properties(
+  properties: BitArray,
+) -> Result(AesProperties, error.ArchiveError) {
+  case properties {
+    <<first_byte, rest:bytes>> -> {
+      let num_cycles_power = int.bitwise_and(first_byte, aes_num_cycles_mask)
+      let iv_flag = int.bitwise_and(first_byte, aes_iv_flag_mask) != 0
+      let salt_flag = int.bitwise_and(first_byte, aes_salt_flag_mask) != 0
+      use <- bool.guard(
+        when: !salt_flag && !iv_flag,
+        return: Ok(AesProperties(num_cycles_power:, salt: <<>>, iv: <<>>)),
+      )
+      parse_aes_field_sizes(rest, num_cycles_power, salt_flag, iv_flag)
+    }
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES coder properties are empty or non-byte-aligned",
+      ))
+  }
+}
+
+fn parse_aes_field_sizes(
+  after_first_byte: BitArray,
+  num_cycles_power: Int,
+  salt_flag: Bool,
+  iv_flag: Bool,
+) -> Result(AesProperties, error.ArchiveError) {
+  case after_first_byte {
+    <<second_byte, after_second:bytes>> -> {
+      let salt_base = flag_to_int(salt_flag)
+      let iv_base = flag_to_int(iv_flag)
+      let salt_size =
+        salt_base + int.bitwise_shift_right(second_byte, aes_high_nibble_shift)
+      let iv_size = iv_base + int.bitwise_and(second_byte, aes_low_nibble_mask)
+      use <- bool.guard(
+        when: salt_size > aes_max_field_bytes || iv_size > aes_max_field_bytes,
+        return: Error(error.ArchiveInvalid(
+          message: "7z AES salt or iv size exceeds 16 bytes",
+        )),
+      )
+      use salt <- result.try(
+        bit_array.slice(after_second, 0, salt_size)
+        |> result.replace_error(error.ArchiveInvalid(
+          message: "7z AES salt slice failed",
+        )),
+      )
+      use iv <- result.try(
+        bit_array.slice(after_second, salt_size, iv_size)
+        |> result.replace_error(error.ArchiveInvalid(
+          message: "7z AES iv slice failed",
+        )),
+      )
+      Ok(AesProperties(num_cycles_power:, salt:, iv:))
+    }
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES coder properties truncated before salt/iv sizes",
+      ))
+  }
+}
+
+// Derive a 32-byte AES-256 key per p7zip's `CKeyInfo::CalcKey` in
+// `CPP/7zip/Crypto/7zAes.cpp`: feed
+//   salt || utf16le(password) || u64_le(counter)
+// into one SHA-256 context for `2 ^ num_cycles_power` iterations, then
+// the digest is the key.  numCyclesPower == 0x3F (63) is a documented
+// "use SHA256(salt || password) directly" escape hatch; not observed
+// in archives produced by p7zip's `7z a`, so reject it for now.
+fn derive_aes_key(
+  password password: String,
+  salt salt: BitArray,
+  num_cycles_power num_cycles_power: Int,
+) -> Result(aes.ExpandedKey, error.ArchiveError) {
+  use <- bool.guard(
+    when: num_cycles_power == aes_num_cycles_mask,
+    return: Error(error.ArchiveNotImplemented(
+      feature: "7z AES numCyclesPower 0x3F (direct SHA-256 mode)",
+    )),
+  )
+  let password_utf16le = utf16le_encode(password, <<>>)
+  let rounds = int.bitwise_shift_left(1, num_cycles_power)
+  let initial = checksum.sha256_init()
+  let final_state = aes_kdf_loop(initial, salt, password_utf16le, 0, rounds)
+  let digest = checksum.sha256_finalize(state: final_state)
+  case aes.expand_key(digest) {
+    Ok(expanded) -> Ok(expanded)
+    Error(Nil) ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES key expansion rejected the derived 32-byte digest",
+      ))
+  }
+}
+
+fn aes_kdf_loop(
+  state: checksum.Sha256State,
+  salt: BitArray,
+  password_utf16le: BitArray,
+  counter: Int,
+  rounds: Int,
+) -> checksum.Sha256State {
+  use <- bool.guard(when: counter == rounds, return: state)
+  let counter_bytes = <<counter:little-size(64)>>
+  let next_state =
+    state
+    |> checksum.sha256_update(data: salt)
+    |> checksum.sha256_update(data: password_utf16le)
+    |> checksum.sha256_update(data: counter_bytes)
+  aes_kdf_loop(next_state, salt, password_utf16le, counter + 1, rounds)
+}
+
+// p7zip encodes the password as little-endian UTF-16 (the historical
+// Windows-only encoding 7z grew up with).  We use `string.to_utf_codepoints`
+// to walk the source codepoints and emit 16-bit code units per UTF-16
+// surrogate rules: BMP scalars below 0x10000 emit one little-endian
+// code unit, scalars from 0x10000..0x10FFFF emit a surrogate pair.
+fn utf16le_encode(source: String, acc: BitArray) -> BitArray {
+  case string.pop_grapheme(source) {
+    Error(_) -> acc
+    Ok(#(grapheme, rest)) ->
+      utf16le_encode(rest, utf16le_append_grapheme(grapheme, acc))
+  }
+}
+
+fn utf16le_append_grapheme(grapheme: String, acc: BitArray) -> BitArray {
+  string.to_utf_codepoints(grapheme)
+  |> list.fold(acc, fn(running, codepoint) {
+    utf16le_append_codepoint(string.utf_codepoint_to_int(codepoint), running)
+  })
+}
+
+fn utf16le_append_codepoint(scalar: Int, acc: BitArray) -> BitArray {
+  use <- bool.guard(when: scalar < 0x10000, return: <<
+    acc:bits,
+    scalar:little-size(16),
+  >>)
+  let adjusted = scalar - 0x10000
+  let high = 0xD800 + int.bitwise_shift_right(adjusted, 10)
+  let low = 0xDC00 + int.bitwise_and(adjusted, 0x3FF)
+  <<acc:bits, high:little-size(16), low:little-size(16)>>
+}
+
+// AES-CBC decryption: split `ciphertext` into 16-byte blocks, decrypt
+// each one with `key`, then XOR the result with the previous
+// ciphertext block (or `iv` for the first).  Ciphertext lengths that
+// aren't a multiple of 16 are rejected — 7z always pads.
+fn aes_cbc_decrypt(
+  ciphertext: BitArray,
+  key: aes.ExpandedKey,
+  iv: BitArray,
+) -> Result(BitArray, error.ArchiveError) {
+  let size = bit_array.byte_size(ciphertext)
+  case int.bitwise_and(size, aes_block_size - 1) {
+    0 -> aes_cbc_decrypt_loop(ciphertext, key, iv_or_zero(iv), <<>>)
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES ciphertext length "
+        <> int.to_string(size)
+        <> " is not a multiple of 16",
+      ))
+  }
+}
+
+fn iv_or_zero(iv: BitArray) -> BitArray {
+  let iv_size = bit_array.byte_size(iv)
+  case iv_size {
+    16 -> iv
+    size if size < 16 -> <<iv:bits, 0:size({ { 16 - size } * 8 })>>
+    _ ->
+      // The properties parser caps `iv` at 16 bytes, so this arm only
+      // exists to keep the case total — truncate just in case.
+      bit_array.slice(iv, 0, 16) |> result.unwrap(or: <<0:size(128)>>)
+  }
+}
+
+fn aes_cbc_decrypt_loop(
+  ciphertext: BitArray,
+  key: aes.ExpandedKey,
+  prev_block: BitArray,
+  acc: BitArray,
+) -> Result(BitArray, error.ArchiveError) {
+  case ciphertext {
+    <<>> -> Ok(acc)
+    <<block:bytes-size(16), rest:bytes>> -> {
+      use decrypted <- result.try(
+        aes.decrypt_block(key, block)
+        |> result.replace_error(error.ArchiveInvalid(
+          message: "7z AES decrypt_block rejected a 16-byte ciphertext block",
+        )),
+      )
+      let plaintext_block = xor_bit_arrays(decrypted, prev_block)
+      aes_cbc_decrypt_loop(rest, key, block, <<acc:bits, plaintext_block:bits>>)
+    }
+    _ ->
+      Error(error.ArchiveInvalid(
+        message: "7z AES ciphertext tail shorter than 16 bytes",
+      ))
+  }
+}
+
+fn xor_bit_arrays(left: BitArray, right: BitArray) -> BitArray {
+  xor_bit_arrays_loop(left, right, <<>>)
+}
+
+fn xor_bit_arrays_loop(
+  left: BitArray,
+  right: BitArray,
+  acc: BitArray,
+) -> BitArray {
+  case left, right {
+    <<left_byte, left_rest:bytes>>, <<right_byte, right_rest:bytes>> ->
+      xor_bit_arrays_loop(left_rest, right_rest, <<
+        acc:bits,
+        int.bitwise_exclusive_or(left_byte, right_byte),
+      >>)
+    _, _ -> acc
   }
 }
 
