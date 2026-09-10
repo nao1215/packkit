@@ -7,6 +7,8 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+## [0.2.0] - 2026-09-10
+
 ### Changed
 
 - The minimum Gleam version is now 1.14.0 (was 1.15.0). 1.14.0 builds and tests the package unchanged on both targets, and `gleam_stdlib` 1.0 already requires it. CI tests that floor alongside the latest Gleam 1.x.

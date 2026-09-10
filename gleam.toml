@@ -1,5 +1,5 @@
 name = "packkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Archive, compression, and recipe planning primitives for Gleam on Erlang and JavaScript targets"
 licences = ["MIT"]
 repository = { type = "github", user = "nao1215", repo = "packkit" }
