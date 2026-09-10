@@ -223,7 +223,10 @@ pub fn extra(header: Header) -> List(Subfield) {
 /// Attach a list of FEXTRA subfields.  Out-of-range IDs or
 /// overlong bodies panic; use [with_extra_checked] when the caller
 /// has not pre-validated the values.
-pub fn with_extra(header: Header, subfields subfields: List(Subfield)) -> Header {
+pub fn with_extra(
+  header: Header,
+  subfields subfields: List(Subfield),
+) -> Header {
   case with_extra_checked(header, subfields: subfields) {
     Ok(h) -> h
     Error(HeaderExtraSubfieldIdOutOfRange(_, _)) ->
@@ -371,7 +374,10 @@ fn encode_extra_block(subfields: List(Subfield)) -> BitArray {
   }
 }
 
-fn encode_extra_subfields(subfields: List(Subfield), acc: BitArray) -> BitArray {
+fn encode_extra_subfields(
+  subfields: List(Subfield),
+  acc: BitArray,
+) -> BitArray {
   case subfields {
     [] -> acc
     [Subfield(id_1: id_1, id_2: id_2, data: data), ..rest] -> {

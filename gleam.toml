@@ -12,7 +12,7 @@ internal_modules = [
   "packkit/internal",
   "packkit/internal/*",
 ]
-gleam = ">= 1.15.0"
+gleam = ">= 1.14.0"
 
 [dependencies]
 gleam_stdlib = ">= 0.44.0 and < 2.0.0"

@@ -236,9 +236,15 @@ pub fn encode_with_header_encryption_emits_nid_17_test() -> Nil {
 
   // Signature header bytes 12..19 hold the little-endian 64-bit
   // offset of the next header from the end of the signature header.
-  let assert <<_:bytes-size(12), next_offset:little-size(64), _:bytes>> =
-    encoded
-  let next_header_start = 32 + next_offset
+  // Read as two 32-bit halves so the pattern also compiles without
+  // truncation on JavaScript.
+  let assert <<
+    _:bytes-size(12),
+    offset_low:little-size(32),
+    offset_high:little-size(32),
+    _:bytes,
+  >> = encoded
+  let next_header_start = 32 + offset_high * 4_294_967_296 + offset_low
   // Skip to that offset and read the first byte — it must be 0x17.
   let assert <<_:bytes-size(next_header_start), first_byte, _:bytes>> = encoded
   first_byte |> should.equal(0x17)

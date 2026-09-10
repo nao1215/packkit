@@ -130,7 +130,10 @@ fn rcon_byte(round: Int) -> Int {
 /// 16-byte ciphertext block.  Input shorter or longer than 16 bytes
 /// is an error — `Error(Nil)` rather than a panic so callers in tight
 /// loops can branch cleanly.
-pub fn encrypt_block(key: ExpandedKey, block: BitArray) -> Result(BitArray, Nil) {
+pub fn encrypt_block(
+  key: ExpandedKey,
+  block: BitArray,
+) -> Result(BitArray, Nil) {
   case bit_array.byte_size(block) {
     16 -> {
       let state = bit_array_to_u32_words(block, [])
@@ -260,7 +263,10 @@ fn gmul3(value: Int) -> Int {
 /// The same `ExpandedKey` schedule produced by `expand_key` is
 /// consumed in reverse order (FIPS 197 §5.3).  Input shorter or
 /// longer than 16 bytes is rejected with `Error(Nil)`.
-pub fn decrypt_block(key: ExpandedKey, block: BitArray) -> Result(BitArray, Nil) {
+pub fn decrypt_block(
+  key: ExpandedKey,
+  block: BitArray,
+) -> Result(BitArray, Nil) {
   case bit_array.byte_size(block) {
     16 -> {
       let state = bit_array_to_u32_words(block, [])

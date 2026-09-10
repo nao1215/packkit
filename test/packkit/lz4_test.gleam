@@ -110,14 +110,18 @@ pub fn encoder_with_content_size_sets_flag_and_field_test() -> Nil {
 
   // Frame magic is at offset 0..4, FLG at offset 4, content size
   // begins at offset 6, HC byte at offset 14.
+  // The 64-bit content size is read as two 32-bit halves so the
+  // pattern also compiles without truncation on JavaScript.
   let assert <<
     _magic:size(32)-little,
     flg,
     _bd,
-    csize:size(64)-little,
+    csize_low:size(32)-little,
+    csize_high:size(32)-little,
     _hc,
     _rest:bytes,
   >> = frame
+  let csize = csize_high * 4_294_967_296 + csize_low
 
   // FLG must have version v1 and content_size flag set.
   case int.bitwise_and(flg, 0x08) {

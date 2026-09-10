@@ -340,7 +340,10 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
 
 const newc_field_max: Int = 0xFFFFFFFF
 
-fn check_hex_field(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
+fn check_hex_field(
+  value: Int,
+  field: String,
+) -> Result(Nil, error.ArchiveError) {
   case value < 0 || value > newc_field_max {
     True ->
       Error(error.ArchiveFieldOverflow(

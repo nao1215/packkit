@@ -418,7 +418,11 @@ fn read_unary(
   }
 }
 
-fn pick_at(stack: List(Int), index: Int, prefix: List(Int)) -> #(Int, List(Int)) {
+fn pick_at(
+  stack: List(Int),
+  index: Int,
+  prefix: List(Int),
+) -> #(Int, List(Int)) {
   case stack, index {
     [head, ..rest], 0 -> #(head, list.append(list.reverse(prefix), rest))
     [head, ..rest], _ -> pick_at(rest, index - 1, [head, ..prefix])
@@ -1271,7 +1275,12 @@ fn rle1_encode(bytes: BitArray) -> List(Int) {
   rle1_loop(bytes, -1, 0, [])
 }
 
-fn rle1_loop(bytes: BitArray, last: Int, run: Int, acc: List(Int)) -> List(Int) {
+fn rle1_loop(
+  bytes: BitArray,
+  last: Int,
+  run: Int,
+  acc: List(Int),
+) -> List(Int) {
   case bytes {
     <<b, rest:bytes>> ->
       case b == last {

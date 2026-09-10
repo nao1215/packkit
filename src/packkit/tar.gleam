@@ -279,7 +279,10 @@ fn dispatch_typeflag(
   }
 }
 
-fn apply_pending(header: ParsedHeader, pending: PendingOverride) -> ParsedHeader {
+fn apply_pending(
+  header: ParsedHeader,
+  pending: PendingOverride,
+) -> ParsedHeader {
   let name = case pending.name {
     "" -> header.name
     n -> n
