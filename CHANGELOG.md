@@ -12,6 +12,10 @@ The `Unreleased` section is the staging area for post-release changes
 - The minimum Gleam version is now 1.14.0 (was 1.15.0). 1.14.0 builds and tests the package unchanged on both targets, and `gleam_stdlib` 1.0 already requires it. CI tests that floor alongside the latest Gleam 1.x.
 - 64-bit little-endian fields in ZIP (Zip64 sizes and offsets, 8-byte Info-ZIP uid/gid) and 7z (entry mtime) are now read as two 32-bit halves. Results on Erlang are unchanged; on JavaScript this removes the compiler's truncation warning for 64-bit integer segments.
 
+### Fixed
+
+- The doc comments of `limit.with_max_members` and `limit.with_max_entry_depth` now point to the clamp-to-1 contract of `limit.with_max_input_bytes`, like the other unchecked setters.
+
 ## [0.1.0] - 2026-05-26
 
 Initial public release.  The bullets below are the entire change history
