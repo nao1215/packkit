@@ -188,12 +188,14 @@ pub fn with_max_output_bytes(limits: Limits, bytes bytes: Int) -> Limits {
   Limits(..limits, max_output_bytes: clamp_positive(bytes))
 }
 
-/// Unchecked setter for `max_members`.
+/// Unchecked setter for `max_members`.  See [with_max_input_bytes] for
+/// the contract.
 pub fn with_max_members(limits: Limits, count count: Int) -> Limits {
   Limits(..limits, max_members: clamp_positive(count))
 }
 
-/// Unchecked setter for `max_entry_depth`.
+/// Unchecked setter for `max_entry_depth`.  See [with_max_input_bytes]
+/// for the contract.
 pub fn with_max_entry_depth(limits: Limits, depth depth: Int) -> Limits {
   Limits(..limits, max_entry_depth: clamp_positive(depth))
 }
