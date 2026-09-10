@@ -64,7 +64,10 @@ fn encode_stream_header() -> BitArray {
   ])
 }
 
-fn encode_block_header(compressed_size: Int, uncompressed_size: Int) -> BitArray {
+fn encode_block_header(
+  compressed_size: Int,
+  uncompressed_size: Int,
+) -> BitArray {
   // Block_Flags = 0xC0: 1 filter, both sizes present.  Compressed size
   // = `compressed_size` (the LZMA2 byte stream we just emitted).
   // Filter: LZMA2 (id 0x21) with a 1-byte properties value of 0x16

@@ -2173,7 +2173,9 @@ fn parse_one_coder(
   }
 }
 
-fn classify_coder_id(id_bytes: BitArray) -> Result(CoderId, error.ArchiveError) {
+fn classify_coder_id(
+  id_bytes: BitArray,
+) -> Result(CoderId, error.ArchiveError) {
   case id_bytes {
     <<b>> if b == copy_coder_id -> Ok(Copy)
     <<b>> if b == lzma2_coder_id -> Ok(Lzma2)
@@ -2535,8 +2537,10 @@ fn read_mtime_filetimes(
     [False, ..rest] -> read_mtime_filetimes(payload, rest, [option.None, ..acc])
     [True, ..rest] ->
       case payload {
-        <<filetime:little-size(64), tail:bytes>> -> {
-          let unix_seconds = filetime_to_unix(filetime)
+        // Read the 64-bit FILETIME as two 32-bit halves: a single 64-bit
+        // integer segment is truncated on the JavaScript target.
+        <<low:little-size(32), high:little-size(32), tail:bytes>> -> {
+          let unix_seconds = filetime_to_unix(high * 4_294_967_296 + low)
           let safe = case unix_seconds < 0 {
             True -> 0
             False -> unix_seconds
@@ -2555,7 +2559,11 @@ fn dummy_names(count: Int) -> List(String) {
   build_dummy_names(count, 0, [])
 }
 
-fn build_dummy_names(count: Int, index: Int, acc: List(String)) -> List(String) {
+fn build_dummy_names(
+  count: Int,
+  index: Int,
+  acc: List(String),
+) -> List(String) {
   case index >= count {
     True -> list.reverse(acc)
     False ->
@@ -3282,7 +3290,10 @@ fn delta_decode_seven_z(bytes: BitArray, distance: Int) -> BitArray {
   byte_list_to_bit_array_seven_z(decoded, <<>>)
 }
 
-fn bit_array_to_byte_list_seven_z(bytes: BitArray, acc: List(Int)) -> List(Int) {
+fn bit_array_to_byte_list_seven_z(
+  bytes: BitArray,
+  acc: List(Int),
+) -> List(Int) {
   case bytes {
     <<b, rest:bytes>> -> bit_array_to_byte_list_seven_z(rest, [b, ..acc])
     _ -> list.reverse(acc)
@@ -3492,7 +3503,10 @@ fn derive_aes_key_hashed(
   checksum.sha256_finalize(state: final_state)
 }
 
-fn derive_aes_key_direct(salt: BitArray, password_utf16le: BitArray) -> BitArray {
+fn derive_aes_key_direct(
+  salt: BitArray,
+  password_utf16le: BitArray,
+) -> BitArray {
   // p7zip pseudo-code: copy salt, then password, then zero-fill — all
   // truncated to 32 bytes.  We build the concatenation upfront, pad on
   // the right with 32 zero bytes (always enough), and slice the first
@@ -4213,7 +4227,9 @@ fn slice_required(
   }
 }
 
-fn read_number(bytes: BitArray) -> Result(#(Int, BitArray), error.ArchiveError) {
+fn read_number(
+  bytes: BitArray,
+) -> Result(#(Int, BitArray), error.ArchiveError) {
   case bytes {
     <<first, rest:bytes>> -> read_number_body(first, rest, 0x80, 0, 0)
     _ -> Error(error.ArchiveInvalid(message: "truncated 7z varint"))

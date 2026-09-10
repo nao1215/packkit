@@ -1283,11 +1283,7 @@ fn distance_code(distance: Int) -> #(Int, Int, Int) {
     n if n >= 65 && n <= 128 -> #(12 + { n - 65 } / 32, 5, { n - 65 } % 32)
     n if n >= 129 && n <= 256 -> #(14 + { n - 129 } / 64, 6, { n - 129 } % 64)
     n if n >= 257 && n <= 512 -> #(16 + { n - 257 } / 128, 7, { n - 257 } % 128)
-    n if n >= 513 && n <= 1024 -> #(
-      18 + { n - 513 } / 256,
-      8,
-      { n - 513 } % 256,
-    )
+    n if n >= 513 && n <= 1024 -> #(18 + { n - 513 } / 256, 8, { n - 513 } % 256)
     n if n >= 1025 && n <= 2048 -> #(
       20 + { n - 1025 } / 512,
       9,
@@ -1757,7 +1753,10 @@ fn list_max(pairs: List(#(Int, Int)), best: Int) -> Int {
   }
 }
 
-fn make_length_vector(alphabet_size: Int, pairs: List(#(Int, Int))) -> List(Int) {
+fn make_length_vector(
+  alphabet_size: Int,
+  pairs: List(#(Int, Int)),
+) -> List(Int) {
   let lookup = dict.from_list(pairs)
   make_length_vector_loop(alphabet_size, 0, lookup, [])
 }

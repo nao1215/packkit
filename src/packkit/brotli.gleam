@@ -621,7 +621,10 @@ fn trim_trailing_zeros(lengths: List(Int)) -> List(Int) {
   trim_trailing_zeros_loop(list.reverse(lengths), [])
 }
 
-fn trim_trailing_zeros_loop(rev_lengths: List(Int), acc: List(Int)) -> List(Int) {
+fn trim_trailing_zeros_loop(
+  rev_lengths: List(Int),
+  acc: List(Int),
+) -> List(Int) {
   case rev_lengths, acc {
     [], _ -> acc
     [0, ..rest], [] -> trim_trailing_zeros_loop(rest, [])
@@ -1201,7 +1204,10 @@ type BrCommand {
   BrCommand(insert_len: Int, copy_len: Int, distance: Int)
 }
 
-fn build_lz77_compressed_stream(bytes: BitArray, total: Int) -> Option(BitArray) {
+fn build_lz77_compressed_stream(
+  bytes: BitArray,
+  total: Int,
+) -> Option(BitArray) {
   use <- bool.guard(
     when: total > 65_536 || total < lz77_min_match,
     return: None,
@@ -2659,7 +2665,12 @@ fn dictionary_copy(
 /// `output[pos - distance]` and appending it, then incrementing pos.
 /// Works correctly for `distance < count` because each emitted byte
 /// updates the source.
-fn lz77_copy(output: BitArray, distance: Int, count: Int, pos: Int) -> BitArray {
+fn lz77_copy(
+  output: BitArray,
+  distance: Int,
+  count: Int,
+  pos: Int,
+) -> BitArray {
   case count {
     0 -> output
     _ -> {
@@ -3278,7 +3289,11 @@ fn init_mtf(n: Int, acc: List(Int)) -> List(Int) {
   }
 }
 
-fn imtf_loop(input: List(Int), table: List(Int), output: List(Int)) -> List(Int) {
+fn imtf_loop(
+  input: List(Int),
+  table: List(Int),
+  output: List(Int),
+) -> List(Int) {
   case input {
     [] -> list.reverse(output)
     [idx, ..rest] -> {

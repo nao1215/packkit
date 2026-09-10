@@ -1108,7 +1108,8 @@ fn decode_unix_uid_gid_value(
     1, <<value, rest:bytes>> -> Some(#(value, rest))
     2, <<value:little-size(16), rest:bytes>> -> Some(#(value, rest))
     4, <<value:little-size(32), rest:bytes>> -> Some(#(value, rest))
-    8, <<value:little-size(64), rest:bytes>> -> Some(#(value, rest))
+    8, <<low:little-size(32), high:little-size(32), rest:bytes>> ->
+      Some(#(join_le64(low:, high:), rest))
     _, _ -> None
   }
 }
@@ -2349,14 +2350,20 @@ fn le32(value: Int) -> BitArray {
   <<value:size(32)-little>>
 }
 
-fn read_le16_at(bytes: BitArray, offset: Int) -> Result(Int, error.ArchiveError) {
+fn read_le16_at(
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Int, error.ArchiveError) {
   case bit_array.slice(bytes, offset, 2) {
     Ok(<<value:size(16)-little>>) -> Ok(value)
     _ -> Error(error.ArchiveInvalid(message: "short read for 16-bit value"))
   }
 }
 
-fn read_le32_at(bytes: BitArray, offset: Int) -> Result(Int, error.ArchiveError) {
+fn read_le32_at(
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Int, error.ArchiveError) {
   case bit_array.slice(bytes, offset, 4) {
     Ok(<<value:size(32)-little>>) -> Ok(value)
     _ -> Error(error.ArchiveInvalid(message: "short read for 32-bit value"))
@@ -2370,11 +2377,22 @@ fn read_le32(bytes: BitArray) -> Result(Int, error.ArchiveError) {
   }
 }
 
-fn read_le64_at(bytes: BitArray, offset: Int) -> Result(Int, error.ArchiveError) {
+fn read_le64_at(
+  bytes: BitArray,
+  offset: Int,
+) -> Result(Int, error.ArchiveError) {
   case bit_array.slice(bytes, offset, 8) {
-    Ok(<<value:size(64)-little>>) -> Ok(value)
+    Ok(<<low:size(32)-little, high:size(32)-little>>) ->
+      Ok(join_le64(low:, high:))
     _ -> Error(error.ArchiveInvalid(message: "short read for 64-bit value"))
   }
+}
+
+/// Combine the halves of a little-endian 64-bit field. The field is read
+/// as two 32-bit segments because a single 64-bit integer segment is
+/// truncated on the JavaScript target; on Erlang the result is identical.
+fn join_le64(low low: Int, high high: Int) -> Int {
+  high * 4_294_967_296 + low
 }
 
 fn le64(value: Int) -> BitArray {
@@ -2460,7 +2478,8 @@ fn maybe_read_le64(
     False -> Ok(#(None, payload))
     True ->
       case payload {
-        <<value:size(64)-little, rest:bytes>> -> Ok(#(Some(value), rest))
+        <<low:size(32)-little, high:size(32)-little, rest:bytes>> ->
+          Ok(#(Some(join_le64(low:, high:)), rest))
         _ -> Error(error.ArchiveInvalid(message: "Zip64 extra field truncated"))
       }
   }

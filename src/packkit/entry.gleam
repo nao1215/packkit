@@ -328,8 +328,7 @@ pub fn with_owner(
 ) -> Entry {
   case with_owner_checked(entry, user_id: user_id, group_id: group_id) {
     Ok(e) -> e
-    Error(_) ->
-      panic as "packkit/entry.with_owner: uid/gid must be non-negative"
+    Error(_) -> panic as "packkit/entry.with_owner: uid/gid must be non-negative"
   }
 }
 

@@ -1642,7 +1642,11 @@ fn encode_lzma_length(
   }
 }
 
-fn encode_lzma_distance(encoder: Encoder, distance: Int, length: Int) -> Encoder {
+fn encode_lzma_distance(
+  encoder: Encoder,
+  distance: Int,
+  length: Int,
+) -> Encoder {
   let len_state = case length - match_min_len < num_len_to_pos_states {
     True -> length - match_min_len
     False -> num_len_to_pos_states - 1

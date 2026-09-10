@@ -226,7 +226,12 @@ fn place_one_symbol(
   }
 }
 
-fn advance_cursor(cursor: Int, mask: Int, step: Int, high_threshold: Int) -> Int {
+fn advance_cursor(
+  cursor: Int,
+  mask: Int,
+  step: Int,
+  high_threshold: Int,
+) -> Int {
   let next = int.bitwise_and(cursor + step, mask)
   case next > high_threshold {
     True -> advance_cursor(next, mask, step, high_threshold)
@@ -326,7 +331,9 @@ pub opaque type BackwardReader {
 /// Create a backward bit reader from the raw bitstream bytes.  The
 /// last byte must contain at least one set bit (the marker); all
 /// bits above the marker are padding and are skipped.
-pub fn new_backward_reader(bytes: BitArray) -> Result(BackwardReader, FseError) {
+pub fn new_backward_reader(
+  bytes: BitArray,
+) -> Result(BackwardReader, FseError) {
   let bytes_rev = bytes_to_reverse_list(bytes, [])
   case bytes_rev {
     [] -> Error(FseEmptyBitstream)

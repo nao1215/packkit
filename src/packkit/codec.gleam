@@ -110,7 +110,10 @@ pub fn clear_level(codec: Codec) -> Codec {
 }
 
 /// Attach a preset dictionary.
-pub fn with_dictionary(codec: Codec, dictionary dictionary: Dictionary) -> Codec {
+pub fn with_dictionary(
+  codec: Codec,
+  dictionary dictionary: Dictionary,
+) -> Codec {
   Codec(..codec, dictionary: Some(dictionary))
 }
 

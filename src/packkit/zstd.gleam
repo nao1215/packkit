@@ -188,7 +188,11 @@ fn emit_raw_blocks_loop(
 /// literals ARE the output — no LZ77, no sequences.  Picking the
 /// smallest of the three keeps the encoder strictly non-regressing on
 /// uncompressible payloads.
-fn pick_best_block(chunk: BitArray, chunk_size: Int, is_last: Bool) -> BitArray {
+fn pick_best_block(
+  chunk: BitArray,
+  chunk_size: Int,
+  is_last: Bool,
+) -> BitArray {
   let raw_block =
     bit_array.concat([
       block_header(chunk_size, 0, is_last),
@@ -493,7 +497,10 @@ fn count_byte_frequencies(chunk: BitArray) -> List(#(Int, Int)) {
   count_freqs_to_list(table, 0, [])
 }
 
-fn empty_freq_dict(symbol: Int, acc: dict.Dict(Int, Int)) -> dict.Dict(Int, Int) {
+fn empty_freq_dict(
+  symbol: Int,
+  acc: dict.Dict(Int, Int),
+) -> dict.Dict(Int, Int) {
   case symbol {
     256 -> acc
     _ -> empty_freq_dict(symbol + 1, dict.insert(acc, symbol, 0))
@@ -703,7 +710,10 @@ fn max_length_in_list(lengths: List(Int), acc: Int) -> Int {
   }
 }
 
-fn trim_trailing_zero_weights(reversed: List(Int), acc: List(Int)) -> List(Int) {
+fn trim_trailing_zero_weights(
+  reversed: List(Int),
+  acc: List(Int),
+) -> List(Int) {
   case reversed, acc {
     [], _ -> acc
     [0, ..rest], [] -> trim_trailing_zero_weights(rest, [])
@@ -782,7 +792,11 @@ fn emit_codes_reverse(
   }
 }
 
-fn flush_full_bytes(buf: Int, bits: Int, out: BitArray) -> #(Int, Int, BitArray) {
+fn flush_full_bytes(
+  buf: Int,
+  bits: Int,
+  out: BitArray,
+) -> #(Int, Int, BitArray) {
   case bits >= 8 {
     True -> {
       let byte = int.bitwise_and(buf, 0xFF)
@@ -2718,7 +2732,9 @@ fn parse_frame_descriptor(
   }
 }
 
-fn skip_window_descriptor(bytes: BitArray) -> Result(BitArray, error.CodecError) {
+fn skip_window_descriptor(
+  bytes: BitArray,
+) -> Result(BitArray, error.CodecError) {
   case bytes {
     <<_window, rest:bytes>> -> Ok(rest)
     _ ->
