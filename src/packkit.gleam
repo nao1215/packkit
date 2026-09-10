@@ -58,7 +58,7 @@ pub type Limits =
 
 /// The package version.
 pub fn package_version() -> String {
-  "0.1.0"
+  "0.2.0"
 }
 
 /// Compress `bytes` with `codec`.  The codec's optional level and

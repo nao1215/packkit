@@ -24,7 +24,7 @@ pub fn main() -> Nil {
 
 pub fn package_version_test() -> Nil {
   packkit.package_version()
-  |> should.equal("0.1.0")
+  |> should.equal("0.2.0")
 }
 
 pub fn entry_rejects_parent_traversal_test() -> Nil {
