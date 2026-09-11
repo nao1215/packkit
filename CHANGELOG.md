@@ -7,6 +7,8 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+## [0.3.0] - 2026-09-11
+
 ### Documentation
 
 - README: `archive.entry_by_path` returns the first of two entries with the same path, while `tar -xf` leaves the last one on disk; the "Inspecting an archive" section now says so and shows how to get the last one (search the reversed `archive.entries`). A test pins that recipe. (#4)
