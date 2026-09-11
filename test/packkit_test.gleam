@@ -620,6 +620,15 @@ pub fn archive_entry_by_path_returns_first_inserted_on_duplicate_test() -> Nil {
   let assert Ok(found) = archive.entry_by_path(archive_value, path: "dup.txt")
   entry.body(found)
   |> should.equal(<<"first":utf8>>)
+
+  // The README's recipe for the entry `tar -xf` leaves on disk (the
+  // last one) searches the reversed entry list.
+  let assert Ok(last) =
+    archive.entries(archive_value)
+    |> list.reverse
+    |> list.find(fn(e) { entry.to_string(entry.path(e)) == "dup.txt" })
+  entry.body(last)
+  |> should.equal(<<"second":utf8>>)
 }
 
 pub fn archive_entry_by_path_matches_list_find_on_entries_test() -> Nil {

@@ -337,6 +337,11 @@ pub fn list_files(bytes: BitArray) -> List(String) {
 }
 ```
 
+A tar archive can hold two entries with the same path. `archive.entry_by_path`
+returns the first of them, while `tar -xf` leaves the last one on disk. To get
+the extracted-file view, search the reversed list:
+`archive.entries(decoded) |> list.reverse |> list.find(fn(e) { entry.to_string(entry.path(e)) == path })`.
+
 ## ZIP per-entry methods
 
 ZIP is an archive family, not a recipe — each entry can carry its own
