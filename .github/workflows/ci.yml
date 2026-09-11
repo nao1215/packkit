@@ -47,7 +47,7 @@ jobs:
           gleam-version: "1.14.0"
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "22 || 24"
       - name: Download dependencies
         run: gleam deps download
       - name: Test (Erlang)
