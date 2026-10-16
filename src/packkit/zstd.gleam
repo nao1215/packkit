@@ -2804,12 +2804,13 @@ type SeqTablesState {
   )
 }
 
-const initial_block_state: BlockState = BlockState(
-  huffman: None,
-  sequences: SeqTablesState(ll: None, of: None, ml: None),
-  previous_output_rev: [],
-  reps: #(1, 4, 8),
-)
+const initial_block_state: BlockState =
+  BlockState(
+    huffman: None,
+    sequences: SeqTablesState(ll: None, of: None, ml: None),
+    previous_output_rev: [],
+    reps: #(1, 4, 8),
+  )
 
 fn decode_blocks(
   bytes: BitArray,
