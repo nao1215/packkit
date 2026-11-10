@@ -7,6 +7,10 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+### Changed
+
+- GitHub Releases now attach the Hex package tarball, `checksums.txt`, a keyless cosign signature bundle for it and build provenance (`*.intoto.jsonl`). See "Verifying releases" in the README.
+
 ## [0.3.0] - 2026-09-11
 
 ### Documentation
