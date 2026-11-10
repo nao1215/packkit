@@ -619,6 +619,23 @@ just ci         # format-check + lint + typecheck + test
 just test       # gleam test on the default target
 ```
 
+## Verifying releases
+
+Each GitHub Release attaches the Hex package tarball (`packkit-<version>.tar`),
+`checksums.txt`, a cosign signature bundle (`checksums.txt.sigstore.json`) and
+build provenance (`packkit-<version>.intoto.jsonl`). Download the assets, then:
+
+```sh
+gh attestation verify packkit-<version>.tar --repo nao1215/packkit
+
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/nao1215/packkit/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+sha256sum --check checksums.txt
+```
+
 ## License
 
 [MIT](LICENSE)
