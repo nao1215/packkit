@@ -1,10 +1,13 @@
 # packkit
 
-[![Package Version](https://img.shields.io/hexpm/v/packkit)](https://hex.pm/packages/packkit)
-[![Downloads](https://img.shields.io/hexpm/dt/packkit)](https://hex.pm/packages/packkit)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/packkit/)
 [![CI](https://github.com/nao1215/packkit/actions/workflows/ci.yml/badge.svg)](https://github.com/nao1215/packkit/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/nao1215/packkit)](LICENSE)
+[![Gitleaks](https://github.com/nao1215/packkit/actions/workflows/gitleaks.yml/badge.svg)](https://github.com/nao1215/packkit/actions/workflows/gitleaks.yml)
+[![Trivy](https://github.com/nao1215/packkit/actions/workflows/trivy.yml/badge.svg)](https://github.com/nao1215/packkit/actions/workflows/trivy.yml)
+[![OSV-Scanner](https://github.com/nao1215/packkit/actions/workflows/osv-scan.yml/badge.svg)](https://github.com/nao1215/packkit/actions/workflows/osv-scan.yml)
+[![Hex](https://img.shields.io/hexpm/v/packkit)](https://hex.pm/packages/packkit)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/packkit/)
+[![Hex Downloads](https://img.shields.io/hexpm/dt/packkit)](https://hex.pm/packages/packkit)
+[![License](https://img.shields.io/github/license/nao1215/packkit)](./LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/nao1215/packkit/badge)](https://scorecard.dev/viewer/?uri=github.com/nao1215/packkit)
 
 Archive, compression, and container workflows for Gleam — pure Gleam,

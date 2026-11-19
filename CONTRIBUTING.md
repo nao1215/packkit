@@ -5,7 +5,7 @@
 You need the following tools installed:
 
 - [Gleam](https://gleam.run/) 1.14+ (`.mise.toml` pins the version CI uses for formatting)
-- Erlang/OTP 28+
+- Erlang/OTP 27+ (CI tests 27 and 29)
 - Node.js 22+ for JavaScript-target builds and tests
 - [just](https://github.com/casey/just) 1.14+ as a task runner — the
   `justfile` uses the `shell()` function which is parsed at justfile
