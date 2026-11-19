@@ -622,6 +622,16 @@ just ci         # format-check + lint + typecheck + test
 just test       # gleam test on the default target
 ```
 
+## Testing
+
+| Technique | Bug class caught here |
+|---|---|
+| Examples and unit tests | [Wrong output or errors for a codec or archive format](doc/testing.md#examples-and-unit-tests) |
+| Generated properties | [Encode / decode and archive round trips that lose bytes or entries](doc/testing.md#generated-properties) |
+| Differential testing | [Streams other implementations cannot read; wrong checksums and hashes](doc/testing.md#differential-testing) |
+| Nightly runs | [Rare inputs the normal run count misses](doc/testing.md#nightly-runs) |
+| Mutation testing | [Assertions that miss a changed operator or branch](doc/testing.md#mutation-testing) |
+
 ## Verifying releases
 
 Each GitHub Release attaches the Hex package tarball (`packkit-<version>.tar`),
