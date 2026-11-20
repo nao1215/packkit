@@ -10,27 +10,24 @@
 [![License](https://img.shields.io/github/license/nao1215/packkit)](./LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/nao1215/packkit/badge)](https://scorecard.dev/viewer/?uri=github.com/nao1215/packkit)
 
-Archive, compression, and container workflows for Gleam — pure Gleam,
-zero runtime dependencies, runs on both the Erlang and JavaScript
-targets. Full API reference at <https://hexdocs.pm/packkit/>.
+Archive, compression, and container formats in pure Gleam, with no
+runtime dependencies and no NIFs. CI runs it on Erlang and JavaScript.
+The full API is on [HexDocs](https://hexdocs.pm/packkit/).
 
-`packkit` keeps three concepts separate, so each is testable in
-isolation and reusable in any combination:
+packkit keeps three things apart:
 
-- **codec** — bytes in, bytes out (`gzip`, `zlib`, `zstd`, `xz`,
-  `bzip2`, `lz4`, `snappy`, `lzw`, `brotli`, `deflate`).
-- **archive** — entries in, bytes out (`tar`, `zip`, `cpio`, `ar`,
-  `7z`).
-- **recipe** — one archive plus zero or more outer codecs
-  (`tar.gz`, `tar.zst`, `cpio.xz`, …).
+- A codec turns bytes into bytes: `gzip`, `zlib`, `zstd`, `xz`,
+  `bzip2`, `lz4`, `snappy`, `lzw`, `brotli`, `deflate`.
+- An archive turns entries into bytes: `tar`, `zip`, `cpio`, `ar`,
+  `7z`.
+- A recipe is one archive plus zero or more outer codecs: `tar.gz`,
+  `tar.zst`, `cpio.xz`, and so on.
 
-`zip` and `7z` stay in the archive family. They are not modelled as
-recipes just because they may compress members internally — see
-[ZIP per-entry methods](#zip-per-entry-methods) for that knob.
+`zip` and `7z` count as archives even though they compress members
+themselves; see [ZIP per-entry methods](#zip-per-entry-methods).
 
-Every example below is checked by
-[`test/packkit/readme_examples_test.gleam`](test/packkit/readme_examples_test.gleam),
-so if it appears here it compiles and round-trips.
+[`test/packkit/readme_examples_test.gleam`](test/packkit/readme_examples_test.gleam)
+has a test for every example below.
 
 ## Install
 
@@ -40,10 +37,8 @@ gleam add packkit
 
 ## Quick start: pack and unpack a tar.gz
 
-The shortest end-to-end path. Build a logical archive, hand it to
-`packkit.pack` with a recipe, get bytes back. `packkit.unpack` reverses
-the recipe — gunzip, then tar-decode — and returns the same logical
-archive.
+`packkit.pack` writes an archive through a recipe, and `packkit.unpack`
+reverses it (gunzip, then tar decode).
 
 ```gleam
 import packkit
@@ -70,10 +65,9 @@ pub fn build_and_read_tar_gz() -> Int {
 
 ## Compressing and decompressing a single byte stream
 
-For raw byte-to-byte work, skip the archive layer and call the codec
-facade directly. The codec value carries its level and optional preset
-dictionary — unsupported combinations surface as
-`CodecOptionUnsupported`, never as a silent drop.
+For plain byte streams, call the codec facade. A codec value carries its
+level and optional preset dictionary, and an unsupported combination
+returns `CodecOptionUnsupported`.
 
 ```gleam
 import packkit
@@ -88,43 +82,19 @@ pub fn gzip_roundtrip(payload: BitArray) -> BitArray {
 }
 ```
 
-The same call shape works for every supported codec. Pick the one that
-matches the input or the producer:
-
-```gleam
-import packkit
-import packkit/codec
-
-pub fn zstd_roundtrip(payload: BitArray) -> BitArray {
-  let assert Ok(stream) = packkit.compress(bytes: payload, with: codec.zstd())
-  let assert Ok(plain) = packkit.decompress(bytes: stream, with: codec.zstd())
-  plain
-}
-
-pub fn bzip2_roundtrip(payload: BitArray) -> BitArray {
-  let assert Ok(stream) = packkit.compress(bytes: payload, with: codec.bzip2())
-  let assert Ok(plain) = packkit.decompress(bytes: stream, with: codec.bzip2())
-  plain
-}
-
-pub fn brotli_roundtrip(payload: BitArray) -> BitArray {
-  let assert Ok(stream) = packkit.compress(bytes: payload, with: codec.brotli())
-  let assert Ok(plain) = packkit.decompress(bytes: stream, with: codec.brotli())
-  plain
-}
-```
-
-`codec.identity()` is a no-op codec — useful when a recipe needs to be
-parameterised over "compress or not" without branching at the call site.
+Every codec uses the same call; swap `codec.gzip()` for `codec.zstd()`,
+`codec.bzip2()`, `codec.brotli()` and so on. `codec.identity()` does
+nothing, which lets a recipe take "compress or not" as a parameter.
 
 ## Building archives
 
-`tar`, `cpio`, `ar`, `zip`, and `7z` share one logical `Archive` value.
-The format-specific module (`packkit/tar`, `packkit/zip`, …) exposes a
-`new/0` constructor; from there, `archive.add_file` / `add_directory` /
-`add_symlink` / `add_hardlink` work identically across formats.
-Format-side limitations (e.g. `ar` only carries flat files) surface at
-encode time as a typed `ArchiveError`.
+`tar`, `cpio`, `ar`, `zip`, and `7z` share one `Archive` value. Start
+from the format module's `new/0` (`tar.new()`, `cpio.new()`,
+`seven_z.new()`, ...), add entries with `archive.add_file` /
+`add_directory` / `add_symlink` / `add_hardlink`, and serialise with
+`packkit.write` and the module's `format()`. What a format
+cannot hold (for example, `ar` has only flat files) is reported at
+encode time as an `ArchiveError`.
 
 ### Tar with directories, symlinks, and metadata
 
@@ -153,18 +123,16 @@ pub fn build_tar_with_metadata() -> BitArray {
 }
 ```
 
-`entry.with_mode` / `with_owner` / `with_modified_at` mutate an opaque
-`Entry` value. The checked variants
-(`with_mode_checked`, `with_owner_checked`, `with_modified_at_checked`)
-return `Result(_, MetadataError)` instead of panicking when the value
-is out of range; reach for them in code that touches user input.
+`entry.with_mode` / `with_owner` / `with_modified_at` panic on an
+out-of-range value. For user input use `with_mode_checked`,
+`with_owner_checked` and `with_modified_at_checked`, which return
+`Result(_, MetadataError)`.
 
 ### Path validation
 
-`Entry` paths are validated up-front. Absolute paths, `..` traversal,
-embedded NUL, Windows separators, empty / `.` segments all surface as
-typed `EntryError` variants — there's no way to construct an
-`Entry` value that would silently extract outside its archive root.
+Absolute paths, `..`, NUL, Windows separators and empty or `.` segments
+are rejected with an `EntryError` when the entry is built, so no `Entry`
+can point outside the archive root.
 
 ```gleam
 import packkit/entry
@@ -180,59 +148,15 @@ pub fn rejects_traversal() -> Result(_, entry.EntryError) {
 }
 ```
 
-### CPIO, ar, 7z
-
-The same `archive.add_*` helpers work for every format. Use
-`packkit.write` to serialise.
-
-```gleam
-import packkit
-import packkit/archive
-import packkit/cpio
-import packkit/ar
-import packkit/seven_z
-
-pub fn build_cpio() -> BitArray {
-  let archive_value =
-    cpio.new()
-    |> archive.add_file(path: "lib/libfoo.so", body: <<"…":utf8>>)
-    |> archive.add_file(path: "lib/libbar.so", body: <<"…":utf8>>)
-  let assert Ok(bytes) =
-    packkit.write(archive_value: archive_value, format: cpio.format())
-  bytes
-}
-
-pub fn build_ar() -> BitArray {
-  let archive_value =
-    ar.new()
-    |> archive.add_file(path: "main.o", body: <<"obj":utf8>>)
-    |> archive.add_file(path: "debian-binary", body: <<"2.0\n":utf8>>)
-  let assert Ok(bytes) =
-    packkit.write(archive_value: archive_value, format: ar.format())
-  bytes
-}
-
-pub fn build_seven_z() -> BitArray {
-  let archive_value =
-    seven_z.new()
-    |> archive.add_file(path: "doc/spec.txt", body: <<"hello 7z":utf8>>)
-    |> archive.add_file(path: "doc/notes.txt", body: <<"more":utf8>>)
-  let assert Ok(bytes) =
-    packkit.write(archive_value: archive_value, format: seven_z.format())
-  bytes
-}
-```
-
 ## Recipe composition
 
-A `Recipe` is one archive plus zero or more outer codecs in
-outer-to-inner order. `packkit/recipe` ships convenience constructors
-for the common combinations:
+A `Recipe` lists its outer codecs from outside in. `packkit/recipe` has
+constructors for the common ones:
 
 | Constructor              | Description |
 |--------------------------|-------------|
 | `recipe.tar()`           | uncompressed tar (same API surface as the compressed variants) |
-| `recipe.zip()`           | ZIP archive (per-entry compression — see below) |
+| `recipe.zip()`           | ZIP archive (per-entry compression, see below) |
 | `recipe.seven_z()`       | 7z archive |
 | `recipe.cpio()`          | uncompressed cpio (newc) |
 | `recipe.ar()`            | BSD ar |
@@ -247,8 +171,7 @@ for the common combinations:
 | `recipe.tar_brotli()`    | `tar.br` |
 | `recipe.cpio_gzip()` / `cpio_bzip2()` / `cpio_xz()` / `cpio_zstd()` | matching cpio variants |
 
-Need a recipe that isn't in the table? Compose one with `recipe.wrap`.
-The wrapper adds an outer codec layer on top of an existing recipe.
+`recipe.wrap` adds another outer codec to an existing recipe:
 
 ```gleam
 import packkit/archive
@@ -262,16 +185,15 @@ pub fn cpio_lz4_then_zstd() -> recipe.Recipe {
 }
 ```
 
-`recipe.description` returns the canonical dotted name
-(`"cpio-newc.lz4.zstd"` for the recipe above), which is handy for
-test snapshots and logs.
+`recipe.description` gives the dotted name, `"cpio-newc.lz4.zstd"` for
+the recipe above.
 
 ## Detecting a format
 
-Three entry points return an opaque `Detected` value, inspected through
-`detect.codec` / `detect.archive` / `detect.recipe` / `detect.extension`.
-Compound extensions (`.tar.gz`, `.cpio.zst`, …) take precedence over
-their inner counterparts.
+`packkit.detect_filename`, `detect_bytes` and `detect_path_or_bytes`
+(re-exports of `packkit/detect`) return a `Detected` value; read it with
+`detect.codec`, `detect.archive`, `detect.recipe` or `detect.extension`.
+Compound extensions such as `.tar.gz` win over the inner one.
 
 ```gleam
 import gleam/option.{type Option}
@@ -289,17 +211,14 @@ pub fn recipe_for_filename(path: String) -> Option(recipe.Recipe) {
 //   -> Some(recipe.tar_zstd())
 ```
 
-For incoming data of unknown origin (uploads, stdin) prefer
-`detect.from_path_or_bytes` — it tries the filename first and falls
-back to magic-byte sniffing on the supplied content.
+For uploads or stdin, `detect.from_path_or_bytes` tries the filename and
+then the magic bytes:
 
 ```gleam
 import gleam/option.{type Option}
 import packkit/codec
 import packkit/detect
 
-/// Pick the right codec for a downloaded blob even when the URL has no
-/// useful extension (`/dev/stdin`, `download.bin`, …).
 pub fn pick_codec(path: String, leading_bytes: BitArray) -> Option(codec.Codec) {
   detect.from_path_or_bytes(path: path, bytes: leading_bytes)
   |> option.from_result
@@ -307,15 +226,10 @@ pub fn pick_codec(path: String, leading_bytes: BitArray) -> Option(codec.Codec) 
 }
 ```
 
-`packkit.detect_filename` / `detect_bytes` / `detect_path_or_bytes`
-re-export the `packkit/detect` entrypoints from the top-level facade so
-most CLI integrations only need to import `packkit`.
-
 ## Inspecting an archive
 
-The decoded `Archive` is iterated through `archive.entries`; each
-`Entry` is opaque and inspected through accessors. `archive.entry_by_path`
-short-circuits the "fetch one named member" use case.
+`archive.entries` lists the decoded entries and `archive.entry_by_path`
+fetches one.
 
 ```gleam
 import gleam/list
@@ -348,10 +262,9 @@ the extracted-file view, search the reversed list:
 
 ## ZIP per-entry methods
 
-ZIP is an archive family, not a recipe — each entry can carry its own
-compression method. `zip.encode_with_method` applies the chosen method
-to every entry; mix-and-match per entry is not (yet) exposed. The
-supported methods are `store`, `deflate`, `bzip2`, `zstd`, `xz`, and
+Each ZIP entry has its own compression method. `zip.encode_with_method`
+applies one method to every entry; choosing per entry is not exposed
+yet. The methods are `store`, `deflate`, `bzip2`, `zstd`, `xz`, and
 `lzma` (PKWARE method 14).
 
 ```gleam
@@ -374,15 +287,6 @@ pub fn write_deflated_zip() -> BitArray {
   bytes
 }
 
-pub fn write_zstd_zip() -> BitArray {
-  let archive_value =
-    zip.new()
-    |> archive.add_file(path: "blob.bin", body: <<"…":utf8>>)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: archive_value, method: zip.zstd())
-  bytes
-}
-
 pub fn read_zip(bytes: BitArray) -> Int {
   let assert Ok(decoded) = packkit.unpack(bytes: bytes, using: recipe.zip())
   archive.entry_count(decoded)
@@ -390,16 +294,12 @@ pub fn read_zip(bytes: BitArray) -> Int {
 ```
 
 `zip.decode_with_password` reads PKWARE traditional ("ZipCrypto") and
-WinZip AES (AE-1 / AE-2) entries through the same logical-archive API
-once the password is supplied — see the docs for the supported method
-matrix.
+WinZip AES (AE-1 / AE-2) entries; HexDocs lists the supported methods.
 
 ## gzip header metadata round-trip
 
-`packkit/gzip` exposes the full RFC 1952 header (member name, comment,
-mtime, optional extra subfields). The top-level facade hides the
-header, but for tooling that needs to read or set those fields, use the
-gzip module directly.
+The facade hides the gzip header. `packkit/gzip` reads and writes all of
+RFC 1952's fields: member name, comment, mtime and extra subfields.
 
 ```gleam
 import gleam/option.{Some}
@@ -418,16 +318,14 @@ pub fn gzip_with_header_metadata(payload: BitArray) -> #(BitArray, Result(gzip.D
 }
 ```
 
-`gzip.decode` returns a `Decoded` record carrying both the original
-header and the decoded payload, so callers can replay metadata from one
-gzip stream into another.
+`gzip.decode` returns the header together with the payload, so you can
+copy metadata from one stream to another.
 
 ## Streaming chunks via packkit/stream
 
-`packkit/stream` exposes opaque incremental decoder and encoder states.
-`push` / `push_encoder` buffer one chunk at a time and enforce
-`max_input_bytes` as the chunks arrive; `finish` / `finish_encoder`
-runs the actual codec once.
+`push` / `push_encoder` buffer one chunk at a time and check
+`max_input_bytes` as chunks arrive; `finish` / `finish_encoder` runs the
+codec once.
 
 ```gleam
 import packkit
@@ -448,19 +346,20 @@ pub fn streamed_gzip_roundtrip(payload: BitArray) -> BitArray {
 }
 ```
 
-Every codec gets a matching constructor —
-`new_deflate_decoder`, `new_zlib_decoder`, `new_lz4_decoder`,
-`new_snappy_decoder`, `new_bzip2_decoder`, `new_lzw_decoder`,
-`new_xz_decoder`, `new_zstd_decoder`, `new_brotli_decoder` — plus the
-encoder twins (`new_gzip_encoder`, …, `encode_chunks`).
+Every codec has a constructor (`new_deflate_decoder`, `new_zlib_decoder`,
+`new_lz4_decoder`, `new_snappy_decoder`, `new_bzip2_decoder`,
+`new_lzw_decoder`, `new_xz_decoder`, `new_zstd_decoder`,
+`new_brotli_decoder`) and an encoder counterpart (`new_gzip_encoder`,
+..., `encode_chunks`).
 
 ## Resource limits
 
-`packkit/limit` carries a budget that every decode entry point honours:
-input size, output size, member count, name length, entry depth, and
-maximum window bits. The facade variants (`compress`, `decompress`,
-`pack`, `unpack`) ship `*_with_limits` twins that thread a custom
-`Limits` value through the codec chain *and* the archive decoder.
+Every decoder respects a `packkit/limit` budget: input size, output
+size, member count, name length, entry depth and window bits.
+`compress`, `decompress`, `pack` and `unpack` each have a
+`*_with_limits` version that applies a custom `Limits` to both the codec
+chain and the archive decoder. The default is 64 MiB in, 256 MiB out
+and 10 000 entries; set explicit limits in shared or multi-tenant code.
 
 ```gleam
 import packkit
@@ -468,9 +367,8 @@ import packkit/codec
 import packkit/error
 import packkit/limit
 
-/// Reject any gzip stream whose ciphertext is larger than 4 bytes.
-/// Useful only as an illustration — production budgets live in the
-/// megabytes.
+/// Reject any gzip stream larger than 4 bytes (a real budget would be
+/// megabytes).
 pub fn refuse_oversized_gzip(stream: BitArray) -> Bool {
   let tight = limit.default() |> limit.with_max_input_bytes(bytes: 4)
   case
@@ -486,14 +384,9 @@ pub fn refuse_oversized_gzip(stream: BitArray) -> Bool {
 }
 ```
 
-The default budget is conservative (64 MiB in, 256 MiB out, 10 000
-entries) — explicit limits in shared / multi-tenant code paths are
-strongly recommended.
-
 ## Checksums
 
-`packkit/checksum` ships the same checksum families the codec engines
-use internally, exposed as standalone helpers.
+`packkit/checksum` exposes the checksums the codecs use.
 
 ```gleam
 import packkit/checksum
@@ -508,16 +401,14 @@ pub fn checksums() -> #(Int, Int, BitArray) {
 }
 ```
 
-`adler32_continue` and `crc32_continue` let callers chain rolling
-checksums across multiple chunks without re-hashing the prefix.
-`sha256_init` / `sha256_update` / `sha256_finalize` expose the same
-streaming shape for SHA-256.
+`adler32_continue` and `crc32_continue` carry a checksum across chunks,
+and `sha256_init` / `sha256_update` / `sha256_finalize` do the same for
+SHA-256.
 
 ## Error handling
 
-Every public entry point returns `Result(_, e)` with a typed error.
-`packkit/error.format_*_error` emits a single user-facing line for each
-family so CLI integrations can surface them as-is.
+Every public function returns a `Result` with a typed error, and
+`packkit/error.format_*_error` turns each error into one line for users.
 
 ```gleam
 import packkit
@@ -543,75 +434,70 @@ pub fn refuses_format_mismatch() -> String {
 }
 ```
 
-The full error families are:
+The error families:
 
-- `CodecError` — `CodecInvalidData`, `CodecLimitExceeded`,
+- `CodecError`: `CodecInvalidData`, `CodecLimitExceeded`,
   `CodecDictionaryRequired`, `CodecDictionaryMismatch`,
   `CodecOptionUnsupported`, `CodecNotImplemented`.
-- `ArchiveError` — `ArchiveUnsupported`, `ArchiveInvalid`,
+- `ArchiveError`: `ArchiveUnsupported`, `ArchiveInvalid`,
   `ArchiveEntryRejected`, `ArchiveLimitExceeded`, `ArchiveNotImplemented`,
   `ArchiveCodecFailed` (wraps a `CodecError` so a recipe-time codec
   failure preserves its structured cause), `ArchiveFormatMismatch`,
   `ArchiveFieldOverflow`, `ArchiveCommentUnsupported`.
-- `RecipeError` — `RecipeArchiveAlreadySet`, `RecipeEmptyCodecChain`,
+- `RecipeError`: `RecipeArchiveAlreadySet`, `RecipeEmptyCodecChain`,
   `RecipeUnsupportedComposition`, `RecipeNotImplemented`.
-- `DetectError` — `DetectUnknownFormat`, `DetectNotImplemented`.
+- `DetectError`: `DetectUnknownFormat`, `DetectNotImplemented`.
 
 ## Supported formats
 
-Implemented codecs:
+Codecs:
 
-- **gzip** (RFC 1952 — header metadata, multi-member streams,
+- gzip (RFC 1952: header metadata, multi-member streams,
   CRC/ISIZE verification)
-- **zlib** (RFC 1950 — Adler-32 trailer, preset dictionaries)
-- **deflate** (RFC 1951 — full decoder; stored + fixed/dynamic-Huffman
+- zlib (RFC 1950: Adler-32 trailer, preset dictionaries)
+- deflate (RFC 1951: full decoder; stored + fixed/dynamic-Huffman
   LZ77 encoders)
-- **lz4** (frame decoder + LZ77 encoder; legacy `lz4c`
+- lz4 (frame decoder + LZ77 encoder; legacy `lz4c`
   `0x184C2102` frames decode too)
-- **snappy** (raw block + framed codec, LZ77 block compressor)
-- **bzip2** (round-trip; multi-stream `.bz2` concatenation decodes)
-- **lzw** (Unix `.Z` encoder + decoder)
-- **xz** (stream header / block / index / footer + LZMA2 with both
+- snappy (raw block + framed codec, LZ77 block compressor)
+- bzip2 (round-trip; multi-stream `.bz2` concatenation decodes)
+- lzw (Unix `.Z` encoder + decoder)
+- xz (stream header / block / index / footer + LZMA2 with both
   uncompressed and LZMA-compressed chunks, BCJ filter pre-processors,
   all four block-check types incl. SHA-256, multi-stream concatenation)
-- **zstd** (frame envelope + raw / RLE / FSE-compressed blocks,
+- zstd (frame envelope + raw / RLE / FSE-compressed blocks,
   Huffman-coded literals, treeless literals, predefined / RLE / FSE
   sequence modes, multi-frame stream decoding, real LZ77 sequences on
   the encode side)
-- **brotli** (full RFC 7932 decoder; encoder picks the smallest of
+- brotli (full RFC 7932 decoder; encoder picks the smallest of
   three candidates per payload, with a real LZ77 + complex-form
   Huffman LZ77 path)
 
-Implemented archive families:
+Archives:
 
-- **tar** — USTAR encode/decode plus GNU `LongName`/`LongLink` and PAX
+- tar: USTAR encode/decode plus GNU `LongName`/`LongLink` and PAX
   attribute (`x` / `g`) decoder
-- **cpio** — newc encode/decode
-- **ar** — BSD long-name encode/decode; the decoder also accepts the
+- cpio: newc encode/decode
+- ar: BSD long-name encode/decode; the decoder also accepts the
   GNU long-name string table form (`//` + `/<offset>`), so `.a` /
   `.deb` archives produced by `binutils ar` round-trip end-to-end
-- **zip** — stored + deflate + bzip2 + zstd + xz + PKWARE LZMA
+- zip: stored + deflate + bzip2 + zstd + xz + PKWARE LZMA
   (method 14) encode/decode, Zip64 extensions, ZipCrypto + WinZip AES
   (AE-1 / AE-2) decryption, per-entry mtime / UID / GID, EFS UTF-8 names
-- **7z** — single-folder reader for Copy / LZMA / LZMA2 / Deflate /
+- 7z: single-folder reader for Copy / LZMA / LZMA2 / Deflate /
   BZip2 plus the BCJ + Delta filter family; encoder writes a
   single-folder archive with LZMA, Copy, Deflate, or BZip2 as the
   coder
 
-Checksum primitives shared across codecs and exposed directly:
+Checksums:
 
 - Adler-32, CRC-32 (reflected), CRC-32C (Castagnoli), bzip2 CRC-32
   (non-reflected), CRC-64 (xz / ECMA reflected, returned as a
   `#(low_u32, high_u32)` pair for cross-target precision), SHA-1, and
   SHA-256 (FIPS 180-4)
 
-For the full coverage matrix — including which encoder strategies are
-currently exposed for each codec — see [CHANGELOG.md](CHANGELOG.md).
-
-## Targets
-
-Both the Erlang and JavaScript targets are exercised in CI on every
-push. Pure-Gleam internals mean no NIF / native binary is needed.
+[CHANGELOG.md](CHANGELOG.md) records which encoder strategies each codec
+has.
 
 ## Development
 
