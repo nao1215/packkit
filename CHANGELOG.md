@@ -7,6 +7,8 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+## [0.5.0] - 2026-11-23
+
 ### Breaking
 
 The public API shrinks from 26 modules to 7: `packkit`, `packkit/codec`, `packkit/archive`, `packkit/limit`, `packkit/gzip`, `packkit/zip` and `packkit/seven_z`.
