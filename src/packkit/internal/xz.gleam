@@ -923,8 +923,9 @@ fn finalize_stream(
   // The stream footer is always exactly 12 bytes, so the first 12
   // bytes of `after_index` are the footer and everything after that
   // is either inter-stream padding or the next stream.
+  let footer_length = stream_footer_size
   case after_index {
-    <<footer:bytes-size(stream_footer_size), after_footer:bytes>> -> {
+    <<footer:bytes-size(footer_length), after_footer:bytes>> -> {
       use _ <- result.try(verify_stream_footer(footer, check_type))
       Ok(#(output, after_footer))
     }

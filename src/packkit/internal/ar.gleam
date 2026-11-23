@@ -67,9 +67,12 @@ fn decode_loop(
   string_table: option.Option(BitArray),
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
+  // Gleam 1.14 on JavaScript cannot use a module constant as a segment
+  // size, so it is bound to a local first.
+  let header_length = header_size
   case bytes {
     <<>> -> Ok(acc)
-    <<header_bits:bytes-size(header_size), after_header:bytes>> -> {
+    <<header_bits:bytes-size(header_length), after_header:bytes>> -> {
       use record <- result.try(parse_header(header_bits))
       // `parse_header` keeps `name_extension` between 0 and `size`.
       let name_size = record.name_extension

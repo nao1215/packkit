@@ -62,8 +62,11 @@ fn decode_loop(
   count: Int,
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
+  // Gleam 1.14 on JavaScript cannot use a module constant as a segment
+  // size, so it is bound to a local first.
+  let header_length = header_size
   use #(header_bits, after_header) <- result.try(case bytes {
-    <<header_bits:bytes-size(header_size), after_header:bytes>> ->
+    <<header_bits:bytes-size(header_length), after_header:bytes>> ->
       Ok(#(header_bits, after_header))
     _ -> Error(archive.InvalidData(message: "cpio header truncated"))
   })

@@ -79,8 +79,11 @@ fn decode_loop_with_pending(
   limits: limit.Limits,
   pending: PendingOverride,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
+  // Gleam 1.14 on JavaScript cannot use a module constant as a segment
+  // size, so it is bound to a local first.
+  let block_length = block_size
   use header_bits <- result.try(case bytes {
-    <<header_bits:bytes-size(block_size), _:bytes>> -> Ok(header_bits)
+    <<header_bits:bytes-size(block_length), _:bytes>> -> Ok(header_bits)
     _ ->
       Error(archive.InvalidData(
         message: "tar stream ended before terminator blocks",
