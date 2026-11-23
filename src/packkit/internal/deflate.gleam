@@ -476,13 +476,9 @@ fn inflate_fixed(
   output: BitArray,
   limits: limit.Limits,
 ) -> Result(#(BitArray, Reader), codec.CodecError) {
-  inflate_huffman_block(
-    reader,
-    output,
-    fixed_literal_tree(),
-    fixed_distance_tree(),
-    limits,
-  )
+  use ltree <- result.try(build_tree(build_fixed_literal_lengths()))
+  use dtree <- result.try(build_tree(list.repeat(5, 32)))
+  inflate_huffman_block(reader, output, ltree, dtree, limits)
 }
 
 fn inflate_dynamic(
@@ -766,52 +762,10 @@ fn apply_backref(
     when: distance <= 0 || distance > size,
     return: Error(codec.InvalidData(message: "back-reference out of range")),
   )
-
-  case distance >= length {
-    True -> {
-      let assert Ok(chunk) = bit_array.slice(output, size - distance, length)
-      bytes.append_with_limit(output, chunk, limits)
-    }
-    False -> apply_backref_byte_by_byte(output, distance, length, limits)
-  }
-}
-
-fn apply_backref_byte_by_byte(
-  output: BitArray,
-  distance: Int,
-  length: Int,
-  limits: limit.Limits,
-) -> Result(BitArray, codec.CodecError) {
-  case length {
-    0 -> Ok(output)
-    _ -> {
-      let size = bit_array.byte_size(output)
-      let assert Ok(byte_slice) = bit_array.slice(output, size - distance, 1)
-      use new_output <- result.try(bytes.append_with_limit(
-        output,
-        byte_slice,
-        limits,
-      ))
-      apply_backref_byte_by_byte(new_output, distance, length - 1, limits)
-    }
-  }
+  bytes.copy_back(output, distance, length, limits)
 }
 
 // -- fixed huffman tables -----------------------------------------------
-
-fn fixed_literal_tree() -> Tree {
-  let lengths = build_fixed_literal_lengths()
-  // Reusing the canonical builder keeps the symbol order consistent
-  // with dynamically-built trees.
-  let assert Ok(tree) = build_tree(lengths)
-  tree
-}
-
-fn fixed_distance_tree() -> Tree {
-  let lengths = list.repeat(5, 32)
-  let assert Ok(tree) = build_tree(lengths)
-  tree
-}
 
 fn build_fixed_literal_lengths() -> List(Int) {
   // 0..143:   length 8

@@ -65,3 +65,26 @@ fn pow_int(base: Int, exp: Int) -> Int {
     _ -> base * pow_int(base, exp - 1)
   }
 }
+
+fn counting(n: Int) -> BitArray {
+  counting_loop(0, n, <<>>)
+}
+
+fn counting_loop(i: Int, n: Int, acc: BitArray) -> BitArray {
+  case i >= n {
+    True -> acc
+    False -> counting_loop(i + 1, n, <<acc:bits, i>>)
+  }
+}
+
+// Inputs of 16 bytes or more go through the four-lane stripe loop. The
+// values come from the xxHash reference algorithm; 0x15935B99 is also
+// the content checksum `lz4` writes for "abc" repeated 60 times.
+pub fn long_inputs_use_the_stripe_loop_test() -> Nil {
+  assert xxh32.digest(bytes: <<"abc">>, seed: 0) == 0x32D153FF
+  assert xxh32.digest(bytes: counting(16), seed: 0) == 0xB72837F4
+  assert xxh32.digest(bytes: counting(31), seed: 0) == 0xEF24F709
+  assert xxh32.digest(bytes: counting(32), seed: 0) == 0x830741C1
+  assert xxh32.digest(bytes: counting(100), seed: 0) == 0x7F89BA44
+  assert xxh32.digest(bytes: counting(100), seed: 0x9747B28C) == 0x6BCB75C0
+}
