@@ -7,6 +7,8 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+## [0.5.1] - 2026-11-23
+
 ### Fixed
 
 - The 7z reader checks `max_entry_name_bytes`, and the tar, cpio and ar readers and the `Identity` codec check `max_output_bytes`, like the other readers and codecs.
