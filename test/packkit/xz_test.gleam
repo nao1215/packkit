@@ -1,19 +1,13 @@
 import gleam/bit_array
 import gleeunit/should
+import packkit
 import packkit/codec
-import packkit/error
-import packkit/xz
-
-pub fn codec_marker_test() -> Nil {
-  xz.codec()
-  |> codec.name
-  |> should.equal("xz")
-}
+import packkit/internal/xz
 
 pub fn encode_roundtrip_hi_test() -> Nil {
   let payload = <<"hi":utf8>>
   let assert Ok(encoded) = xz.encode(bytes: payload)
-  let assert Ok(decoded) = xz.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Xz)
   decoded
   |> should.equal(payload)
 }
@@ -21,7 +15,7 @@ pub fn encode_roundtrip_hi_test() -> Nil {
 pub fn encode_roundtrip_pangram_test() -> Nil {
   let payload = <<"The quick brown fox jumps over the lazy dog.":utf8>>
   let assert Ok(encoded) = xz.encode(bytes: payload)
-  let assert Ok(decoded) = xz.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Xz)
   decoded
   |> should.equal(payload)
 }
@@ -34,7 +28,7 @@ pub fn encode_roundtrip_empty_test() -> Nil {
   // decoder fail with "truncated xz filter properties".
   let payload = <<>>
   let assert Ok(encoded) = xz.encode(bytes: payload)
-  let assert Ok(decoded) = xz.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Xz)
   decoded
   |> should.equal(payload)
 }
@@ -75,7 +69,7 @@ pub fn encode_roundtrip_multi_chunk_test() -> Nil {
   let unit = "PACKKIT-XZ-LZMA2-CHUNK-CROSS-TEST-PAYLOAD-"
   let payload = repeat_bytes(<<unit:utf8>>, 1900)
   let assert Ok(encoded) = xz.encode(bytes: payload)
-  let assert Ok(decoded) = xz.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Xz)
   decoded
   |> should.equal(payload)
 }
@@ -94,7 +88,7 @@ pub fn decode_empty_stream_test() -> Nil {
     0x00, 0x00, 0x00, 0x1C, 0xDF, 0x44, 0x21, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00,
     0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<>>)
 }
@@ -109,7 +103,7 @@ pub fn decode_short_uncompressed_block_test() -> Nil {
     0x27, 0x92, 0x3A, 0x69, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00,
     0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<"hi":utf8>>)
 }
@@ -126,7 +120,7 @@ pub fn decode_lzma_repeated_byte_test() -> Nil {
     0xAF, 0x0A, 0x01, 0xDC, 0x00, 0x01, 0x2A, 0x1E, 0x60, 0x44, 0xE2, 0xB5, 0x1F,
     0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":utf8>>)
 }
@@ -155,7 +149,7 @@ pub fn decode_lzma_pangram_repeated_test() -> Nil {
     expected_unit:utf8,
     expected_unit:utf8,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(expected)
 }
@@ -182,16 +176,14 @@ pub fn decode_block_header_without_compressed_size_test() -> Nil {
     0x4F, 0x00, 0x01, 0x1B, 0x03, 0x0B, 0x2F, 0xB9, 0x10, 0x1F, 0xB6, 0xF3, 0x7D,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<"hi\n":utf8>>)
 }
 
 pub fn decode_rejects_missing_magic_test() -> Nil {
-  xz.decode(bytes: <<0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>)
-  |> should.equal(
-    Error(error.CodecInvalidData(message: "invalid xz stream header")),
-  )
+  packkit.decompress(<<0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>, with: codec.Xz)
+  |> should.equal(Error(codec.InvalidData(message: "invalid xz stream header")))
 }
 
 pub fn decode_multi_stream_concatenated_test() -> Nil {
@@ -203,7 +195,7 @@ pub fn decode_multi_stream_concatenated_test() -> Nil {
   let assert Ok(s2) = xz.encode(bytes: <<"second-":utf8>>)
   let assert Ok(s3) = xz.encode(bytes: <<"third":utf8>>)
   let combined = bit_array.concat([s1, s2, s3])
-  let assert Ok(plain) = xz.decode(bytes: combined)
+  let assert Ok(plain) = packkit.decompress(combined, with: codec.Xz)
   plain
   |> should.equal(<<"first-second-third":utf8>>)
 }
@@ -220,7 +212,7 @@ pub fn decode_multi_stream_with_padding_test() -> Nil {
       <<0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>,
       s2,
     ])
-  let assert Ok(plain) = xz.decode(bytes: combined)
+  let assert Ok(plain) = packkit.decompress(combined, with: codec.Xz)
   plain
   |> should.equal(<<"alphabeta":utf8>>)
 }
@@ -242,7 +234,7 @@ pub fn decode_x86_bcj_lzma2_chain_test() -> Nil {
     0xD6, 0xF6, 0x08, 0x00, 0x01, 0x35, 0x15, 0x76, 0x93, 0x6A, 0xEF, 0x1F, 0xB6,
     0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0xE8, 0x10, 0x00, 0x00, 0x00, 0xE9, 0x20, 0x00, 0x00, 0x00, 0x68, 0x65, 0x6C,
@@ -265,7 +257,7 @@ pub fn decode_x86_bcj_consecutive_calls_test() -> Nil {
     0x90, 0x25, 0xA2, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04,
     0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0xE8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00,
@@ -290,7 +282,7 @@ pub fn decode_powerpc_bcj_lzma2_chain_test() -> Nil {
     0x93, 0x77, 0xE2, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04,
     0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0x48, 0x00, 0x00, 0x01, 0x48, 0x00, 0x00, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
@@ -313,7 +305,7 @@ pub fn decode_armthumb_bcj_lzma2_chain_test() -> Nil {
     0x93, 0x77, 0xE2, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04,
     0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0x00, 0xF0, 0x00, 0xF8, 0x00, 0xF0, 0x10, 0xF8, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
@@ -335,7 +327,7 @@ pub fn decode_sparc_bcj_lzma2_chain_test() -> Nil {
     0x90, 0x25, 0xA2, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04,
     0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0x40, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x02, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
@@ -357,7 +349,7 @@ pub fn decode_arm64_bcj_lzma2_chain_test() -> Nil {
     0x90, 0x25, 0xA2, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04,
     0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0x01, 0x00, 0x00, 0x94, 0x02, 0x00, 0x00, 0x94, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
@@ -383,7 +375,7 @@ pub fn decode_ia64_bcj_lzma2_chain_test() -> Nil {
     0xAF, 0x5C, 0x00, 0x01, 0x42, 0x20, 0x64, 0xB8, 0xA7, 0xD9, 0x1F, 0xB6, 0xF3,
     0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0x00, 0x00, 0x00, 0x40, 0x05, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -408,7 +400,7 @@ pub fn decode_riscv_bcj_lzma2_chain_test() -> Nil {
     0x51, 0x96, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x59,
     0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(<<
     0x97, 0x02, 0x00, 0x00, 0xE7, 0x82, 0x02, 0x00, 0xEF, 0x00, 0x80, 0x00, 0x68,

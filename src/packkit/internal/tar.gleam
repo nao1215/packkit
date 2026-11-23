@@ -17,9 +17,9 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import packkit/archive as archives
-import packkit/entry
-import packkit/error
+import packkit/archive
+import packkit/internal/bytes
+import packkit/internal/entry
 import packkit/limit
 
 const block_size: Int = 512
@@ -30,84 +30,12 @@ const prefix_size: Int = 155
 
 const linkname_size: Int = 100
 
-/// Tar archive format marker.
-pub fn format() -> archives.ArchiveFormat {
-  archives.tar()
-}
-
-/// Create an empty tar archive value.
-pub fn new() -> archives.Archive {
-  archives.new(format: format())
-}
-
-/// Add a regular file after checked path validation.
-pub fn add_file_checked(
-  archive archive_value: archives.Archive,
-  path path: String,
-  body body: BitArray,
-) -> Result(archives.Archive, entry.EntryError) {
-  case entry.file_checked(path: path, body: body) {
-    Ok(value) -> Ok(archives.add(archive_value, entry: value))
-    Error(err) -> Error(err)
-  }
-}
-
-/// Panicking counterpart of `add_file_checked`.
-pub fn add_file(
-  archive archive_value: archives.Archive,
-  path path: String,
-  body body: BitArray,
-) -> archives.Archive {
-  archives.add(archive_value, entry: entry.file(path: path, body: body))
-}
-
-/// Add a directory after checked path validation.
-pub fn add_directory_checked(
-  archive archive_value: archives.Archive,
-  path path: String,
-) -> Result(archives.Archive, entry.EntryError) {
-  case entry.directory_checked(path) {
-    Ok(value) -> Ok(archives.add(archive_value, entry: value))
-    Error(err) -> Error(err)
-  }
-}
-
-/// Panicking counterpart of `add_directory_checked`.
-pub fn add_directory(
-  archive archive_value: archives.Archive,
-  path path: String,
-) -> archives.Archive {
-  archives.add(archive_value, entry: entry.directory(path))
-}
-
-/// Add a symbolic link after checked path validation.
-pub fn add_symlink_checked(
-  archive archive_value: archives.Archive,
-  path path: String,
-  target target: String,
-) -> Result(archives.Archive, entry.EntryError) {
-  case entry.symlink_checked(path: path, target: target) {
-    Ok(value) -> Ok(archives.add(archive_value, entry: value))
-    Error(err) -> Error(err)
-  }
-}
-
-/// Panicking counterpart of `add_symlink_checked`.
-pub fn add_symlink(
-  archive archive_value: archives.Archive,
-  path path: String,
-  target target: String,
-) -> archives.Archive {
-  archives.add(archive_value, entry: entry.symlink(path: path, target: target))
-}
-
 /// Encode a logical archive to a USTAR byte stream.
 pub fn encode(
-  archive archive_value: archives.Archive,
-) -> Result(BitArray, error.ArchiveError) {
-  use _ <- result.try(reject_comment(archive_value))
-  archive_value
-  |> archives.entries
+  archive archive_value: archive.Archive,
+) -> Result(BitArray, archive.ArchiveError) {
+  use _ <- result.try(entry.reject_comment(archive_value))
+  archive_value.entries
   |> list.try_map(encode_entry)
   |> result.map(fn(blocks) {
     [bit_array.concat(blocks), end_marker()]
@@ -115,32 +43,15 @@ pub fn encode(
   })
 }
 
-fn reject_comment(
-  archive_value: archives.Archive,
-) -> Result(Nil, error.ArchiveError) {
-  case archives.comment(archive_value) {
-    None -> Ok(Nil)
-    Some(_) -> Error(error.ArchiveCommentUnsupported(format: "tar"))
-  }
-}
-
-/// Decode a USTAR byte stream into a logical archive using the default
-/// resource limits.
-pub fn decode(
-  bytes bytes: BitArray,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a USTAR byte stream into a logical archive using the supplied
 /// resource limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -148,7 +59,11 @@ pub fn decode_with_limits(
 
   decode_loop(bytes, [], 0, limits)
   |> result.map(list.reverse)
-  |> result.map(archives.from_entries(format: format(), entries: _))
+  |> result.map(archive.Archive(
+    format: archive.Tar,
+    entries: _,
+    comment: option.None,
+  ))
 }
 
 type PendingOverride {
@@ -161,23 +76,23 @@ fn no_pending() -> PendingOverride {
 
 fn decode_loop(
   bytes: BitArray,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   count: Int,
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   decode_loop_with_pending(bytes, acc, count, limits, no_pending())
 }
 
 fn decode_loop_with_pending(
   bytes: BitArray,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   count: Int,
   limits: limit.Limits,
   pending: PendingOverride,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   use <- bool.guard(
     when: bit_array.byte_size(bytes) < block_size,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "tar stream ended before terminator blocks",
     )),
   )
@@ -192,7 +107,7 @@ fn decode_loop_with_pending(
   let total_advance = block_size + body_padded
   use <- bool.guard(
     when: bit_array.byte_size(bytes) < total_advance,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "tar entry body extends beyond the input",
     )),
   )
@@ -208,12 +123,12 @@ fn decode_loop_with_pending(
 fn dispatch_typeflag(
   bytes: BitArray,
   rest: BitArray,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   count: Int,
   limits: limit.Limits,
   pending: PendingOverride,
   header: ParsedHeader,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   case header.typeflag {
     // GNU LongName ('L'): body holds the next entry's name.
     0x4C -> {
@@ -301,11 +216,11 @@ fn read_pax_body(
   bytes: BitArray,
   start: Int,
   size: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bit_array.slice(bytes, start, size) {
     Ok(chunk) -> Ok(chunk)
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "truncated tar PAX extended header"))
+      Error(archive.InvalidData(message: "truncated tar PAX extended header"))
   }
 }
 
@@ -369,7 +284,7 @@ fn read_string_body(
   start: Int,
   size: Int,
   label: String,
-) -> Result(String, error.ArchiveError) {
+) -> Result(String, archive.ArchiveError) {
   case bit_array.slice(bytes, start, size) {
     Ok(chunk) -> {
       // Drop a trailing NUL if present.
@@ -378,12 +293,12 @@ fn read_string_body(
       case bit_array.to_string(name_bits) {
         Ok(value) -> Ok(value)
         Error(_) ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "tar " <> label <> " is not valid UTF-8",
           ))
       }
     }
-    Error(_) -> Error(error.ArchiveInvalid(message: "truncated tar " <> label))
+    Error(_) -> Error(archive.InvalidData(message: "truncated tar " <> label))
   }
 }
 
@@ -401,10 +316,9 @@ fn trim_trailing_nul_size(bytes: BitArray, size: Int) -> Int {
 fn check_member_limit(
   count: Int,
   limits: limit.Limits,
-) -> Result(Nil, error.ArchiveError) {
-  case count > limit.max_members(limits) {
-    True ->
-      Error(error.ArchiveLimitExceeded(limit: "max_members", actual: count))
+) -> Result(Nil, archive.ArchiveError) {
+  case count > limits.max_members {
+    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
     False -> Ok(Nil)
   }
 }
@@ -422,7 +336,7 @@ type ParsedHeader {
   )
 }
 
-fn parse_header(block: BitArray) -> Result(ParsedHeader, error.ArchiveError) {
+fn parse_header(block: BitArray) -> Result(ParsedHeader, archive.ArchiveError) {
   use _ <- result.try(verify_checksum(block))
 
   use raw_name <- result.try(read_string_field(block, 0, name_size))
@@ -456,10 +370,10 @@ fn header_to_entry(
   header: ParsedHeader,
   bytes: BitArray,
   limits: limit.Limits,
-) -> Result(entry.Entry, error.ArchiveError) {
+) -> Result(archive.Entry, archive.ArchiveError) {
   use <- bool.guard(
-    when: string.byte_size(header.name) > limit.max_entry_name_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: string.byte_size(header.name) > limits.max_entry_name_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_entry_name_bytes",
       actual: string.byte_size(header.name),
     )),
@@ -474,30 +388,31 @@ fn header_to_entry(
     0x31 ->
       link_entry(header, fn(p, t) { entry.hardlink_checked(path: p, target: t) })
     other ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "unsupported tar typeflag " <> int.to_string(other),
       ))
   })
 
   let name_for_depth = trim_trailing_slash(header.name)
-  case entry.path_checked(name_for_depth) {
-    Ok(parsed_path) ->
-      case entry.depth(parsed_path) > limit.max_entry_depth(limits) {
+  case entry.check_path(name_for_depth) {
+    Ok(Nil) ->
+      case entry.depth(name_for_depth) > limits.max_entry_depth {
         True ->
-          Error(error.ArchiveLimitExceeded(
+          Error(archive.LimitExceeded(
             limit: "max_entry_depth",
-            actual: entry.depth(parsed_path),
+            actual: entry.depth(name_for_depth),
           ))
         False -> Ok(Nil)
       }
     Error(_) -> Ok(Nil)
   }
-  |> result.try(fn(_) {
-    Ok(
-      base_entry
-      |> entry.with_mode(mode: header.mode)
-      |> entry.with_owner(user_id: header.uid, group_id: header.gid)
-      |> entry.with_modified_at(unix_seconds: header.mtime),
+  |> result.map(fn(_) {
+    archive.Entry(
+      ..base_entry,
+      mode: header.mode,
+      user_id: header.uid,
+      group_id: header.gid,
+      modified_at: header.mtime,
     )
   })
 }
@@ -505,63 +420,40 @@ fn header_to_entry(
 fn regular_entry(
   header: ParsedHeader,
   bytes: BitArray,
-) -> Result(entry.Entry, error.ArchiveError) {
+) -> Result(archive.Entry, archive.ArchiveError) {
   let body = case bit_array.slice(bytes, block_size, header.size) {
     Ok(body) -> body
     Error(_) -> <<>>
   }
   entry.file_checked(path: header.name, body: body)
-  |> result.map_error(entry_error_to_archive_error(_, header.name))
+  |> result.map_error(entry.to_archive_error(_, header.name))
 }
 
 fn directory_entry(
   header: ParsedHeader,
-) -> Result(entry.Entry, error.ArchiveError) {
+) -> Result(archive.Entry, archive.ArchiveError) {
   entry.directory_checked(path: trim_trailing_slash(header.name))
-  |> result.map_error(entry_error_to_archive_error(_, header.name))
+  |> result.map_error(entry.to_archive_error(_, header.name))
 }
 
 fn link_entry(
   header: ParsedHeader,
-  builder: fn(String, String) -> Result(entry.Entry, entry.EntryError),
-) -> Result(entry.Entry, error.ArchiveError) {
+  builder: fn(String, String) -> Result(archive.Entry, entry.EntryError),
+) -> Result(archive.Entry, archive.ArchiveError) {
   builder(header.name, header.linkname)
-  |> result.map_error(entry_error_to_archive_error(_, header.name))
+  |> result.map_error(entry.to_archive_error(_, header.name))
 }
 
-fn entry_error_to_archive_error(
-  err: entry.EntryError,
-  path: String,
-) -> error.ArchiveError {
-  case err {
-    entry.EmptyPath ->
-      error.ArchiveEntryRejected(path: path, reason: "empty path")
-    entry.AbsolutePath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "absolute path")
-    entry.PathTraversal(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "path traversal")
-    entry.WindowsPath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "windows path")
-    entry.EmptySegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "empty segment")
-    entry.DotSegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "dot segment")
-    entry.ContainsNul(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "nul byte")
-  }
-}
-
-fn verify_checksum(block: BitArray) -> Result(Nil, error.ArchiveError) {
+fn verify_checksum(block: BitArray) -> Result(Nil, archive.ArchiveError) {
   use stored <- result.try(read_checksum_field(block))
   let computed = compute_checksum(block)
   case stored == computed {
     True -> Ok(Nil)
-    False ->
-      Error(error.ArchiveInvalid(message: "tar header checksum mismatch"))
+    False -> Error(archive.InvalidData(message: "tar header checksum mismatch"))
   }
 }
 
-fn read_checksum_field(block: BitArray) -> Result(Int, error.ArchiveError) {
+fn read_checksum_field(block: BitArray) -> Result(Int, archive.ArchiveError) {
   read_octal_field(block, 148, 8)
 }
 
@@ -584,32 +476,30 @@ fn sum_with_checksum_blanked(block: BitArray, position: Int, acc: Int) -> Int {
 }
 
 fn encode_entry(
-  entry_value: entry.Entry,
-) -> Result(BitArray, error.ArchiveError) {
+  entry_value: archive.Entry,
+) -> Result(BitArray, archive.ArchiveError) {
   use header <- result.try(build_header(entry_value))
   let body = entry.body(entry_value)
   let body_blocks = pad_to_block(body)
   Ok(bit_array.concat([header, body_blocks]))
 }
 
-fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
-  let kind = entry.kind(value)
-  let path = entry.to_string(entry.path(value))
-  let metadata = entry.metadata(value)
+fn build_header(
+  value: archive.Entry,
+) -> Result(BitArray, archive.ArchiveError) {
+  let kind = value.kind
+  let path = value.path
 
   use #(name_field, prefix_field) <- result.try(split_name_field(path, kind))
 
   let typeflag = case kind {
-    entry.File -> 0x30
-    entry.Directory -> 0x35
-    entry.Symlink -> 0x32
-    entry.Hardlink -> 0x31
+    archive.File(_) -> 0x30
+    archive.Directory -> 0x35
+    archive.Symlink(_) -> 0x32
+    archive.Hardlink(_) -> 0x31
   }
 
-  let size = case kind {
-    entry.File -> bit_array.byte_size(entry.body(value))
-    _ -> 0
-  }
+  let size = bit_array.byte_size(entry.body(value))
 
   let linkname = case entry.link_target(value) {
     Some(target) -> target
@@ -626,24 +516,12 @@ fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   // A `width=8` field thus holds 7 octal digits → max 2^21-1; a
   // `width=12` field holds 11 octal digits → max 2^33-1.  Reject
   // overflow instead of silently dropping high bits.
-  use mode_field <- result.try(checked_octal_field(
-    entry.mode(metadata),
-    8,
-    "mode",
-  ))
-  use uid_field <- result.try(checked_octal_field(
-    entry.user_id(metadata),
-    8,
-    "uid",
-  ))
-  use gid_field <- result.try(checked_octal_field(
-    entry.group_id(metadata),
-    8,
-    "gid",
-  ))
+  use mode_field <- result.try(checked_octal_field(value.mode, 8, "mode"))
+  use uid_field <- result.try(checked_octal_field(value.user_id, 8, "uid"))
+  use gid_field <- result.try(checked_octal_field(value.group_id, 8, "gid"))
   use size_field <- result.try(checked_octal_field(size, 12, "size"))
   use mtime_field <- result.try(checked_octal_field(
-    entry.modified_at_unix(metadata),
+    value.modified_at,
     12,
     "mtime",
   ))
@@ -684,11 +562,11 @@ fn build_header(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
 
 fn split_name_field(
   path: String,
-  kind: entry.EntryKind,
-) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+  kind: archive.EntryKind,
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
   let canonical = case kind {
-    entry.Directory -> path <> "/"
-    _ -> path
+    archive.Directory -> path <> "/"
+    archive.File(_) | archive.Symlink(_) | archive.Hardlink(_) -> path
   }
 
   let canonical_bytes = bit_array.from_string(canonical)
@@ -707,10 +585,10 @@ fn split_name_field(
 fn attempt_prefix_split(
   canonical: String,
   total_bytes: Int,
-) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
   case total_bytes > name_size + prefix_size + 1 {
     True ->
-      Error(error.ArchiveEntryRejected(
+      Error(archive.EntryRejected(
         path: canonical,
         reason: "name longer than 256 bytes (USTAR limit)",
       ))
@@ -723,7 +601,7 @@ fn attempt_prefix_split(
             right_pad(bit_array.from_string(prefix), prefix_size, 0),
           ))
         None ->
-          Error(error.ArchiveEntryRejected(
+          Error(archive.EntryRejected(
             path: canonical,
             reason: "no USTAR-compatible prefix/name split",
           ))
@@ -790,11 +668,11 @@ fn fit_field(
   value: String,
   width: Int,
   kind kind: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let bytes = bit_array.from_string(value)
   case bit_array.byte_size(bytes) > width {
     True ->
-      Error(error.ArchiveEntryRejected(
+      Error(archive.EntryRejected(
         path: value,
         reason: kind <> " longer than " <> int.to_string(width) <> " bytes",
       ))
@@ -814,12 +692,12 @@ fn checked_octal_field(
   value: Int,
   width: Int,
   field: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let digit_width = width - 1
   let max_value = pow_int(8, digit_width) - 1
   case value < 0 || value > max_value {
     True ->
-      Error(error.ArchiveFieldOverflow(
+      Error(archive.FieldOverflow(
         field: "tar " <> field,
         value: value,
         max: max_value,
@@ -937,16 +815,16 @@ fn read_string_field(
   block: BitArray,
   offset: Int,
   width: Int,
-) -> Result(String, error.ArchiveError) {
+) -> Result(String, archive.ArchiveError) {
   case bit_array.slice(block, offset, width) {
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "header field out of bounds"))
+      Error(archive.InvalidData(message: "header field out of bounds"))
     Ok(slice) -> {
-      let trimmed = strip_trailing_nul(slice)
+      let trimmed = bytes.strip_trailing_nul(slice)
       case bit_array.to_string(trimmed) {
         Ok(value) -> Ok(value)
         Error(_) ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "header field contains non-UTF-8 bytes",
           ))
       }
@@ -958,10 +836,10 @@ fn read_octal_field(
   block: BitArray,
   offset: Int,
   width: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case bit_array.slice(block, offset, width) {
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "header field out of bounds"))
+      Error(archive.InvalidData(message: "header field out of bounds"))
     Ok(slice) -> parse_octal(slice, 0, False)
   }
 }
@@ -970,7 +848,7 @@ fn parse_octal(
   bytes: BitArray,
   acc: Int,
   any_digit: Bool,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case bytes {
     <<>> ->
       case any_digit {
@@ -987,9 +865,7 @@ fn parse_octal(
             False -> parse_octal(rest, acc, any_digit)
           }
         OctalInvalid ->
-          Error(error.ArchiveInvalid(
-            message: "invalid octal byte in tar header",
-          ))
+          Error(archive.InvalidData(message: "invalid octal byte in tar header"))
       }
     _ -> Ok(acc)
   }
@@ -1011,29 +887,13 @@ fn classify_octal_byte(byte: Int) -> OctalClass {
   }
 }
 
-fn read_byte(block: BitArray, offset: Int) -> Result(Int, error.ArchiveError) {
+fn read_byte(
+  block: BitArray,
+  offset: Int,
+) -> Result(Int, archive.ArchiveError) {
   case bit_array.slice(block, offset, 1) {
     Ok(<<b>>) -> Ok(b)
-    _ -> Error(error.ArchiveInvalid(message: "header byte out of bounds"))
-  }
-}
-
-fn strip_trailing_nul(bytes: BitArray) -> BitArray {
-  let size = bit_array.byte_size(bytes)
-  strip_trailing_nul_loop(bytes, size)
-}
-
-fn strip_trailing_nul_loop(bytes: BitArray, size: Int) -> BitArray {
-  case size {
-    0 -> <<>>
-    _ ->
-      case bit_array.slice(bytes, size - 1, 1) {
-        Ok(<<0>>) -> strip_trailing_nul_loop(bytes, size - 1)
-        _ -> {
-          let assert Ok(slice) = bit_array.slice(bytes, 0, size)
-          slice
-        }
-      }
+    _ -> Error(archive.InvalidData(message: "header byte out of bounds"))
   }
 }
 
@@ -1046,19 +906,19 @@ fn trim_trailing_slash(value: String) -> String {
 
 fn verify_double_zero_terminator(
   bytes: BitArray,
-  acc: List(entry.Entry),
-) -> Result(List(entry.Entry), error.ArchiveError) {
+  acc: List(archive.Entry),
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   case bit_array.slice(bytes, block_size, block_size) {
     Ok(second) ->
       case is_zero_block(second) {
         True -> Ok(acc)
         False ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "tar stream ended after a single zero block",
           ))
       }
     Error(_) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "tar stream ended after a single zero block",
       ))
   }

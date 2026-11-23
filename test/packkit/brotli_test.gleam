@@ -1,24 +1,19 @@
 import gleam/bit_array
 import gleeunit/should
-import packkit/brotli
+import packkit
 import packkit/codec
-
-pub fn codec_marker_test() -> Nil {
-  brotli.codec()
-  |> codec.name
-  |> should.equal("brotli")
-}
+import packkit/internal/brotli
 
 pub fn encode_empty_stream_round_trips_test() -> Nil {
   let assert Ok(stream) = brotli.encode(bytes: <<>>)
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<>>))
 }
 
 pub fn encode_small_payload_round_trips_test() -> Nil {
   let payload = <<"packkit brotli uncompressed metablock":utf8>>
   let assert Ok(stream) = brotli.encode(bytes: payload)
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(payload))
 }
 
@@ -28,7 +23,7 @@ pub fn encode_multi_chunk_payload_round_trips_test() -> Nil {
   let chunk = bit_array.from_string("abcdefghij")
   let big = repeat_chunk(chunk, 7000, <<>>)
   let assert Ok(stream) = brotli.encode(bytes: big)
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(big))
 }
 
@@ -41,26 +36,32 @@ fn repeat_chunk(chunk: BitArray, times: Int, acc: BitArray) -> BitArray {
 
 pub fn decode_empty_stream_test() -> Nil {
   // `printf '' | brotli -c` — canonical empty stream byte.
-  brotli.decode(bytes: <<0x3F>>)
+  packkit.decompress(<<0x3F>>, with: codec.Brotli)
   |> should.equal(Ok(<<>>))
 }
 
 pub fn decode_hi_uncompressed_metablock_test() -> Nil {
   // `printf 'hi' | brotli -c` — brotli emits a single ISUNCOMPRESSED
   // metablock for tiny inputs that it can't compress profitably.
-  brotli.decode(bytes: <<0x8F, 0x00, 0x80, 0x68, 0x69, 0x03>>)
+  packkit.decompress(<<0x8F, 0x00, 0x80, 0x68, 0x69, 0x03>>, with: codec.Brotli)
   |> should.equal(Ok(<<"hi":utf8>>))
 }
 
 pub fn decode_hello_uncompressed_metablock_test() -> Nil {
   // `printf 'hello' | brotli -c`.
-  brotli.decode(bytes: <<0x0F, 0x02, 0x80, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x03>>)
+  packkit.decompress(
+    <<0x0F, 0x02, 0x80, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x03>>,
+    with: codec.Brotli,
+  )
   |> should.equal(Ok(<<"hello":utf8>>))
 }
 
 pub fn decode_abc_uncompressed_metablock_test() -> Nil {
   // `printf 'abc' | brotli -c`.
-  brotli.decode(bytes: <<0x0F, 0x01, 0x80, 0x61, 0x62, 0x63, 0x03>>)
+  packkit.decompress(
+    <<0x0F, 0x01, 0x80, 0x61, 0x62, 0x63, 0x03>>,
+    with: codec.Brotli,
+  )
   |> should.equal(Ok(<<"abc":utf8>>))
 }
 
@@ -70,7 +71,7 @@ pub fn decode_hi_with_wbits_18_test() -> Nil {
   // of `read_wbits`.  Decoder treats the metablock as uncompressed
   // regardless of WBITS value, so this is also a smoke test that the
   // fixed prefix consumes the right number of bits.
-  brotli.decode(bytes: <<0x83, 0x00, 0x80, 0x68, 0x69, 0x03>>)
+  packkit.decompress(<<0x83, 0x00, 0x80, 0x68, 0x69, 0x03>>, with: codec.Brotli)
   |> should.equal(Ok(<<"hi":utf8>>))
 }
 
@@ -79,7 +80,7 @@ pub fn decode_compressed_10a_test() -> Nil {
   // compressed metablock using simple-form prefix codes plus a single
   // in-window LZ77 copy (1 literal 'a' + 9-byte copy at distance 1).
   let stream = <<0x1F, 0x09, 0x00, 0xF8, 0x25, 0xC2, 0x82, 0x84, 0x00, 0x00>>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<"aaaaaaaaaa":utf8>>))
 }
 
@@ -89,14 +90,14 @@ pub fn decode_compressed_10a_with_small_wbits_test() -> Nil {
   // `read_wbits` (fixed earlier this session) and the distance
   // decoder's NPOSTFIX/NDIRECT-derived parameters.
   let stream = <<0xA1, 0x48, 0x00, 0xC0, 0x2F, 0x11, 0x16, 0x24, 0x04, 0x00>>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<"aaaaaaaaaa":utf8>>))
 }
 
 pub fn decode_compressed_16a_test() -> Nil {
   // `printf 'aaaaaaaaaaaaaaaa' | brotli -c` (16 `a`s).
   let stream = <<0x1F, 0x0F, 0x00, 0xF8, 0x25, 0xC2, 0x22, 0x8C, 0x00, 0x00>>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<"aaaaaaaaaaaaaaaa":utf8>>))
 }
 
@@ -109,7 +110,7 @@ pub fn decode_compressed_time_of_the_day_test() -> Nil {
     0x1F, 0x0E, 0x00, 0xF8, 0xA5, 0xC2, 0xF2, 0x52, 0x10, 0x49, 0x84, 0x29, 0x80,
     0x56, 0xA2, 0x7E, 0x8A, 0x20, 0x01,
   >>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<"time of the day":utf8>>))
 }
 
@@ -122,7 +123,7 @@ pub fn decode_compressed_quotes_mixed_test() -> Nil {
     0x32, 0x4B, 0x6D, 0xE8, 0x63, 0x72, 0xED, 0x83, 0xFB, 0xBC, 0xFC, 0x7E, 0x01,
     0x9A, 0xC6, 0x3A,
   >>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(
     Ok(<<"abc\"def,ghi\"jkl,mno\"pqr,stu\"vwx,yza\"bcd,efg":utf8>>),
   )
@@ -154,7 +155,7 @@ pub fn decode_compressed_code_test() -> Nil {
     0x7E, 0x10, 0x63, 0xB0, 0x25, 0x44, 0x59, 0x59, 0x42, 0x64, 0x4E, 0xB7, 0xF3,
     0x65, 0x0E,
   >>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(bit_array.from_string(expected)))
 }
 
@@ -187,7 +188,7 @@ pub fn decode_compressed_lorem_ipsum_test() -> Nil {
   >>
   let expected =
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod\ntempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim\nveniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea\ncommodo consequat. Duis aute irure dolor in reprehenderit in voluptate\nvelit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat\ncupidatat non proident, sunt in culpa qui officia deserunt mollit anim id\nest laborum.\n"
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(bit_array.from_string(expected)))
 }
 
@@ -200,7 +201,7 @@ pub fn decode_compressed_hello_world_test() -> Nil {
     0x09, 0x04, 0x41, 0xEA, 0x41, 0x14, 0xA9, 0xE5, 0x16, 0xC5, 0xD2, 0x91, 0x58,
     0x5D, 0x3B, 0x5A, 0xB2, 0x77, 0xE2, 0xD7, 0xC1, 0xD6, 0x02,
   >>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<"Hello, World! This is brotli testing.":utf8>>))
 }
 
@@ -211,6 +212,6 @@ pub fn decode_compressed_20a_test() -> Nil {
     0x1F, 0x13, 0x00, 0xF8, 0xA5, 0xCB, 0xD2, 0xDA, 0xE8, 0x84, 0x18, 0x01, 0x80,
     0x1B,
   >>
-  brotli.decode(bytes: stream)
+  packkit.decompress(stream, with: codec.Brotli)
   |> should.equal(Ok(<<"timetimetimetimetime":utf8>>))
 }

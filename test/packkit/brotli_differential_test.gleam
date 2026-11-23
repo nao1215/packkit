@@ -8,61 +8,62 @@
 
 import gleam/bit_array
 import gleeunit/should
-import packkit/brotli
+import packkit
+import packkit/codec
 
 pub fn diff_all_a_1_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("0F00806103")
   let expected = bit_array.from_string("a")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_x_1_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("0F00807803")
   let expected = bit_array.from_string("x")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_a_2_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("8F0080616103")
   let expected = bit_array.from_string("aa")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_x_2_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("8F0080787803")
   let expected = bit_array.from_string("xx")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_a_9_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("1F0800F825C262840000")
   let expected = bit_array.from_string("aaaaaaaaa")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_x_9_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("1F0800F825F062840000")
   let expected = bit_array.from_string("xxxxxxxxx")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_a_15_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("1F0E00F825C2028C0020")
   let expected = bit_array.from_string("aaaaaaaaaaaaaaa")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_all_x_15_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("1F0E00F825F0028C0020")
   let expected = bit_array.from_string("xxxxxxxxxxxxxxx")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -72,7 +73,7 @@ pub fn diff_all_a_100_test() -> Nil {
     bit_array.from_string(
       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -82,7 +83,7 @@ pub fn diff_all_x_100_test() -> Nil {
     bit_array.from_string(
       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -92,7 +93,7 @@ pub fn diff_all_a_1000_test() -> Nil {
     bit_array.from_string(
       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -102,14 +103,14 @@ pub fn diff_all_x_1000_test() -> Nil {
     bit_array.from_string(
       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
 pub fn diff_abc_cycle_10_test() -> Nil {
   let assert Ok(input) = bit_array.base16_decode("1F1D00F825C3C4C6829B20A01A")
   let expected = bit_array.from_string("abcabcabcabcabcabcabcabcabcabc")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -120,7 +121,7 @@ pub fn diff_abcdefghij_cycle_10_test() -> Nil {
     bit_array.from_string(
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -130,7 +131,7 @@ pub fn diff_abc_cycle_50_test() -> Nil {
     bit_array.from_string(
       "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -141,7 +142,7 @@ pub fn diff_abcdefghij_cycle_50_test() -> Nil {
     bit_array.from_string(
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -151,7 +152,7 @@ pub fn diff_abc_cycle_500_test() -> Nil {
     bit_array.from_string(
       "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -162,7 +163,7 @@ pub fn diff_abcdefghij_cycle_500_test() -> Nil {
     bit_array.from_string(
       "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -175,7 +176,7 @@ pub fn diff_ascii_alphabet_test() -> Nil {
     bit_array.from_string(
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -188,7 +189,7 @@ pub fn diff_ascii_alphabet_x4_test() -> Nil {
     bit_array.from_string(
       "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -196,7 +197,7 @@ pub fn diff_hello_world_test() -> Nil {
   let assert Ok(input) =
     bit_array.base16_decode("0F068048656C6C6F2C20576F726C642103")
   let expected = bit_array.from_string("Hello, World!")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -209,7 +210,7 @@ pub fn diff_the_quick_brown_fox_test() -> Nil {
     bit_array.from_string(
       "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. ",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -222,7 +223,7 @@ pub fn diff_json_small_test() -> Nil {
     bit_array.from_string(
       "{\"name\":\"alice\",\"age\":30,\"name\":\"bob\",\"age\":25,\"name\":\"carol\",\"age\":35}",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -235,7 +236,7 @@ pub fn diff_json_array_of_quoted_test() -> Nil {
     bit_array.from_string(
       "[\"alpha\",\"beta\",\"gamma\",\"delta\",\"epsilon\",\"zeta\",\"eta\",\"theta\",\"iota\"]",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -248,7 +249,7 @@ pub fn diff_json_full_test() -> Nil {
     bit_array.from_string(
       "{\"users\":[{\"name\":\"alice\",\"age\":30,\"email\":\"alice@example.com\",\"active\":true,\"score\":99.5},{\"name\":\"bob\",\"age\":25,\"email\":\"bob@example.com\",\"active\":false,\"score\":87.3},{\"name\":\"charlie\",\"age\":35,\"email\":\"charlie@example.com\",\"active\":true,\"score\":91.7}],\"timestamp\":\"2024-01-15T12:34:56Z\",\"version\":\"1.2.3-beta\",\"tags\":[\"api\",\"stable\",\"production\"],\"settings\":{\"timeout\":30000,\"retries\":5,\"verbose\":false}}",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -261,7 +262,7 @@ pub fn diff_json_keys_only_test() -> Nil {
     bit_array.from_string(
       "{\"a\":1,\"bb\":2,\"ccc\":3,\"dddd\":4,\"eeeee\":5,\"ffffff\":6,\"ggggggg\":7,\"hhhhhhhh\":8,\"iiiiiiiii\":9,\"jjjjjjjjjj\":10,\"kkkkkkkkkkk\":11,\"llllllllllll\":12,\"mmmmmmmmmmmmm\":13}",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -269,7 +270,7 @@ pub fn diff_comma_after_quote_short_test() -> Nil {
   let assert Ok(input) =
     bit_array.base16_decode("0F09802261222C2262222C2263222C2264222C22652203")
   let expected = bit_array.from_string("\"a\",\"b\",\"c\",\"d\",\"e\"")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -282,7 +283,7 @@ pub fn diff_comma_after_quote_long_test() -> Nil {
     bit_array.from_string(
       "\"alpha\",\"beta\",\"gamma\",\"delta\",\"epsilon\",\"zeta\",\"eta\",\"theta\",\"iota\",\"kappa\",\"lambda\",\"mu\",\"nu\",\"xi\",\"omicron\",\"pi\",\"rho\",\"sigma\"",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -293,7 +294,7 @@ pub fn diff_brace_after_quote_test() -> Nil {
     )
   let expected =
     bit_array.from_string("{\"a\":1}{\"b\":2}{\"c\":3}{\"d\":4}{\"e\":5}")
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -306,7 +307,7 @@ pub fn diff_bracket_after_quote_test() -> Nil {
     bit_array.from_string(
       "[\"a\",\"b\",\"c\"][\"d\",\"e\",\"f\"][\"g\",\"h\",\"i\"]",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -319,7 +320,7 @@ pub fn diff_code_like_test() -> Nil {
     bit_array.from_string(
       "function foo(x, y) {\n  return x + y * 2;\n}\nfunction bar(a, b) {\n  return a / b;\n}\n",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -332,7 +333,7 @@ pub fn diff_random_ascii_50_test() -> Nil {
     bit_array.from_string(
       "4#dRA;@JN$txf\"z#QfT\t212uKFN6[|DwB+,O-SK[2r*K-?['rX",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }
 
@@ -345,6 +346,6 @@ pub fn diff_random_ascii_200_test() -> Nil {
     bit_array.from_string(
       "@*TtG)3PeH,2~\\S8khp:?g/nXl3]\t;HZ<vZX9N\u{000B}=V,'1@iYDUuB}0(,\\mv=e$a*p$E?Uu?m\t\rF\nd4$Gq^x]e[2T+,JP S%Z1pT;^{_ CBi:P/+12!RG~\"Ri/T8j\\S+aY\nPfi!=MJHkJQmh3Z(e:QOu-k$Cgl+KM[$6V0);tuCk1&B.IUPNtB/Vk\\Rp:78(+1\nj(0K\t%Q",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(Ok(expected))
 }

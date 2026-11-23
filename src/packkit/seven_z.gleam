@@ -1,26 +1,11 @@
-//// 7z archive — minimal pure-Gleam reader.
+//// Writing 7z with a compression method or AES-256 encryption, and
+//// reading encrypted 7z archives. `packkit.write` compresses with LZMA,
+//// and `packkit.read` reads any unencrypted 7z archive.
 ////
-//// The reader handles the common case produced by `7z a` on a small
-//// payload: a single packed stream wrapped in a single folder that
-//// uses one coder.  Recognised single-coder ids:
-////   - LZMA2 (`0x21`)
-////   - raw LZMA (`0x03 0x01 0x01`)
-////   - Copy (`0x00`) — identity passthrough
-////   - Deflate (`0x04 0x01 0x08`) — raw DEFLATE, delegated to packkit/deflate
-////   - BZip2 (`0x04 0x02 0x02`) — full BZh stream, delegated to packkit/bzip2
-//// Multiple files packed into that folder are supported when the
-//// archive carries a `SubStreamsInfo` block — the parser reads the
-//// per-substream sizes from `kSize` (0x09), derives the final size
-//// from the folder's total, and splits the decoded stream
-//// accordingly.  Multi-coder folders (BCJ filters in front of LZMA2,
-//// AES decryption in front of LZMA2), AES-256-CBC encryption with
-//// p7zip's SHA-256-based key derivation (`06 F1 07 01`), and multiple
-//// folders are supported.  Header encryption (`-mhe=on`, encrypts the
-//// next-header itself) is intentionally rejected with
-//// `ArchiveNotImplemented`.  AES-encrypted archives require the
-//// `decode_with_password` / `decode_with_password_and_limits` entry
-//// points.  The encoder is unaffected — it still emits a single
-//// LZMA-coded folder regardless of which coders the decoder accepts.
+//// The writer puts every file in one LZMA, Deflate, bzip2 or Copy folder
+//// and stores files only, not directories or links. The reader also
+//// accepts LZMA2, the BCJ, BCJ2 and Delta filters, and archives with
+//// several folders.
 
 import gleam/bit_array
 import gleam/bool
@@ -30,15 +15,15 @@ import gleam/option.{type Option}
 import gleam/order
 import gleam/result
 import gleam/string
-import packkit/archive as archives
-import packkit/bzip2
-import packkit/checksum
-import packkit/deflate
-import packkit/entry
-import packkit/error
+import packkit/archive
+import packkit/codec
 import packkit/internal/aes
 import packkit/internal/bcj
 import packkit/internal/bcj2
+import packkit/internal/bzip2
+import packkit/internal/checksum
+import packkit/internal/deflate
+import packkit/internal/entry
 import packkit/internal/lzma
 import packkit/limit
 
@@ -211,171 +196,71 @@ const nid_start_pos: Int = 0x18
 
 const nid_dummy: Int = 0x19
 
-/// 7z archive format marker.
-pub fn format() -> archives.ArchiveFormat {
-  archives.seven_z()
+/// The compression method for the folder that holds every file body.
+pub type Method {
+  /// LZMA with `lc=3`, `lp=0`, `pb=2` and a 64 KiB dictionary, the
+  /// defaults of `7z a`.
+  Lzma
+  /// No compression.
+  Copy
+  /// Raw DEFLATE.
+  Deflate
+  /// bzip2.
+  Bzip2
 }
 
-/// Create an empty 7z archive value.
-pub fn new() -> archives.Archive {
-  archives.new(format: format())
-}
-
-/// Coder selection for the single-folder 7z encoder.  Mirrors the
-/// `7z a -m0=<method>` CLI option: every entry's body is concatenated,
-/// then the whole buffer is fed through the chosen coder and emitted
-/// as one folder.  The decoder side accepts the same set plus extra
-/// coder ids it doesn't yet have an encoder for (LZMA2, BCJ family,
-/// Delta).
-pub opaque type Method {
-  MethodLzma
-  MethodCopy
-  MethodDeflate
-  MethodBzip2
-}
-
-/// Default `Method`: raw LZMA1 with the historical `7z a` defaults
-/// (lc=3 / lp=0 / pb=2, 64 KiB dictionary).  Equivalent to passing
-/// `seven_z.lzma()` to `encode_with_method`.
-pub fn lzma() -> Method {
-  MethodLzma
-}
-
-/// `Method` constructor: identity (no compression).  Equivalent to
-/// `7z a -m0=Copy`.  The packed bytes stored in the folder are the
-/// concatenated entry bodies verbatim.
-pub fn copy() -> Method {
-  MethodCopy
-}
-
-/// `Method` constructor: raw DEFLATE (no zlib / gzip wrapper).  The
-/// concatenated entry bodies go through `packkit/deflate.encode`.
-/// Equivalent to `7z a -m0=Deflate`.
-pub fn deflate() -> Method {
-  MethodDeflate
-}
-
-/// `Method` constructor: full bzip2 stream (with `BZh` magic and CRCs).
-/// The concatenated entry bodies go through `packkit/bzip2.encode`.
-/// Equivalent to `7z a -m0=BZip2`.
-pub fn bzip2() -> Method {
-  MethodBzip2
-}
-
-/// Encode a logical archive to a 7z byte stream.
+/// Whether and how to encrypt a 7z archive with AES-256.
 ///
-/// The encoder produces a single-folder, single-coder archive that
-/// uses a raw LZMA1 coder for the packed stream.  All file bodies are
-/// concatenated into one logical substream which is then fed to
-/// `packkit/internal/lzma.encode_literal_only`; if the archive holds
-/// more than one entry, the per-substream sizes are emitted via
-/// `SubStreamsInfo` so the standard decoder can split the decompressed
-/// bytes back into individual entries.
+/// The salt is empty and the IV is all zeros, so two archives made with
+/// the same password and the same contents have the same bytes. Key
+/// derivation runs 2^19 rounds of SHA-256, which takes several seconds on
+/// JavaScript.
+pub type Encryption {
+  Unencrypted
+  /// Encrypts the file contents. Names stay readable, like `7z a -p`.
+  EncryptContents(password: String)
+  /// Encrypts the file contents and the header with the names, like
+  /// `7z a -p -mhe=on`.
+  EncryptContentsAndHeaders(password: String)
+}
+
+/// Writes `archive` as 7z with all file bodies in one folder compressed
+/// with `method`.
 ///
-/// Restrictions: only `File` entries are accepted (no directories,
-/// symlinks, or hardlinks — these would require the `EmptyStream` /
-/// `Attribute` / `WinAttributes` blocks the reader does not yet
-/// validate).  Empty archives are rejected because the 7z format
-/// requires `MainStreamsInfo` to be present once a `Header` block
-/// exists.
+/// Returns `EntryRejected` for an empty archive and for directories and
+/// links, which this writer does not store, and `CommentUnsupported`
+/// when the archive has a comment.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let notes = archive.new_entry(path: "notes.txt", kind: File(<<"hi":utf8>>))
+/// encode(
+///   Archive(format: SevenZ, entries: [notes], comment: None),
+///   method: Lzma,
+///   encryption: EncryptContents(password: "secret"),
+/// )
+/// ```
+///
 pub fn encode(
-  archive archive_value: archives.Archive,
-) -> Result(BitArray, error.ArchiveError) {
-  encode_with_method(archive: archive_value, method: lzma())
-}
-
-/// Same as `encode/1` but lets the caller pick the coder.  All four
-/// methods produce a single-folder, single-coder archive — Copy is
-/// just the raw bytes; Deflate / BZip2 / LZMA dispatch to the
-/// corresponding packkit codec.  Cross-method round-trips work
-/// because the decoder accepts each of these coder ids.
-pub fn encode_with_method(
-  archive archive_value: archives.Archive,
+  archive_value: archive.Archive,
   method method: Method,
-) -> Result(BitArray, error.ArchiveError) {
-  do_encode(archive_value, method, option.None, option.None)
-}
-
-/// Encode a logical archive to a 7z byte stream with AES-256-CBC
-/// payload encryption (coder id `06 F1 07 01`).  Plumbed into the
-/// folder as a 2-coder chain `[AES, <method>]` so the existing
-/// `decode_with_password` path reads it back verbatim.
-///
-/// The encoder uses **empty salt** and **a 16-byte all-zero IV** for
-/// determinism — without an FFI into a platform CSPRNG there is no
-/// good source of randomness in pure Gleam.  This is fine for
-/// archives that go to a trusted recipient over an authenticated
-/// channel, but it is NOT a substitute for randomised encryption —
-/// two archives encrypted with the same password produce identical
-/// ciphertext blocks for identical plaintext prefixes, which leaks
-/// information about the payload.  If you need randomised
-/// encryption, encrypt the payload yourself before passing it in or
-/// pre-generate a 16-byte IV from a CSPRNG and feed it back through
-/// a future BYO-IV API.
-///
-/// The inner coder defaults to LZMA — matching what `7z a -p<pw>`
-/// emits — and the key derivation runs the canonical 2^19 = 524288
-/// SHA-256 iterations, which on the JS target is slow (multiple
-/// seconds per archive).
-pub fn encode_with_password(
-  archive archive_value: archives.Archive,
-  password password: String,
-) -> Result(BitArray, error.ArchiveError) {
-  encode_with_password_and_method(
-    archive: archive_value,
-    password: password,
-    method: lzma(),
-  )
-}
-
-/// Same as `encode_with_password` but lets the caller pick the inner
-/// coder (Copy / Deflate / BZip2 / LZMA).  Salt + IV are still empty /
-/// all-zero — see `encode_with_password` for the determinism caveat.
-pub fn encode_with_password_and_method(
-  archive archive_value: archives.Archive,
-  password password: String,
-  method method: Method,
-) -> Result(BitArray, error.ArchiveError) {
-  do_encode(
-    archive_value,
-    method,
-    option.Some(default_encryption_spec(password)),
-    option.None,
-  )
-}
-
-/// Encode an archive with both the payload AND the next-header bytes
-/// AES-encrypted — the on-disk equivalent of `7z a -p<pw> -mhe=on`.
-/// The signature header points at an "encoded next header" (NID 0x17)
-/// whose StreamsInfo block tells the decoder where the AES-encrypted
-/// next-header pack lives; the next header itself is plain bytes
-/// AES-CBC-encrypted with the user's password (no inner compression
-/// — the header is small enough that LZMA isn't worth the dispatch
-/// cost).
-///
-/// The same determinism caveat as `encode_with_password` applies: salt
-/// is empty and IV is all zeros.
-pub fn encode_with_password_and_header_encryption(
-  archive archive_value: archives.Archive,
-  password password: String,
-) -> Result(BitArray, error.ArchiveError) {
-  encode_with_password_and_header_encryption_and_method(
-    archive: archive_value,
-    password: password,
-    method: lzma(),
-  )
-}
-
-/// Like `encode_with_password_and_header_encryption` but lets the
-/// caller pick the inner coder for the *payload*.  The header is
-/// always wrapped in just AES (no inner method).
-pub fn encode_with_password_and_header_encryption_and_method(
-  archive archive_value: archives.Archive,
-  password password: String,
-  method method: Method,
-) -> Result(BitArray, error.ArchiveError) {
-  let spec = default_encryption_spec(password)
-  do_encode(archive_value, method, option.Some(spec), option.Some(spec))
+  encryption encryption: Encryption,
+) -> Result(BitArray, archive.ArchiveError) {
+  use _ <- result.try(entry.validate_all(archive_value.entries))
+  use _ <- result.try(entry.reject_comment(archive_value))
+  let #(contents, headers) = case encryption {
+    Unencrypted -> #(option.None, option.None)
+    EncryptContents(password) -> #(
+      option.Some(default_encryption_spec(password)),
+      option.None,
+    )
+    EncryptContentsAndHeaders(password) -> {
+      let spec = default_encryption_spec(password)
+      #(option.Some(spec), option.Some(spec))
+    }
+  }
+  do_encode(archive_value, method, contents, headers)
 }
 
 fn default_encryption_spec(password: String) -> EncryptionSpec {
@@ -397,15 +282,15 @@ type EncryptionSpec {
 }
 
 fn do_encode(
-  archive_value: archives.Archive,
+  archive_value: archive.Archive,
   method: Method,
   encryption: Option(EncryptionSpec),
   header_encryption: Option(EncryptionSpec),
-) -> Result(BitArray, error.ArchiveError) {
-  let entries = archives.entries(archive_value)
+) -> Result(BitArray, archive.ArchiveError) {
+  let entries = archive_value.entries
   case entries {
     [] ->
-      Error(error.ArchiveEntryRejected(
+      Error(archive.EntryRejected(
         path: "<archive>",
         reason: "7z encoder requires at least one entry",
       ))
@@ -414,15 +299,15 @@ fn do_encode(
 }
 
 fn encode_entries(
-  entries: List(entry.Entry),
+  entries: List(archive.Entry),
   method: Method,
   encryption: Option(EncryptionSpec),
   header_encryption: Option(EncryptionSpec),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   use _ <- result.try(validate_entries_for_encode(entries))
 
   let bodies = list.map(entries, entry.body)
-  let names = list.map(entries, fn(e) { entry.to_string(entry.path(e)) })
+  let names = list.map(entries, fn(e) { e.path })
   let unpack_sizes = list.map(bodies, bit_array.byte_size)
   let total_unpack = sum_list(unpack_sizes, 0)
   let concatenated = bit_array.concat(bodies)
@@ -490,8 +375,7 @@ fn encode_entries(
   // -- FilesInfo ---------------------------------------------------
   use names_block <- result.try(encode_names_block(names))
   let num_files = list.length(entries)
-  let mtimes_unix =
-    list.map(entries, fn(e) { entry.modified_at_unix(entry.metadata(e)) })
+  let mtimes_unix = list.map(entries, fn(e) { e.modified_at })
   // Only emit the Mtime block when at least one entry carries a
   // recorded mtime (> 0).  An archive of "no mtime" entries stays
   // bit-for-bit identical to the pre-mtime encoder output, so a
@@ -567,7 +451,7 @@ fn maybe_encrypt_next_header(
   plain_next_header: BitArray,
   payload_pack_size: Int,
   header_encryption: Option(EncryptionSpec),
-) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
   case header_encryption {
     option.None -> Ok(#(<<>>, plain_next_header))
     option.Some(spec) -> {
@@ -641,17 +525,26 @@ fn build_encoded_next_header_for_aes(
   ])
 }
 
+// The last second a 64-bit FILETIME (100 ns ticks since 1601) can hold.
+const max_filetime_unix: Int = 1_833_029_933_770
+
 fn validate_entries_for_encode(
-  entries: List(entry.Entry),
-) -> Result(Nil, error.ArchiveError) {
+  entries: List(archive.Entry),
+) -> Result(Nil, archive.ArchiveError) {
   case entries {
     [] -> Ok(Nil)
+    [head, ..] if head.modified_at > max_filetime_unix ->
+      Error(archive.FieldOverflow(
+        field: "7z mtime",
+        value: head.modified_at,
+        max: max_filetime_unix,
+      ))
     [head, ..rest] ->
-      case entry.kind(head) {
-        entry.File -> validate_entries_for_encode(rest)
-        _ ->
-          Error(error.ArchiveEntryRejected(
-            path: entry.to_string(entry.path(head)),
+      case head.kind {
+        archive.File(_) -> validate_entries_for_encode(rest)
+        archive.Directory | archive.Symlink(_) | archive.Hardlink(_) ->
+          Error(archive.EntryRejected(
+            path: head.path,
             reason: "7z encoder currently supports File entries only",
           ))
       }
@@ -667,9 +560,9 @@ fn validate_entries_for_encode(
 fn encode_via_method(
   bytes: BitArray,
   method: Method,
-) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
   case method {
-    MethodLzma -> {
+    Lzma -> {
       // LZMA1 with the historical `7z a` defaults (`lc=3 / lp=0 /
       // pb=2`, 64 KiB dictionary).  Coder flags 0x23 = id_size=3 +
       // attrs present.
@@ -688,13 +581,13 @@ fn encode_via_method(
       >>
       Ok(#(compressed, coder_def))
     }
-    MethodCopy -> {
+    Copy -> {
       // Identity coder: packed bytes ARE the unpack bytes.  Coder
       // flags 0x01 = id_size=1, no attrs.
       let coder_def = <<0x01, copy_coder_id>>
       Ok(#(bytes, coder_def))
     }
-    MethodDeflate -> {
+    Deflate -> {
       // Raw DEFLATE (no zlib / gzip wrapper).  Coder id is the 3-byte
       // `04 01 08`; flags 0x03 = id_size=3, no attrs.
       use compressed <- result.try(
@@ -708,7 +601,7 @@ fn encode_via_method(
       >>
       Ok(#(compressed, coder_def))
     }
-    MethodBzip2 -> {
+    Bzip2 -> {
       // Full `BZh` bzip2 stream (with magic + CRCs).  Coder id is
       // the 3-byte `04 02 02`; flags 0x03 = id_size=3, no attrs.
       use compressed <- result.try(
@@ -747,7 +640,7 @@ fn maybe_wrap_with_aes(
   inner_packed_size: Int,
   total_unpack: Int,
   encryption: Option(EncryptionSpec),
-) -> Result(#(BitArray, FolderEncoding), error.ArchiveError) {
+) -> Result(#(BitArray, FolderEncoding), archive.ArchiveError) {
   case encryption {
     option.None ->
       Ok(#(
@@ -820,19 +713,19 @@ fn build_aes_props_tail(
 
 fn build_aes_coder_def(
   spec: EncryptionSpec,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let salt_size = bit_array.byte_size(spec.salt)
   let iv_size = bit_array.byte_size(spec.iv)
   use <- bool.guard(
     when: salt_size > aes_max_field_bytes || iv_size > aes_max_field_bytes,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "7z AES encoder: salt or iv exceeds 16 bytes",
     )),
   )
   use <- bool.guard(
     when: spec.num_cycles_power < 0
       || spec.num_cycles_power >= aes_num_cycles_mask,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "7z AES encoder: numCyclesPower must be in 0..62 (0x3F is reserved)",
     )),
   )
@@ -999,7 +892,7 @@ fn pack_bool_bits_loop(
 
 fn encode_names_block(
   names: List(String),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   // External-flag byte (0 = inline) followed by NUL-terminated
   // UTF-16 LE strings, one per file.
   use bodies <- result.try(encode_names_loop(names, <<>>))
@@ -1009,7 +902,7 @@ fn encode_names_block(
 fn encode_names_loop(
   names: List(String),
   acc: BitArray,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case names {
     [] -> Ok(acc)
     [name, ..rest] -> {
@@ -1019,7 +912,9 @@ fn encode_names_loop(
   }
 }
 
-fn encode_utf16_le_name(name: String) -> Result(BitArray, error.ArchiveError) {
+fn encode_utf16_le_name(
+  name: String,
+) -> Result(BitArray, archive.ArchiveError) {
   let codepoints = string.to_utf_codepoints(name)
   use body <- result.try(encode_utf16_le_codepoints(codepoints, <<>>, name))
   // NUL terminator (two zero bytes for UTF-16 LE).
@@ -1030,7 +925,7 @@ fn encode_utf16_le_codepoints(
   codepoints: List(UtfCodepoint),
   acc: BitArray,
   full_name: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case codepoints {
     [] -> Ok(acc)
     [cp, ..rest] -> {
@@ -1042,7 +937,7 @@ fn encode_utf16_le_codepoints(
           encode_utf16_le_codepoints(rest, <<acc:bits, low, high>>, full_name)
         }
         False ->
-          Error(error.ArchiveEntryRejected(
+          Error(archive.EntryRejected(
             path: full_name,
             reason: "7z encoder requires BMP-only file names (no UTF-16 surrogate pairs yet)",
           ))
@@ -1090,46 +985,26 @@ fn int_pow(base: Int, exp: Int) -> Int {
   }
 }
 
-/// Decode a 7z byte stream using the default limits.
+@internal
 pub fn decode(
   bytes bytes: BitArray,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_internal(bytes, option.None, limit.default())
-}
-
-/// Decode a 7z byte stream using explicit limits.  Enforces
-/// `max_input_bytes` at entry, `max_output_bytes` against the
-/// declared unpack size before invoking the LZMA/LZMA2 decoder,
-/// and `max_members` / `max_entry_depth` while materialising the
-/// logical entry list.
-pub fn decode_with_limits(
-  bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   decode_internal(bytes, option.None, limits)
 }
 
-/// Decode a 7z byte stream that contains an AES-256 encrypted folder.
-/// `password` is applied to every AES-coded folder via the SHA-256
-/// key-derivation routine p7zip uses (`numCyclesPower` rounds of
-/// `sha256(salt || utf16le(password) || u64_le(counter))`); folders
-/// without an AES coder decode unchanged.  A wrong password produces
-/// garbage plaintext that the downstream coder (typically LZMA2)
-/// rejects with the usual typed `ArchiveInvalid` error — there's no
-/// authentication tag on the AES layer.
+/// Reads a 7z archive whose folders or header may be encrypted with
+/// AES-256. Folders without encryption are read as usual.
+///
+/// AES in 7z has no authentication tag, so a wrong password shows up as
+/// `InvalidData` from the decompressor that runs after it. Use
+/// `packkit.read` for archives without a password.
+///
 pub fn decode_with_password(
   bytes bytes: BitArray,
   password password: String,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_internal(bytes, option.Some(password), limit.default())
-}
-
-/// Same as `decode_with_password` but with explicit limits.
-pub fn decode_with_password_and_limits(
-  bytes bytes: BitArray,
-  password password: String,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   decode_internal(bytes, option.Some(password), limits)
 }
 
@@ -1137,10 +1012,10 @@ fn decode_internal(
   bytes: BitArray,
   password: Option(String),
   limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -1177,7 +1052,7 @@ fn decode_encoded_header(
   full_archive: BitArray,
   password: Option(String),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   // The encoded-header body is a StreamsInfo block describing the
   // packed stream(s) that contain the *actual* next-header bytes.
   // Parse it through the same MainStreamsInfo parser, then decode the
@@ -1193,7 +1068,7 @@ fn decode_encoded_header(
   )
   case streams {
     HeaderStreamsNone ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z encoded next header has no StreamsInfo",
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
@@ -1236,7 +1111,7 @@ fn decode_encoded_header(
 
 fn parse_signature_header(
   bytes: BitArray,
-) -> Result(#(Int, Int, Int), error.ArchiveError) {
+) -> Result(#(Int, Int, Int), archive.ArchiveError) {
   case bytes {
     <<
       0x37,
@@ -1268,7 +1143,7 @@ fn parse_signature_header(
         |> int.bitwise_or(next_size_lo)
       Ok(#(next_offset, next_size, next_crc))
     }
-    _ -> Error(error.ArchiveInvalid(message: "invalid 7z signature header"))
+    _ -> Error(archive.InvalidData(message: "invalid 7z signature header"))
   }
 }
 
@@ -1332,9 +1207,9 @@ type CoderSpec {
 
 type CoderId {
   Lzma2
-  Lzma
-  Copy
-  Deflate
+  LzmaCoder
+  CopyCoder
+  DeflateCoder
   BZip2
   Delta
   BcjX86
@@ -1353,7 +1228,7 @@ fn parse_header(
   header: BitArray,
   full_archive: BitArray,
   limits: limit.Limits,
-) -> Result(ParsedHeader, error.ArchiveError) {
+) -> Result(ParsedHeader, archive.ArchiveError) {
   case header {
     <<head_nid, rest:bytes>> if head_nid == nid_header -> {
       let parser =
@@ -1371,7 +1246,7 @@ fn parse_header(
       finalize_parsed_header(parser)
     }
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z header must start with the Header NID",
       ))
   }
@@ -1417,7 +1292,7 @@ fn parse_header_body(
   parser: HeaderParser,
   full_archive: BitArray,
   limits: limit.Limits,
-) -> Result(HeaderParser, error.ArchiveError) {
+) -> Result(HeaderParser, archive.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
@@ -1476,11 +1351,9 @@ fn parse_header_body(
           // a specific property.  No p7zip-produced archive sets
           // this; reject for now rather than silently skip with the
           // wrong byte boundary.
-          Error(error.ArchiveNotImplemented(
-            feature: "7z ArchiveProperties (NID 0x02)",
-          ))
+          Error(archive.Unsupported(feature: "7z ArchiveProperties (NID 0x02)"))
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "unexpected 7z header NID " <> int.to_string(nid),
           ))
       }
@@ -1490,7 +1363,7 @@ fn parse_header_body(
 
 fn finalize_parsed_header(
   parser: HeaderParser,
-) -> Result(ParsedHeader, error.ArchiveError) {
+) -> Result(ParsedHeader, archive.ArchiveError) {
   case parser.streams, parser.files {
     HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, sub),
       HeaderFilesParsed(names, empty_streams, empty_files, mtimes_unix)
@@ -1523,7 +1396,7 @@ fn finalize_parsed_header(
         ),
       )
     _, _ ->
-      Error(error.ArchiveInvalid(message: "7z header missing MainStreamsInfo"))
+      Error(archive.InvalidData(message: "7z header missing MainStreamsInfo"))
   }
 }
 
@@ -1532,7 +1405,7 @@ fn finalize_parsed_header(
 fn parse_main_streams_info(
   bytes: BitArray,
   additional_streams: List(BitArray),
-) -> Result(#(HeaderStreams, BitArray), error.ArchiveError) {
+) -> Result(#(HeaderStreams, BitArray), archive.ArchiveError) {
   let state =
     StreamsParser(
       pack_pos: 0,
@@ -1562,14 +1435,14 @@ fn parse_streams_loop(
   bytes: BitArray,
   state: StreamsParser,
   additional_streams: List(BitArray),
-) -> Result(#(HeaderStreams, BitArray), error.ArchiveError) {
+) -> Result(#(HeaderStreams, BitArray), archive.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
         n if n == nid_end ->
           case state.folders {
             [] ->
-              Error(error.ArchiveInvalid(
+              Error(archive.InvalidData(
                 message: "7z MainStreamsInfo missing UnPackInfo",
               ))
             _ ->
@@ -1635,11 +1508,11 @@ fn parse_streams_loop(
           )
         }
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "unexpected 7z MainStreamsInfo NID " <> int.to_string(nid),
           ))
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z MainStreamsInfo"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z MainStreamsInfo"))
   }
 }
 
@@ -1647,7 +1520,7 @@ fn parse_streams_loop(
 
 fn parse_pack_info(
   bytes: BitArray,
-) -> Result(#(Int, List(Int), BitArray), error.ArchiveError) {
+) -> Result(#(Int, List(Int), BitArray), archive.ArchiveError) {
   use #(pack_pos, rest) <- result.try(read_number(bytes))
   use #(num_pack_streams, rest) <- result.try(read_number(rest))
   parse_pack_info_body(rest, pack_pos, num_pack_streams, [])
@@ -1658,7 +1531,7 @@ fn parse_pack_info_body(
   pack_pos: Int,
   num_pack_streams: Int,
   sizes: List(Int),
-) -> Result(#(Int, List(Int), BitArray), error.ArchiveError) {
+) -> Result(#(Int, List(Int), BitArray), archive.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
@@ -1675,11 +1548,11 @@ fn parse_pack_info_body(
           parse_pack_info_body(rest, pack_pos, num_pack_streams, sizes)
         }
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "unexpected 7z PackInfo NID " <> int.to_string(nid),
           ))
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z PackInfo"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z PackInfo"))
   }
 }
 
@@ -1690,7 +1563,7 @@ fn parse_unpack_info(
   additional_streams: List(BitArray),
 ) -> Result(
   #(List(ParsedFolder), List(List(Int)), BitArray),
-  error.ArchiveError,
+  archive.ArchiveError,
 ) {
   parse_unpack_info_body(bytes, [], [], additional_streams)
 }
@@ -1702,7 +1575,7 @@ fn parse_unpack_info_body(
   additional_streams: List(BitArray),
 ) -> Result(
   #(List(ParsedFolder), List(List(Int)), BitArray),
-  error.ArchiveError,
+  archive.ArchiveError,
 ) {
   case bytes {
     <<nid, rest:bytes>> ->
@@ -1710,7 +1583,7 @@ fn parse_unpack_info_body(
         n if n == nid_end ->
           case folders {
             [] ->
-              Error(error.ArchiveInvalid(
+              Error(archive.InvalidData(
                 message: "7z UnPackInfo missing Folder section",
               ))
             _ -> Ok(#(folders, folder_unpack_sizes, rest))
@@ -1752,22 +1625,22 @@ fn parse_unpack_info_body(
           )
         }
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "unexpected 7z UnPackInfo NID " <> int.to_string(nid),
           ))
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z UnPackInfo"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z UnPackInfo"))
   }
 }
 
 fn parse_folders(
   bytes: BitArray,
   additional_streams: List(BitArray),
-) -> Result(#(List(ParsedFolder), BitArray), error.ArchiveError) {
+) -> Result(#(List(ParsedFolder), BitArray), archive.ArchiveError) {
   use #(num_folders, rest) <- result.try(read_number(bytes))
   use <- bool.guard(
     when: num_folders < 1,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "7z UnPackInfo declares zero folders",
     )),
   )
@@ -1794,7 +1667,7 @@ fn parse_folders(
           Ok(#(parsed_folders, after_data_index))
         }
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z folder section"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z folder section"))
   }
 }
 
@@ -1814,10 +1687,10 @@ fn decode_additional_streams(
   streams_info: HeaderStreams,
   full_archive: BitArray,
   limits: limit.Limits,
-) -> Result(List(BitArray), error.ArchiveError) {
+) -> Result(List(BitArray), archive.ArchiveError) {
   case streams_info {
     HeaderStreamsNone ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AdditionalStreamsInfo has no StreamsInfo body",
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
@@ -1850,7 +1723,7 @@ fn decode_additional_streams_loop(
   limits: limit.Limits,
   pack_cursor: Int,
   acc: List(BitArray),
-) -> Result(List(BitArray), error.ArchiveError) {
+) -> Result(List(BitArray), archive.ArchiveError) {
   case folders, folder_unpack_sizes {
     [], [] -> Ok(list.reverse(acc))
     [folder, ..rest_folders], [unpack_sizes, ..rest_unpack] -> {
@@ -1879,7 +1752,7 @@ fn decode_additional_streams_loop(
       )
     }
     _, _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AdditionalStreamsInfo folder/unpack-size lists misaligned",
       ))
   }
@@ -1888,12 +1761,12 @@ fn decode_additional_streams_loop(
 fn get_additional_stream(
   streams: List(BitArray),
   index: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case streams, index {
     [head, ..], 0 -> Ok(head)
     [_, ..rest], _ if index > 0 -> get_additional_stream(rest, index - 1)
     _, _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z external DataIndex "
         <> int.to_string(index)
         <> " out of bounds (AdditionalStreamsInfo holds "
@@ -1907,7 +1780,7 @@ fn parse_folders_loop(
   bytes: BitArray,
   remaining: Int,
   acc: List(ParsedFolder),
-) -> Result(#(List(ParsedFolder), BitArray), error.ArchiveError) {
+) -> Result(#(List(ParsedFolder), BitArray), archive.ArchiveError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {
@@ -1953,17 +1826,15 @@ fn split_unpack_sizes_by_folder(
 // Anything else falls through to `ArchiveNotImplemented`.
 fn parse_one_folder(
   bytes: BitArray,
-) -> Result(#(ParsedFolder, BitArray), error.ArchiveError) {
+) -> Result(#(ParsedFolder, BitArray), archive.ArchiveError) {
   use #(num_coders, rest) <- result.try(read_number(bytes))
   use <- bool.guard(
     when: num_coders < 1,
-    return: Error(error.ArchiveInvalid(
-      message: "7z folder declares zero coders",
-    )),
+    return: Error(archive.InvalidData(message: "7z folder declares zero coders")),
   )
   use <- bool.guard(
     when: num_coders > 3,
-    return: Error(error.ArchiveNotImplemented(
+    return: Error(archive.Unsupported(
       feature: "7z folders with " <> int.to_string(num_coders) <> " coders",
     )),
   )
@@ -2026,7 +1897,7 @@ fn read_bind_pairs(
   bytes: BitArray,
   remaining: Int,
   acc: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), BitArray), error.ArchiveError) {
+) -> Result(#(List(#(Int, Int)), BitArray), archive.ArchiveError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {
@@ -2041,7 +1912,7 @@ fn read_varint_list(
   bytes: BitArray,
   remaining: Int,
   acc: List(Int),
-) -> Result(#(List(Int), BitArray), error.ArchiveError) {
+) -> Result(#(List(Int), BitArray), archive.ArchiveError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {
@@ -2055,14 +1926,14 @@ fn consume_linear_bind_pairs(
   bytes: BitArray,
   next_in_idx: Int,
   remaining: Int,
-) -> Result(#(BitArray, Nil), error.ArchiveError) {
+) -> Result(#(BitArray, Nil), archive.ArchiveError) {
   use <- bool.guard(when: remaining == 0, return: Ok(#(bytes, Nil)))
   use #(in_idx, after_in) <- result.try(read_number(bytes))
   use #(out_idx, after_out) <- result.try(read_number(after_in))
   let expected_out_idx = next_in_idx - 1
   use <- bool.guard(
     when: in_idx != next_in_idx || out_idx != expected_out_idx,
-    return: Error(error.ArchiveNotImplemented(
+    return: Error(archive.Unsupported(
       feature: "7z non-linear coder topology (bind in="
       <> int.to_string(in_idx)
       <> " out="
@@ -2081,7 +1952,7 @@ fn parse_coders_loop(
   bytes: BitArray,
   remaining: Int,
   acc: List(CoderSpec),
-) -> Result(#(List(CoderSpec), BitArray), error.ArchiveError) {
+) -> Result(#(List(CoderSpec), BitArray), archive.ArchiveError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {
@@ -2093,7 +1964,7 @@ fn parse_coders_loop(
 
 fn parse_one_coder(
   bytes: BitArray,
-) -> Result(#(CoderSpec, BitArray), error.ArchiveError) {
+) -> Result(#(CoderSpec, BitArray), archive.ArchiveError) {
   case bytes {
     <<flags, after_flags:bytes>> -> {
       let id_size = int.bitwise_and(flags, 0x0F)
@@ -2111,7 +1982,7 @@ fn parse_one_coder(
           id_size,
           bit_array.byte_size(after_flags) - id_size,
         )
-        |> result.replace_error(error.ArchiveInvalid(
+        |> result.replace_error(archive.InvalidData(
           message: "7z coder id slice failed",
         )),
       )
@@ -2153,7 +2024,7 @@ fn parse_one_coder(
               attrs_size,
               bit_array.byte_size(after_attrs_size) - attrs_size,
             )
-            |> result.replace_error(error.ArchiveInvalid(
+            |> result.replace_error(archive.InvalidData(
               message: "7z coder attrs slice failed",
             )),
           )
@@ -2169,27 +2040,27 @@ fn parse_one_coder(
         }
       }
     }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z coder definition"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z coder definition"))
   }
 }
 
 fn classify_coder_id(
   id_bytes: BitArray,
-) -> Result(CoderId, error.ArchiveError) {
+) -> Result(CoderId, archive.ArchiveError) {
   case id_bytes {
-    <<b>> if b == copy_coder_id -> Ok(Copy)
+    <<b>> if b == copy_coder_id -> Ok(CopyCoder)
     <<b>> if b == lzma2_coder_id -> Ok(Lzma2)
     <<b>> if b == delta_coder_id -> Ok(Delta)
     <<b1, b2, b3>>
       if b1 == lzma_coder_id_high
       && b2 == lzma_coder_id_mid
       && b3 == lzma_coder_id_low
-    -> Ok(Lzma)
+    -> Ok(LzmaCoder)
     <<b1, b2, b3>>
       if b1 == deflate_coder_id_high
       && b2 == deflate_coder_id_mid
       && b3 == deflate_coder_id_low
-    -> Ok(Deflate)
+    -> Ok(DeflateCoder)
     <<b1, b2, b3>>
       if b1 == bzip2_coder_id_high
       && b2 == bzip2_coder_id_mid
@@ -2217,12 +2088,12 @@ fn classify_coder_id(
         v3, v4 if v3 == bcj_sparc_byte_2 && v4 == bcj_sparc_byte_3 ->
           Ok(BcjSparc)
         _, _ ->
-          Error(error.ArchiveNotImplemented(
+          Error(archive.Unsupported(
             feature: "7z coder id " <> describe_bit_array_hex(id_bytes, ""),
           ))
       }
     _ ->
-      Error(error.ArchiveNotImplemented(
+      Error(archive.Unsupported(
         feature: "7z coder id " <> describe_bit_array_hex(id_bytes, ""),
       ))
   }
@@ -2240,7 +2111,7 @@ fn describe_bit_array_hex(bytes: BitArray, acc: String) -> String {
 fn parse_files_info(
   bytes: BitArray,
   additional_streams: List(BitArray),
-) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
+) -> Result(#(HeaderFiles, BitArray), archive.ArchiveError) {
   use #(num_files, rest) <- result.try(read_number(bytes))
   parse_files_loop(rest, num_files, [], [], [], [], additional_streams)
 }
@@ -2253,7 +2124,7 @@ fn parse_files_loop(
   empty_files: List(Bool),
   mtimes_unix: List(Option(Int)),
   additional_streams: List(BitArray),
-) -> Result(#(HeaderFiles, BitArray), error.ArchiveError) {
+) -> Result(#(HeaderFiles, BitArray), archive.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
@@ -2427,11 +2298,11 @@ fn parse_files_loop(
           )
         }
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "unexpected 7z FilesInfo NID " <> int.to_string(nid),
           ))
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z FilesInfo"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z FilesInfo"))
   }
 }
 
@@ -2472,7 +2343,7 @@ fn parse_mtime_block(
   payload: BitArray,
   num_files: Int,
   additional_streams: List(BitArray),
-) -> Result(List(Option(Int)), error.ArchiveError) {
+) -> Result(List(Option(Int)), archive.ArchiveError) {
   case payload {
     <<all_defined, external, after_header:bytes>> -> {
       use external_bytes <- result.try(case external {
@@ -2509,14 +2380,14 @@ fn parse_mtime_block(
       }
       read_mtime_filetimes(body_after_flags, defined_flags, [])
     }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z mtime block header"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z mtime block header"))
   }
 }
 
 fn read_mtime_defined_flags(
   payload: BitArray,
   num_files: Int,
-) -> Result(List(Bool), error.ArchiveError) {
+) -> Result(List(Bool), archive.ArchiveError) {
   let bitmap_size = { num_files + 7 } / 8
   use bits <- result.try(slice_required(
     payload,
@@ -2531,7 +2402,7 @@ fn read_mtime_filetimes(
   payload: BitArray,
   defined_flags: List(Bool),
   acc: List(Option(Int)),
-) -> Result(List(Option(Int)), error.ArchiveError) {
+) -> Result(List(Option(Int)), archive.ArchiveError) {
   case defined_flags {
     [] -> Ok(list.reverse(acc))
     [False, ..rest] -> read_mtime_filetimes(payload, rest, [option.None, ..acc])
@@ -2548,7 +2419,7 @@ fn read_mtime_filetimes(
           read_mtime_filetimes(tail, rest, [option.Some(safe), ..acc])
         }
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "truncated 7z mtime FILETIME entry",
           ))
       }
@@ -2578,7 +2449,7 @@ fn parse_name_block(
   payload: BitArray,
   num_files: Int,
   additional_streams: List(BitArray),
-) -> Result(List(String), error.ArchiveError) {
+) -> Result(List(String), archive.ArchiveError) {
   case payload {
     <<external, rest:bytes>> ->
       case external {
@@ -2595,7 +2466,7 @@ fn parse_name_block(
           decode_utf16_names(external_bytes, num_files, [], [])
         }
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z file-name section"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z file-name section"))
   }
 }
 
@@ -2604,7 +2475,7 @@ fn decode_utf16_names(
   remaining: Int,
   current: List(Int),
   acc: List(String),
-) -> Result(List(String), error.ArchiveError) {
+) -> Result(List(String), archive.ArchiveError) {
   case remaining {
     0 -> Ok(list.reverse(acc))
     _ ->
@@ -2623,7 +2494,7 @@ fn decode_utf16_names(
           }
         }
         _ ->
-          Error(error.ArchiveInvalid(message: "truncated 7z UTF-16 file name"))
+          Error(archive.InvalidData(message: "truncated 7z UTF-16 file name"))
       }
   }
 }
@@ -2698,7 +2569,7 @@ fn take_bools(
 fn skip_crc_block(
   bytes: BitArray,
   count: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bytes {
     <<all_defined, rest:bytes>> ->
       case all_defined {
@@ -2713,7 +2584,7 @@ fn skip_crc_block(
           drop_bytes(after_flags, count * 4, "7z CRC values")
         }
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z CRC block"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z CRC block"))
   }
 }
 
@@ -2721,10 +2592,10 @@ fn drop_bytes(
   bytes: BitArray,
   count: Int,
   label: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bit_array.slice(bytes, count, bit_array.byte_size(bytes) - count) {
     Ok(rest) -> Ok(rest)
-    Error(_) -> Error(error.ArchiveInvalid(message: "truncated " <> label))
+    Error(_) -> Error(archive.InvalidData(message: "truncated " <> label))
   }
 }
 
@@ -2745,7 +2616,7 @@ fn parse_sub_streams_info(
   bytes: BitArray,
   num_folders: Int,
   folder_unpack_sizes: List(Int),
-) -> Result(#(List(Int), List(Int), BitArray), error.ArchiveError) {
+) -> Result(#(List(Int), List(Int), BitArray), archive.ArchiveError) {
   let initial = SubStreamsAcc(per_folder: [], explicit_sizes: [])
   use #(acc, rest) <- result.try(sub_streams_loop_collect(
     bytes,
@@ -2767,7 +2638,7 @@ fn parse_sub_streams_info(
   case list.length(sizes) == total_substreams {
     True -> Ok(#(per_folder, sizes, rest))
     False ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z SubStreamsInfo: derived substream count mismatch",
       ))
   }
@@ -2781,7 +2652,7 @@ fn sub_streams_loop_collect(
   bytes: BitArray,
   num_folders: Int,
   acc: SubStreamsAcc,
-) -> Result(#(SubStreamsAcc, BitArray), error.ArchiveError) {
+) -> Result(#(SubStreamsAcc, BitArray), archive.ArchiveError) {
   case bytes {
     <<nid, rest:bytes>> ->
       case nid {
@@ -2824,11 +2695,11 @@ fn sub_streams_loop_collect(
           sub_streams_loop_collect(rest, num_folders, acc)
         }
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "unexpected 7z SubStreamsInfo NID " <> int.to_string(nid),
           ))
       }
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z SubStreamsInfo"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z SubStreamsInfo"))
   }
 }
 
@@ -2894,7 +2765,7 @@ fn decode_archive(
   parsed: ParsedHeader,
   password: Option(String),
   limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   // The declared unpack sizes live in the header, so we can refuse an
   // oversized payload before the LZMA range coder runs — a malicious
   // archive that advertises a multi-GB unpack size shouldn't be able
@@ -2909,8 +2780,8 @@ fn decode_archive(
   // payload, since the file list lives in the next header.
   let declared_members = list.length(parsed.file_names)
   use <- bool.guard(
-    when: declared_members > limit.max_members(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: declared_members > limits.max_members,
+    return: Error(archive.LimitExceeded(
       limit: "max_members",
       actual: declared_members,
     )),
@@ -2954,7 +2825,7 @@ fn decode_all_folders(
   limits: limit.Limits,
   pack_cursor: Int,
   acc: List(BitArray),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case folders, folder_unpack_sizes {
     [], [] -> Ok(bit_array.concat(list.reverse(acc)))
     [folder, ..rest_folders], [unpack_sizes, ..rest_unpack] -> {
@@ -2987,7 +2858,7 @@ fn decode_all_folders(
       )
     }
     _, _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z folder / unpack-size lists are misaligned",
       ))
   }
@@ -3005,7 +2876,7 @@ fn slice_folder_streams(
   cursor: Int,
   sizes: List(Int),
   acc: List(BitArray),
-) -> Result(List(BitArray), error.ArchiveError) {
+) -> Result(List(BitArray), archive.ArchiveError) {
   case sizes {
     [] -> Ok(list.reverse(acc))
     [size, ..rest] -> {
@@ -3023,11 +2894,11 @@ fn slice_folder_streams(
 fn enforce_max_output(
   unpack_sizes: List(Int),
   limits: limit.Limits,
-) -> Result(Nil, error.ArchiveError) {
+) -> Result(Nil, archive.ArchiveError) {
   let total = sum_list(unpack_sizes, 0)
-  case total > limit.max_output_bytes(limits) {
+  case total > limits.max_output_bytes {
     True ->
-      Error(error.ArchiveLimitExceeded(limit: "max_output_bytes", actual: total))
+      Error(archive.LimitExceeded(limit: "max_output_bytes", actual: total))
     False -> Ok(Nil)
   }
 }
@@ -3038,7 +2909,7 @@ fn decode_folder(
   unpack_sizes: List(Int),
   password: Option(String),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   // Dispatch by folder shape:
   //   - 1 packed stream (the common case): linear N-coder chain.
   //   - 4 packed streams + BCJ2 as the second coder: the canonical
@@ -3066,7 +2937,7 @@ fn decode_folder(
         limits,
       )
     _, _ ->
-      Error(error.ArchiveNotImplemented(
+      Error(archive.Unsupported(
         feature: "7z folder topology with "
         <> int.to_string(list.length(packed_streams))
         <> " packed streams and "
@@ -3090,7 +2961,7 @@ fn decode_bcj2_folder(
   unpack_sizes: List(Int),
   password: Option(String),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   // The folder's CodersUnPackSize block records two entries: the
   // inner coder's output size (= BCJ2's main-stream input length)
   // and BCJ2's output size (= the final binary).
@@ -3116,18 +2987,18 @@ fn decode_bcj2_folder(
   |> result.map_error(bcj2_error_to_archive)
 }
 
-fn bcj2_error_to_archive(err: bcj2.Bcj2Error) -> error.ArchiveError {
+fn bcj2_error_to_archive(err: bcj2.Bcj2Error) -> archive.ArchiveError {
   case err {
     bcj2.RangeCoderHeaderInvalid ->
-      error.ArchiveInvalid(
+      archive.InvalidData(
         message: "7z BCJ2: range-coder header invalid (first 5 bytes)",
       )
     bcj2.StreamExhausted(stream_name: name) ->
-      error.ArchiveInvalid(
+      archive.InvalidData(
         message: "7z BCJ2: stream \"" <> name <> "\" exhausted mid-decode",
       )
     bcj2.OutputSizeMismatch(declared: declared, actual: actual) ->
-      error.ArchiveInvalid(
+      archive.InvalidData(
         message: "7z BCJ2: decoded "
         <> int.to_string(actual)
         <> " bytes, expected "
@@ -3142,10 +3013,10 @@ fn decode_linear_chain(
   unpack_sizes: List(Int),
   password: Option(String),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case coders, unpack_sizes {
     [], _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z folder has unsupported coder count",
       ))
     [single], _ ->
@@ -3178,25 +3049,25 @@ fn decode_linear_chain(
     // header; reject rather than silently splitting on a phantom
     // size.
     _, _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z folder coder list longer than CodersUnPackSize block",
       ))
   }
 }
 
 fn maybe_wrap_aes_chain_error(
-  err: error.ArchiveError,
+  err: archive.ArchiveError,
   head_id: CoderId,
-) -> error.ArchiveError {
+) -> archive.ArchiveError {
   case head_id == Aes256Sha256 {
     False -> err
     True -> {
       let original = case err {
-        error.ArchiveInvalid(message:) -> message
-        error.ArchiveNotImplemented(feature:) -> feature
+        archive.InvalidData(message:) -> message
+        archive.Unsupported(feature:) -> feature
         other -> string_inspect(other)
       }
-      error.ArchiveInvalid(
+      archive.InvalidData(
         message: "7z AES decrypt produced invalid plaintext for the "
         <> "downstream coder (wrong password or corrupt archive): "
         <> original,
@@ -3215,12 +3086,12 @@ fn dispatch_coder(
   unpack_sizes: List(Int),
   password: Option(String),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case spec.id {
-    Lzma2 -> decode_lzma2_payload(packed, spec.properties, unpack_sizes)
-    Lzma -> decode_raw_lzma(packed, spec.properties, unpack_sizes)
-    Copy -> decode_copy_coder(packed, unpack_sizes)
-    Deflate -> decode_deflate_coder(packed, unpack_sizes, limits)
+    Lzma2 -> decode_lzma2_stream(packed, <<>>)
+    LzmaCoder -> decode_raw_lzma(packed, spec.properties, unpack_sizes)
+    CopyCoder -> decode_copy_coder(packed, unpack_sizes)
+    DeflateCoder -> decode_deflate_coder(packed, unpack_sizes, limits)
     BZip2 -> decode_bzip2_coder(packed, unpack_sizes, limits)
     Delta -> decode_delta_coder(packed, spec.properties, unpack_sizes)
     BcjX86 -> decode_bcj_coder(packed, unpack_sizes, bcj.x86_decode, "x86")
@@ -3240,7 +3111,7 @@ fn dispatch_coder(
       // dispatch runs.  Reaching this arm means the folder topology
       // declared `Bcj2` but doesn't match the canonical shape — fall
       // through to a typed error instead of corrupt output.
-      Error(error.ArchiveNotImplemented(
+      Error(archive.Unsupported(
         feature: "7z BCJ2 outside its canonical [simple, BCJ2(4,1)] folder layout",
       ))
   }
@@ -3257,7 +3128,7 @@ fn decode_bcj_coder(
   unpack_sizes: List(Int),
   decoder: fn(BitArray, Int) -> BitArray,
   arch_name: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let target = folder_unpack_total(unpack_sizes)
   let decoded = decoder(packed, 0)
   verify_unpack_size(decoded, target, "BCJ " <> arch_name)
@@ -3274,7 +3145,7 @@ fn decode_delta_coder(
   packed: BitArray,
   properties: BitArray,
   unpack_sizes: List(Int),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let target = folder_unpack_total(unpack_sizes)
   let distance = case properties {
     <<d>> -> d + 1
@@ -3364,11 +3235,11 @@ fn decode_aes_coder(
   properties: BitArray,
   unpack_sizes: List(Int),
   password: Option(String),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   use password_value <- result.try(case password {
     option.Some(value) -> Ok(value)
     option.None ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES folder requires a password — call decode_with_password",
       ))
   })
@@ -3388,7 +3259,7 @@ fn decode_aes_coder(
   let plaintext_size = bit_array.byte_size(plaintext)
   use <- bool.guard(
     when: plaintext_size < target,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "7z AES decrypted "
       <> int.to_string(plaintext_size)
       <> " bytes < declared "
@@ -3396,14 +3267,14 @@ fn decode_aes_coder(
     )),
   )
   bit_array.slice(plaintext, 0, target)
-  |> result.replace_error(error.ArchiveInvalid(
+  |> result.replace_error(archive.InvalidData(
     message: "7z AES decrypted slice failed",
   ))
 }
 
 fn parse_aes_properties(
   properties: BitArray,
-) -> Result(AesProperties, error.ArchiveError) {
+) -> Result(AesProperties, archive.ArchiveError) {
   case properties {
     <<first_byte, rest:bytes>> -> {
       let num_cycles_power = int.bitwise_and(first_byte, aes_num_cycles_mask)
@@ -3416,7 +3287,7 @@ fn parse_aes_properties(
       parse_aes_field_sizes(rest, num_cycles_power, salt_flag, iv_flag)
     }
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES coder properties are empty or non-byte-aligned",
       ))
   }
@@ -3427,7 +3298,7 @@ fn parse_aes_field_sizes(
   num_cycles_power: Int,
   salt_flag: Bool,
   iv_flag: Bool,
-) -> Result(AesProperties, error.ArchiveError) {
+) -> Result(AesProperties, archive.ArchiveError) {
   case after_first_byte {
     <<second_byte, after_second:bytes>> -> {
       let salt_base = flag_to_int(salt_flag)
@@ -3437,26 +3308,26 @@ fn parse_aes_field_sizes(
       let iv_size = iv_base + int.bitwise_and(second_byte, aes_low_nibble_mask)
       use <- bool.guard(
         when: salt_size > aes_max_field_bytes || iv_size > aes_max_field_bytes,
-        return: Error(error.ArchiveInvalid(
+        return: Error(archive.InvalidData(
           message: "7z AES salt or iv size exceeds 16 bytes",
         )),
       )
       use salt <- result.try(
         bit_array.slice(after_second, 0, salt_size)
-        |> result.replace_error(error.ArchiveInvalid(
+        |> result.replace_error(archive.InvalidData(
           message: "7z AES salt slice failed",
         )),
       )
       use iv <- result.try(
         bit_array.slice(after_second, salt_size, iv_size)
-        |> result.replace_error(error.ArchiveInvalid(
+        |> result.replace_error(archive.InvalidData(
           message: "7z AES iv slice failed",
         )),
       )
       Ok(AesProperties(num_cycles_power:, salt:, iv:))
     }
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES coder properties truncated before salt/iv sizes",
       ))
   }
@@ -3477,7 +3348,7 @@ fn derive_aes_key(
   password password: String,
   salt salt: BitArray,
   num_cycles_power num_cycles_power: Int,
-) -> Result(aes.ExpandedKey, error.ArchiveError) {
+) -> Result(aes.ExpandedKey, archive.ArchiveError) {
   let password_utf16le = utf16le_encode(password, <<>>)
   let digest = case num_cycles_power == aes_num_cycles_mask {
     True -> derive_aes_key_direct(salt, password_utf16le)
@@ -3486,7 +3357,7 @@ fn derive_aes_key(
   case aes.expand_key(digest) {
     Ok(expanded) -> Ok(expanded)
     Error(Nil) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES key expansion rejected the derived 32-byte digest",
       ))
   }
@@ -3589,7 +3460,7 @@ fn aes_cbc_encrypt(
   plaintext: BitArray,
   key: aes.ExpandedKey,
   iv: BitArray,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let plaintext_size = bit_array.byte_size(plaintext)
   let remainder = int.bitwise_and(plaintext_size, aes_block_size - 1)
   let padding_bytes = case remainder {
@@ -3609,14 +3480,14 @@ fn aes_cbc_encrypt_loop(
   key: aes.ExpandedKey,
   prev_block: BitArray,
   acc: BitArray,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case plaintext {
     <<>> -> Ok(acc)
     <<block:bytes-size(16), rest:bytes>> -> {
       let xored = xor_bit_arrays(block, prev_block)
       use ciphertext_block <- result.try(
         aes.encrypt_block(key, xored)
-        |> result.replace_error(error.ArchiveInvalid(
+        |> result.replace_error(archive.InvalidData(
           message: "7z AES encrypt_block rejected a 16-byte plaintext block",
         )),
       )
@@ -3626,7 +3497,7 @@ fn aes_cbc_encrypt_loop(
       >>)
     }
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES plaintext tail shorter than 16 bytes after padding",
       ))
   }
@@ -3640,12 +3511,12 @@ fn aes_cbc_decrypt(
   ciphertext: BitArray,
   key: aes.ExpandedKey,
   iv: BitArray,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let size = bit_array.byte_size(ciphertext)
   case int.bitwise_and(size, aes_block_size - 1) {
     0 -> aes_cbc_decrypt_loop(ciphertext, key, iv_or_zero(iv), <<>>)
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES ciphertext length "
         <> int.to_string(size)
         <> " is not a multiple of 16",
@@ -3670,13 +3541,13 @@ fn aes_cbc_decrypt_loop(
   key: aes.ExpandedKey,
   prev_block: BitArray,
   acc: BitArray,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case ciphertext {
     <<>> -> Ok(acc)
     <<block:bytes-size(16), rest:bytes>> -> {
       use decrypted <- result.try(
         aes.decrypt_block(key, block)
-        |> result.replace_error(error.ArchiveInvalid(
+        |> result.replace_error(archive.InvalidData(
           message: "7z AES decrypt_block rejected a 16-byte ciphertext block",
         )),
       )
@@ -3684,7 +3555,7 @@ fn aes_cbc_decrypt_loop(
       aes_cbc_decrypt_loop(rest, key, block, <<acc:bits, plaintext_block:bits>>)
     }
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z AES ciphertext tail shorter than 16 bytes",
       ))
   }
@@ -3725,7 +3596,7 @@ fn folder_unpack_total(unpack_sizes: List(Int)) -> Int {
 fn decode_copy_coder(
   packed: BitArray,
   unpack_sizes: List(Int),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let target = folder_unpack_total(unpack_sizes)
   let packed_size = bit_array.byte_size(packed)
   case packed_size >= target {
@@ -3733,10 +3604,10 @@ fn decode_copy_coder(
       case bit_array.slice(packed, 0, target) {
         Ok(b) -> Ok(b)
         Error(_) ->
-          Error(error.ArchiveInvalid(message: "7z Copy coder slice failed"))
+          Error(archive.InvalidData(message: "7z Copy coder slice failed"))
       }
     False ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z Copy coder packed size "
         <> int.to_string(packed_size)
         <> " < declared unpack size "
@@ -3754,7 +3625,7 @@ fn decode_deflate_coder(
   packed: BitArray,
   unpack_sizes: List(Int),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let target = folder_unpack_total(unpack_sizes)
   case deflate.decode_with_limits(bytes: packed, limits: limits) {
     Ok(plain) -> verify_unpack_size(plain, target, "Deflate")
@@ -3768,7 +3639,7 @@ fn decode_bzip2_coder(
   packed: BitArray,
   unpack_sizes: List(Int),
   limits: limit.Limits,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let target = folder_unpack_total(unpack_sizes)
   case bzip2.decode_with_limits(bytes: packed, limits: limits) {
     Ok(plain) -> verify_unpack_size(plain, target, "BZip2")
@@ -3785,12 +3656,12 @@ fn verify_unpack_size(
   plain: BitArray,
   expected: Int,
   coder_name: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let actual = bit_array.byte_size(plain)
   case actual == expected {
     True -> Ok(plain)
     False ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z "
         <> coder_name
         <> " unpacked "
@@ -3801,24 +3672,10 @@ fn verify_unpack_size(
   }
 }
 
-fn decode_lzma2_payload(
-  packed: BitArray,
-  _props: BitArray,
-  unpack_sizes: List(Int),
-) -> Result(BitArray, error.ArchiveError) {
-  let total = case unpack_sizes {
-    [size, ..] -> size
-    [] -> 0
-  }
-  use bytes <- result.try(decode_lzma2_stream(packed, <<>>, total))
-  Ok(bytes)
-}
-
 fn decode_lzma2_stream(
   payload: BitArray,
   output: BitArray,
-  target: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case payload {
     <<0x00, _:bytes>> -> Ok(output)
     <<control, _:bytes>> if control == 0x01 || control == 0x02 -> {
@@ -3831,30 +3688,25 @@ fn decode_lzma2_stream(
                 bit_array.slice(rest, size, bit_array.byte_size(rest) - size)
               {
                 Ok(after) ->
-                  decode_lzma2_stream(
-                    after,
-                    bit_array.concat([output, chunk]),
-                    target,
-                  )
+                  decode_lzma2_stream(after, bit_array.concat([output, chunk]))
                 Error(_) ->
-                  Error(error.ArchiveInvalid(
+                  Error(archive.InvalidData(
                     message: "truncated 7z LZMA2 uncompressed chunk",
                   ))
               }
             Error(_) ->
-              Error(error.ArchiveInvalid(
+              Error(archive.InvalidData(
                 message: "truncated 7z LZMA2 chunk body",
               ))
           }
         }
         _ ->
-          Error(error.ArchiveInvalid(message: "truncated 7z LZMA2 chunk header"))
+          Error(archive.InvalidData(message: "truncated 7z LZMA2 chunk header"))
       }
     }
     <<control, usize_high, usize_low, csize_high, csize_low, rest:bytes>>
       if control >= 0x80
     -> {
-      let _ = target
       let usize =
         int.bitwise_or(
           int.bitwise_shift_left(int.bitwise_and(control, 0x1F), 16),
@@ -3886,20 +3738,19 @@ fn decode_lzma2_stream(
                                   decode_lzma2_stream(
                                     after_chunk,
                                     bit_array.concat([output, decoded]),
-                                    target,
                                   )
                                 Error(err) -> Error(codec_to_archive(err))
                               }
                             Error(err) -> Error(codec_to_archive(err))
                           }
                         Error(_) ->
-                          Error(error.ArchiveInvalid(
+                          Error(archive.InvalidData(
                             message: "truncated 7z LZMA chunk",
                           ))
                       }
                     }
                     Error(_) ->
-                      Error(error.ArchiveInvalid(
+                      Error(archive.InvalidData(
                         message: "truncated 7z LZMA chunk body",
                       ))
                   }
@@ -3908,18 +3759,18 @@ fn decode_lzma2_stream(
               }
             }
             _ ->
-              Error(error.ArchiveInvalid(
+              Error(archive.InvalidData(
                 message: "truncated 7z LZMA properties byte",
               ))
           }
         }
         False ->
-          Error(error.ArchiveNotImplemented(
+          Error(archive.Unsupported(
             feature: "7z LZMA2 chunks without inline properties",
           ))
       }
     }
-    _ -> Error(error.ArchiveInvalid(message: "invalid 7z LZMA2 control byte"))
+    _ -> Error(archive.InvalidData(message: "invalid 7z LZMA2 control byte"))
   }
 }
 
@@ -3927,7 +3778,7 @@ fn decode_raw_lzma(
   packed: BitArray,
   props: BitArray,
   unpack_sizes: List(Int),
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let target = case unpack_sizes {
     [size, ..] -> size
     [] -> 0
@@ -3953,34 +3804,18 @@ fn decode_raw_lzma(
         Error(err) -> Error(codec_to_archive(err))
       }
     _ ->
-      Error(error.ArchiveInvalid(
-        message: "7z raw LZMA coder missing properties",
-      ))
+      Error(archive.InvalidData(message: "7z raw LZMA coder missing properties"))
   }
 }
 
-fn codec_to_archive(err: error.CodecError) -> error.ArchiveError {
+fn codec_to_archive(err: codec.CodecError) -> archive.ArchiveError {
   case err {
-    error.CodecNotImplemented(feature) ->
-      error.ArchiveNotImplemented(feature: feature)
-    error.CodecInvalidData(message) -> error.ArchiveInvalid(message: message)
-    error.CodecLimitExceeded(limit, actual) ->
-      error.ArchiveLimitExceeded(limit: limit, actual: actual)
-    error.CodecDictionaryRequired(name) ->
-      error.ArchiveInvalid(
-        message: "codec " <> name <> " requires a preset dictionary",
-      )
-    error.CodecDictionaryMismatch(name) ->
-      error.ArchiveInvalid(
-        message: "codec " <> name <> " preset dictionary DICT_ID mismatch",
-      )
-    error.CodecOptionUnsupported(option, codec_name) ->
-      error.ArchiveInvalid(
-        message: "codec "
-        <> codec_name
-        <> " does not support the requested option: "
-        <> option,
-      )
+    codec.Unsupported(feature) -> archive.Unsupported(feature: feature)
+    codec.InvalidData(message) -> archive.InvalidData(message: message)
+    codec.LimitExceeded(limit, actual) ->
+      archive.LimitExceeded(limit: limit, actual: actual)
+    codec.DictionaryRequired ->
+      archive.InvalidData(message: "codec requires a preset dictionary")
   }
 }
 
@@ -3988,7 +3823,7 @@ fn build_archive_entries(
   plain: BitArray,
   parsed: ParsedHeader,
   limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   // SubStreamsInfo is optional: it's only emitted when ≥ 2 files share
   // a single folder (the solid-mode case).  Non-solid archives — and
   // single-file solid archives — omit it entirely.  Derive a synthetic
@@ -4011,7 +3846,11 @@ fn build_archive_entries(
     limits,
   )
   |> result.map(fn(entries) {
-    archives.from_entries(format: format(), entries: entries)
+    archive.Archive(
+      format: archive.SevenZ,
+      entries: entries,
+      comment: option.None,
+    )
   })
 }
 
@@ -4043,9 +3882,9 @@ fn build_entries_loop(
   mtimes: List(Option(Int)),
   sizes: List(Int),
   consumed: Int,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   // Pull the next mtime slot.  When the Mtime block was absent the
   // input list is empty for every iteration and we treat the entry
   // as having no recorded mtime (option.None).
@@ -4127,9 +3966,9 @@ fn consume_one_file_body(
   rest_mtimes: List(Option(Int)),
   sizes: List(Int),
   consumed: Int,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   // Pull the next file size from the SubStreamsInfo when one was
   // declared; otherwise fall back to "all the remaining bytes" so
   // single-file archives that omit SubStreamsInfo keep working.
@@ -4154,10 +3993,10 @@ fn consume_one_file_body(
   })
 }
 
-fn apply_mtime(e: entry.Entry, mtime: Option(Int)) -> entry.Entry {
+fn apply_mtime(e: archive.Entry, mtime: Option(Int)) -> archive.Entry {
   case mtime {
     option.Some(unix_seconds) if unix_seconds > 0 ->
-      entry.with_modified_at(e, unix_seconds: unix_seconds)
+      archive.Entry(..e, modified_at: unix_seconds)
     _ -> e
   }
 }
@@ -4166,23 +4005,20 @@ fn add_file(
   name: String,
   body: BitArray,
   mtime: Option(Int),
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   case entry.file_checked(path: name, body: body) {
     Ok(e) -> {
-      let depth = entry.depth(entry.path(e))
-      case depth > limit.max_entry_depth(limits) {
+      let depth = entry.depth(e.path)
+      case depth > limits.max_entry_depth {
         True ->
-          Error(error.ArchiveLimitExceeded(
-            limit: "max_entry_depth",
-            actual: depth,
-          ))
+          Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth))
         False -> Ok([apply_mtime(e, mtime), ..acc])
       }
     }
     Error(_) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z file name failed path validation: " <> name,
       ))
   }
@@ -4191,23 +4027,20 @@ fn add_file(
 fn add_directory(
   name: String,
   mtime: Option(Int),
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   case entry.directory_checked(path: name) {
     Ok(e) -> {
-      let depth = entry.depth(entry.path(e))
-      case depth > limit.max_entry_depth(limits) {
+      let depth = entry.depth(e.path)
+      case depth > limits.max_entry_depth {
         True ->
-          Error(error.ArchiveLimitExceeded(
-            limit: "max_entry_depth",
-            actual: depth,
-          ))
+          Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth))
         False -> Ok([apply_mtime(e, mtime), ..acc])
       }
     }
     Error(_) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "7z directory name failed path validation: " <> name,
       ))
   }
@@ -4220,19 +4053,19 @@ fn slice_required(
   offset: Int,
   length: Int,
   label: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bit_array.slice(bytes, offset, length) {
     Ok(value) -> Ok(value)
-    Error(_) -> Error(error.ArchiveInvalid(message: "truncated " <> label))
+    Error(_) -> Error(archive.InvalidData(message: "truncated " <> label))
   }
 }
 
 fn read_number(
   bytes: BitArray,
-) -> Result(#(Int, BitArray), error.ArchiveError) {
+) -> Result(#(Int, BitArray), archive.ArchiveError) {
   case bytes {
     <<first, rest:bytes>> -> read_number_body(first, rest, 0x80, 0, 0)
-    _ -> Error(error.ArchiveInvalid(message: "truncated 7z varint"))
+    _ -> Error(archive.InvalidData(message: "truncated 7z varint"))
   }
 }
 
@@ -4242,7 +4075,7 @@ fn read_number_body(
   mask: Int,
   index: Int,
   value: Int,
-) -> Result(#(Int, BitArray), error.ArchiveError) {
+) -> Result(#(Int, BitArray), archive.ArchiveError) {
   case index >= 8 {
     True -> Ok(#(value, rest))
     False ->
@@ -4263,7 +4096,7 @@ fn read_number_body(
                 value + int.bitwise_shift_left(byte, index * 8),
               )
             _ ->
-              Error(error.ArchiveInvalid(
+              Error(archive.InvalidData(
                 message: "truncated 7z multi-byte varint",
               ))
           }
@@ -4274,7 +4107,7 @@ fn read_number_body(
 fn read_numbers(
   bytes: BitArray,
   count: Int,
-) -> Result(#(List(Int), BitArray), error.ArchiveError) {
+) -> Result(#(List(Int), BitArray), archive.ArchiveError) {
   read_numbers_loop(bytes, count, [])
 }
 
@@ -4282,7 +4115,7 @@ fn read_numbers_loop(
   bytes: BitArray,
   remaining: Int,
   acc: List(Int),
-) -> Result(#(List(Int), BitArray), error.ArchiveError) {
+) -> Result(#(List(Int), BitArray), archive.ArchiveError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {

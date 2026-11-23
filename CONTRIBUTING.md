@@ -31,38 +31,9 @@ with a `shell` error before any recipe runs.  If that happens, source
 the bootstrap script by hand once (`. scripts/lib/mise_bootstrap.sh`)
 and re-run `just`.
 
-## Project status
+## Layout
 
-Implemented engines:
-
-- **checksum**: Adler-32, CRC-32 (reflected), CRC-32C, bzip2 CRC-32.
-- **tar / cpio (newc) / ar**: full encode/decode.
-- **zip**: stored-method encode/decode; deflate-method encode/decode.
-- **deflate**: full RFC 1951 decoder; fixed-Huffman LZ77 encoder.
-- **zlib / gzip**: full RFC wrappers including preset-dictionary
-  support on zlib's decoder side (and an `encode_with_dictionary`
-  helper that emits the FDICT envelope).
-- **lz4 / snappy / lzw**: full encode/decode.
-- **bzip2**: full encode/decode (level 1..9).
-- **xz**: full LZMA2 decoder (raw + LZMA-compressed chunks);
-  uncompressed-LZMA2 encoder.
-- **zstd**: frame envelope + raw + RLE + FSE-compressed blocks with
-  Raw/RLE literals and predefined FSE modes on decode; raw-block
-  encoder.
-- **brotli**: full RFC 7932 decoder; encoder emits uncompressed
-  metablocks only (valid stream, no actual compression yet).
-- **7z**: single-folder LZMA / LZMA2 reader; encoder still pending.
-
-Codecs without real encoders (`xz`, `zstd`, `brotli`) still produce
-valid streams that any conforming decoder accepts; they just do no
-actual compression yet.  The `*NotImplemented` errors that remain are
-either internal helpers or 7z encode.
-
-The facade (`packkit.compress`, `packkit.decompress`, `packkit.pack`,
-`packkit.unpack`) honours the codec's optional `level` and preset
-dictionary.  Asking for an option the underlying engine cannot honour
-returns the typed `CodecOptionUnsupported` instead of silently
-dropping the request.
+The public modules are `packkit`, `packkit/codec`, `packkit/archive`, `packkit/limit`, `packkit/gzip`, `packkit/zip` and `packkit/seven_z`. Every codec, tar, cpio and ar live under `src/packkit/internal/`, and `src/packkit.gleam` dispatches to them.
 
 ## Running checks
 

@@ -1,23 +1,22 @@
 import gleam/bit_array
 import gleam/list
 import gleeunit/should
-import packkit/ar
+import packkit
 import packkit/archive
-import packkit/entry
-import packkit/error
+import packkit/fixture
+import packkit/internal/ar
+import packkit/internal/entry
 
 pub fn roundtrip_file_test() -> Nil {
   let original =
-    ar.new()
+    fixture.new(archive.Ar)
     |> archive_add_file("a.o", <<1, 2, 3>>)
     |> archive_add_file("b.o", <<4, 5, 6, 7>>)
 
   let assert Ok(bytes) = ar.encode(archive: original)
-  let assert Ok(decoded) = ar.decode(bytes: bytes)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Ar)
 
-  list.map(archive.entries(decoded), fn(e) {
-    #(entry.to_string(entry.path(e)), entry.body(e))
-  })
+  list.map(decoded.entries, fn(e) { #(e.path, entry.body(e)) })
   |> should.equal([#("a.o", <<1, 2, 3>>), #("b.o", <<4, 5, 6, 7>>)])
 }
 
@@ -25,12 +24,12 @@ pub fn roundtrip_long_name_test() -> Nil {
   let path = "this-is-a-very-long-object-name-that-overflows-16-bytes.o"
   let body = <<"long-payload":utf8>>
 
-  let original = ar.new() |> archive_add_file(path, body)
+  let original = fixture.new(archive.Ar) |> archive_add_file(path, body)
   let assert Ok(bytes) = ar.encode(archive: original)
-  let assert Ok(decoded) = ar.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Ar)
+  let assert [restored] = decoded.entries
 
-  entry.to_string(entry.path(restored))
+  restored.path
   |> should.equal(path)
   entry.body(restored)
   |> should.equal(body)
@@ -39,22 +38,22 @@ pub fn roundtrip_long_name_test() -> Nil {
 pub fn rejects_directory_entries_test() -> Nil {
   let assert Ok(dir_entry) = entry.directory_checked(path: "build")
   let archive_value =
-    archive.new(format: ar.format())
-    |> archive.add(entry: dir_entry)
+    fixture.new(archive.Ar)
+    |> fixture.add(entry: dir_entry)
 
   case ar.encode(archive: archive_value) {
-    Error(error.ArchiveEntryRejected(_, _)) -> Nil
+    Error(archive.EntryRejected(_, _)) -> Nil
     _ -> should.fail()
   }
 }
 
 pub fn encoder_rejects_archive_comment_test() -> Nil {
   let with_note =
-    ar.new()
+    fixture.new(archive.Ar)
     |> archive_add_file("a.o", <<>>)
-    |> archive.with_comment(comment: "nope")
+    |> fixture.with_comment(comment: "nope")
   case ar.encode(archive: with_note) {
-    Error(error.ArchiveCommentUnsupported(format: "ar")) -> Nil
+    Error(archive.CommentUnsupported(format: archive.Ar)) -> Nil
     _ -> should.fail()
   }
 }
@@ -64,11 +63,10 @@ pub fn encoder_rejects_uid_overflow_test() -> Nil {
   // 1_000_000 does not, and used to silently truncate via
   // `right_pad`.
   let assert Ok(base) = entry.file_checked(path: "a.o", body: <<>>)
-  let huge = base |> entry.with_owner(user_id: 1_000_000, group_id: 0)
-  let archive_value =
-    archive.new(format: ar.format()) |> archive.add(entry: huge)
+  let huge = base |> fixture.with_owner(user_id: 1_000_000, group_id: 0)
+  let archive_value = fixture.new(archive.Ar) |> fixture.add(entry: huge)
   case ar.encode(archive: archive_value) {
-    Error(error.ArchiveFieldOverflow(field: "ar uid", value: 1_000_000, max: _)) ->
+    Error(archive.FieldOverflow(field: "ar uid", value: 1_000_000, max: _)) ->
       Nil
     _ -> should.fail()
   }
@@ -76,9 +74,8 @@ pub fn encoder_rejects_uid_overflow_test() -> Nil {
 
 pub fn encoder_accepts_uid_boundary_test() -> Nil {
   let assert Ok(base) = entry.file_checked(path: "a.o", body: <<>>)
-  let max_uid = base |> entry.with_owner(user_id: 999_999, group_id: 0)
-  let archive_value =
-    archive.new(format: ar.format()) |> archive.add(entry: max_uid)
+  let max_uid = base |> fixture.with_owner(user_id: 999_999, group_id: 0)
+  let archive_value = fixture.new(archive.Ar) |> fixture.add(entry: max_uid)
   case ar.encode(archive: archive_value) {
     Ok(_) -> Nil
     _ -> should.fail()
@@ -125,11 +122,9 @@ pub fn decodes_gnu_long_name_string_table_test() -> Nil {
       <<"MORE":utf8>>,
     ])
 
-  let assert Ok(decoded) = ar.decode(bytes: stream)
+  let assert Ok(decoded) = packkit.read(stream, format: archive.Ar)
 
-  list.map(archive.entries(decoded), fn(e) {
-    #(entry.to_string(entry.path(e)), entry.body(e))
-  })
+  list.map(decoded.entries, fn(e) { #(e.path, entry.body(e)) })
   |> should.equal([
     #(long_a, <<"DATA":utf8>>),
     #(long_b, <<"MORE":utf8>>),
@@ -150,11 +145,9 @@ pub fn skips_gnu_symbol_table_member_test() -> Nil {
       <<"HELLO":utf8>>,
     ])
 
-  let assert Ok(decoded) = ar.decode(bytes: stream)
+  let assert Ok(decoded) = packkit.read(stream, format: archive.Ar)
 
-  list.map(archive.entries(decoded), fn(e) {
-    #(entry.to_string(entry.path(e)), entry.body(e))
-  })
+  list.map(decoded.entries, fn(e) { #(e.path, entry.body(e)) })
   |> should.equal([#("hello.o", <<"HELLO":utf8>>)])
 }
 
@@ -251,5 +244,17 @@ fn archive_add_file(
   body: BitArray,
 ) -> archive.Archive {
   let assert Ok(file_entry) = entry.file_checked(path: path, body: body)
-  archive.add(archive_value, entry: file_entry)
+  fixture.add(archive_value, entry: file_entry)
+}
+
+pub fn decode_keeps_mode_wider_than_16_bits_test() -> Nil {
+  // The ar mode field holds eight octal digits.  Reading one above
+  // 0xFFFF used to panic in the entry builder; it is now kept as is.
+  let wide =
+    fixture.with_mode(fixture.file(path: "a", body: <<>>), mode: 0o7777777)
+  let assert Ok(bytes) =
+    packkit.write(fixture.new(archive.Ar) |> fixture.add(entry: wide))
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Ar)
+  decoded.entries
+  |> should.equal([wide])
 }

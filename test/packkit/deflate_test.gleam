@@ -1,12 +1,14 @@
 import gleam/bit_array
 import gleeunit/should
-import packkit/deflate
+import packkit
+import packkit/codec
+import packkit/internal/deflate
 
 pub fn decode_fixed_huffman_hello_test() -> Nil {
   // Raw deflate for the ASCII string "hello" produced by Python's
   // zlib.compressobj(level=6, wbits=-15).  Uses fixed Huffman.
   let compressed = <<0xCB, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00>>
-  let assert Ok(plain) = deflate.decode(bytes: compressed)
+  let assert Ok(plain) = packkit.decompress(compressed, with: codec.Deflate)
   plain
   |> should.equal(<<"hello":utf8>>)
 }
@@ -14,7 +16,7 @@ pub fn decode_fixed_huffman_hello_test() -> Nil {
 pub fn decode_fixed_huffman_repeat_test() -> Nil {
   // 51-byte ASCII string of repeated "abc" sequences.
   let compressed = <<0x4B, 0x4C, 0x4A, 0x4E, 0x24, 0x11, 0x01, 0x00>>
-  let assert Ok(plain) = deflate.decode(bytes: compressed)
+  let assert Ok(plain) = packkit.decompress(compressed, with: codec.Deflate)
   bit_array.byte_size(plain)
   |> should.equal(51)
 }
@@ -31,7 +33,7 @@ pub fn decode_dynamic_huffman_lorem_test() -> Nil {
     0x3F,
   >>
 
-  let assert Ok(plain) = deflate.decode(bytes: compressed)
+  let assert Ok(plain) = packkit.decompress(compressed, with: codec.Deflate)
   bit_array.to_string(plain)
   |> should.equal(Ok(
     "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
@@ -41,24 +43,16 @@ pub fn decode_dynamic_huffman_lorem_test() -> Nil {
 pub fn roundtrip_huffman_encoder_test() -> Nil {
   let payload = <<"packkit roundtrip via fixed-huffman deflate":utf8>>
   let assert Ok(compressed) = deflate.encode(bytes: payload)
-  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  let assert Ok(restored) = packkit.decompress(compressed, with: codec.Deflate)
   restored
   |> should.equal(payload)
 }
 
 pub fn roundtrip_empty_encoder_test() -> Nil {
   let assert Ok(compressed) = deflate.encode(bytes: <<>>)
-  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  let assert Ok(restored) = packkit.decompress(compressed, with: codec.Deflate)
   restored
   |> should.equal(<<>>)
-}
-
-pub fn roundtrip_stored_encoder_test() -> Nil {
-  let payload = <<"packkit roundtrip via stored deflate":utf8>>
-  let assert Ok(compressed) = deflate.encode_stored_only(bytes: payload)
-  let assert Ok(restored) = deflate.decode(bytes: compressed)
-  restored
-  |> should.equal(payload)
 }
 
 pub fn huffman_encoder_compresses_repetition_test() -> Nil {
@@ -66,7 +60,7 @@ pub fn huffman_encoder_compresses_repetition_test() -> Nil {
   // back-references.
   let payload = repeat_byte(0x41, 1024, <<>>)
   let assert Ok(compressed) = deflate.encode(bytes: payload)
-  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  let assert Ok(restored) = packkit.decompress(compressed, with: codec.Deflate)
   restored
   |> should.equal(payload)
   should.be_true(bit_array.byte_size(compressed) < 64)
@@ -77,7 +71,7 @@ pub fn huffman_encoder_handles_long_runs_test() -> Nil {
   // length/distance pairs back to back.
   let payload = <<"abcdef":utf8, "abcdef":utf8, "abcdef":utf8, "xyz":utf8>>
   let assert Ok(compressed) = deflate.encode(bytes: payload)
-  let assert Ok(restored) = deflate.decode(bytes: compressed)
+  let assert Ok(restored) = packkit.decompress(compressed, with: codec.Deflate)
   restored
   |> should.equal(payload)
 }

@@ -14,10 +14,12 @@ import gleam/list
 import metamon
 import metamon/generator.{type Generator}
 import metamon/generator/range
-import packkit/checksum
-import packkit/deflate
+import packkit
+import packkit/codec
 import packkit/gzip
-import packkit/zlib
+import packkit/internal/checksum
+import packkit/internal/deflate
+import packkit/internal/zlib
 
 @external(erlang, "packkit_reference_ffi", "zlib_compress")
 @external(javascript, "./packkit_reference_ffi.mjs", "zlib_compress")
@@ -134,9 +136,8 @@ fn repeat(piece: BitArray, times: Int) -> BitArray {
 pub fn reference_inflates_packkit_deflate_test() -> Nil {
   metamon.forall(payload_gen(), fn(data) {
     let assert Ok(fixed) = deflate.encode(bytes: data)
-    let assert Ok(dynamic) = deflate.encode_dynamic(bytes: data)
-    let assert Ok(stored) = deflate.encode_stored_only(bytes: data)
-    list.all([fixed, dynamic, stored], fn(stream) {
+    let dynamic = deflate.encode_dynamic(bytes: data)
+    list.all([fixed, dynamic], fn(stream) {
       ref_raw_inflate(hex(stream)) == Ok(hex(data))
     })
   })
@@ -145,7 +146,7 @@ pub fn reference_inflates_packkit_deflate_test() -> Nil {
 pub fn packkit_inflates_reference_deflate_test() -> Nil {
   metamon.forall(payload_gen(), fn(data) {
     let assert Ok(stream) = unhex(ref_raw_deflate(hex(data)))
-    deflate.decode(bytes: stream) == Ok(data)
+    packkit.decompress(stream, with: codec.Deflate) == Ok(data)
   })
 }
 
@@ -154,16 +155,16 @@ pub fn zlib_matches_reference_both_ways_test() -> Nil {
     let assert Ok(ours) = zlib.encode(bytes: data)
     let assert Ok(theirs) = unhex(ref_zlib_compress(hex(data)))
     ref_zlib_uncompress(hex(ours)) == Ok(hex(data))
-    && zlib.decode(bytes: theirs) == Ok(data)
+    && packkit.decompress(theirs, with: codec.Zlib) == Ok(data)
   })
 }
 
 pub fn gzip_matches_reference_both_ways_test() -> Nil {
   metamon.forall(payload_gen(), fn(data) {
-    let assert Ok(ours) = gzip.encode(bytes: data)
+    let ours = gzip.encode_without_header(data)
     let assert Ok(theirs) = unhex(ref_gzip(hex(data)))
     ref_gunzip(hex(ours)) == Ok(hex(data))
-    && gzip.decode_payload(bytes: theirs) == Ok(data)
+    && packkit.decompress(theirs, with: codec.Gzip) == Ok(data)
   })
 }
 
@@ -180,11 +181,7 @@ pub fn incremental_checksums_match_one_shot_test() -> Nil {
   metamon.forall(generator.tuple2(payload_gen(), payload_gen()), fn(pair) {
     let #(a, b) = pair
     let whole = bit_array.append(a, b)
-    checksum.crc32_continue(previous: checksum.crc32(data: a), data: b)
-    == checksum.crc32(data: whole)
-    && checksum.adler32_continue(previous: checksum.adler32(data: a), data: b)
-    == checksum.adler32(data: whole)
-    && checksum.sha256_finalize(
+    checksum.sha256_finalize(
       state: checksum.sha256_init()
       |> checksum.sha256_update(data: a)
       |> checksum.sha256_update(data: b),
@@ -257,11 +254,12 @@ pub fn deflate_handles_every_distance_and_length_code_boundary_test() -> Nil {
     })
   list.each(list.append(at_distances, at_lengths), fn(data) {
     let assert Ok(fixed) = deflate.encode(bytes: data)
-    let assert Ok(dynamic) = deflate.encode_dynamic(bytes: data)
+    let dynamic = deflate.encode_dynamic(bytes: data)
     let assert Ok(theirs) = unhex(ref_raw_deflate(hex(data)))
     let assert True = ref_raw_inflate(hex(fixed)) == Ok(hex(data))
     let assert True = ref_raw_inflate(hex(dynamic)) == Ok(hex(data))
-    let assert True = deflate.decode(bytes: theirs) == Ok(data)
+    let assert True =
+      packkit.decompress(theirs, with: codec.Deflate) == Ok(data)
     Nil
   })
 }

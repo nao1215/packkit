@@ -1,5 +1,5 @@
 import gleeunit/should
-import packkit/checksum
+import packkit/internal/checksum
 
 pub fn adler32_empty_test() -> Nil {
   checksum.adler32(<<>>)
@@ -10,18 +10,6 @@ pub fn adler32_wikipedia_test() -> Nil {
   // Reference value from Wikipedia's Adler-32 article.
   checksum.adler32(<<"Wikipedia":utf8>>)
   |> should.equal(0x11E60398)
-}
-
-pub fn adler32_continue_matches_single_pass_test() -> Nil {
-  let full = <<"The quick brown fox jumps over the lazy dog":utf8>>
-  let prefix = <<"The quick brown fox ":utf8>>
-  let suffix = <<"jumps over the lazy dog":utf8>>
-
-  let direct = checksum.adler32(full)
-  let chained = checksum.adler32_continue(checksum.adler32(prefix), suffix)
-
-  direct
-  |> should.equal(chained)
 }
 
 pub fn crc32_empty_test() -> Nil {
@@ -122,18 +110,6 @@ pub fn sha256_two_block_test() -> Nil {
     0x3E, 0x60, 0x39, 0xA3, 0x3C, 0xE4, 0x59, 0x64, 0xFF, 0x21, 0x67, 0xF6, 0xEC,
     0xED, 0xD4, 0x19, 0xDB, 0x06, 0xC1,
   >>)
-}
-
-pub fn crc32_continue_matches_single_pass_test() -> Nil {
-  let full = <<"The quick brown fox jumps over the lazy dog":utf8>>
-  let prefix = <<"The quick brown fox ":utf8>>
-  let suffix = <<"jumps over the lazy dog":utf8>>
-
-  let direct = checksum.crc32(full)
-  let chained = checksum.crc32_continue(checksum.crc32(prefix), suffix)
-
-  direct
-  |> should.equal(chained)
 }
 
 pub fn bzip2_crc32_check_value_test() -> Nil {

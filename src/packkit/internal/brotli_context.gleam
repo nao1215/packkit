@@ -10,7 +10,7 @@
 import gleam/bit_array
 import gleam/int
 
-pub const lookup: BitArray = <<
+const lookup: BitArray = <<
   0,
   1,
   2,

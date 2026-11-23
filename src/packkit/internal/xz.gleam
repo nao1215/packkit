@@ -11,29 +11,18 @@ import gleam/bool
 import gleam/int
 import gleam/list
 import gleam/result
-import packkit/checksum
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
 import packkit/internal/bcj
+import packkit/internal/bytes
+import packkit/internal/checksum
 import packkit/internal/lzma
 import packkit/limit
 
 const stream_footer_size: Int = 12
 
-/// xz codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.xz()
-}
-
-/// Encode `bytes` as an xz stream.  The encoder produces a single
-/// block whose LZMA2 filter chain contains real LZMA1-compressed
-/// chunks — each chunk routes through the literal-only LZMA1 encoder
-/// in `packkit/internal/lzma`, so the output is a fully conforming
-/// `.xz` file that any decoder accepts.  Compression ratio is bounded
-/// by the literal-only LZMA1 encoder (no LZ77 match search yet);
-/// plugging in a hash-chain match finder is the next obvious
-/// incremental improvement.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+/// Encode `bytes` as an xz stream with one block whose LZMA2 chunks
+/// are compressed by the LZ77 LZMA1 encoder in `packkit/internal/lzma`.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   let size = bit_array.byte_size(bytes)
   let stream_header = encode_stream_header()
   let lzma2_payload = encode_lzma2_compressed(bytes, size)
@@ -95,7 +84,7 @@ fn encode_block_header(
 
 // Maximum uncompressed bytes per LZMA-compressed LZMA2 chunk.  The
 // chunk header carries a 16-bit (compressed_size - 1) field, capping
-// the compressed payload at 64 KiB; with our literal-only LZMA1
+// the compressed payload at 64 KiB; with our LZMA1
 // encoder hitting ~1.125x expansion in the worst case, an input chunk
 // of 32 KiB encodes to at most ~37 KiB — well within the cap and
 // leaving room for the eventual LZ77 / Huffman uplift.
@@ -138,10 +127,9 @@ fn emit_lzma_chunks(
       let csize_minus_1 = csize - 1
       // Control byte: 0xE0 reset everything (state + properties +
       // dictionary) and pack the top 5 bits of (usize - 1) in the
-      // bottom 5 bits.  Resetting per chunk is wasteful for an LZMA
-      // encoder with LZ77 history, but our literal-only encoder has
-      // no history to carry between chunks anyway, so the simpler
-      // form is exactly equivalent.
+      // bottom 5 bits.  Resetting per chunk costs some ratio because
+      // the match window does not carry across chunks, but keeps each
+      // chunk independent.
       let control =
         int.bitwise_or(
           0xE0,
@@ -219,11 +207,6 @@ fn round_up_to_4(value: Int) -> Int {
   }
 }
 
-/// Decode an xz stream using default limits.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode an xz stream using explicit limits.
 ///
 /// Handles multi-stream files (per `xz-file-format.txt` §1: a `.xz`
@@ -233,10 +216,10 @@ pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -250,7 +233,7 @@ fn decode_streams_loop(
   acc: BitArray,
   accumulated_size: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use #(header_flags, rest) <- result.try(parse_stream_header(bytes))
   use #(payload, rest) <- result.try(decode_blocks(
     rest,
@@ -260,12 +243,9 @@ fn decode_streams_loop(
     limits,
   ))
   let next_size = accumulated_size + bit_array.byte_size(payload)
-  case next_size > limit.max_output_bytes(limits) {
+  case next_size > limits.max_output_bytes {
     True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: next_size,
-      ))
+      Error(codec.LimitExceeded(limit: "max_output_bytes", actual: next_size))
     False -> {
       let acc = bit_array.concat([acc, payload])
       let rest = skip_stream_padding(rest)
@@ -292,7 +272,7 @@ fn skip_stream_padding(bytes: BitArray) -> BitArray {
 
 fn parse_stream_header(
   bytes: BitArray,
-) -> Result(#(Int, BitArray), error.CodecError) {
+) -> Result(#(Int, BitArray), codec.CodecError) {
   case bytes {
     <<
       0xFD,
@@ -308,20 +288,20 @@ fn parse_stream_header(
     >> -> {
       use <- bool.guard(
         when: flag_zero != 0,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "xz stream header reserved byte is non-zero",
         )),
       )
       let expected = checksum.crc32(<<flag_zero, check_type>>)
       use <- bool.guard(
         when: expected != bit_array_to_u32_le(crc),
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "xz stream header CRC mismatch",
         )),
       )
       Ok(#(check_type, rest))
     }
-    _ -> Error(error.CodecInvalidData(message: "invalid xz stream header"))
+    _ -> Error(codec.InvalidData(message: "invalid xz stream header"))
   }
 }
 
@@ -354,7 +334,7 @@ fn decode_blocks(
   output: BitArray,
   records_acc: List(#(Int, Int)),
   limits: limit.Limits,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case bytes {
     <<0x00, rest:bytes>> ->
       // Index indicator.  Validate the index and footer, then return.
@@ -365,7 +345,11 @@ fn decode_blocks(
         check_type,
         limits,
       ))
-      use new_output <- result.try(append_with_limit(output, plain, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        plain,
+        limits,
+      ))
       decode_blocks(
         rest,
         check_type,
@@ -375,25 +359,9 @@ fn decode_blocks(
       )
     }
     _ ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "truncated xz stream before block or index",
       ))
-  }
-}
-
-fn append_with_limit(
-  output: BitArray,
-  chunk: BitArray,
-  limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
-  let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
-    False -> Ok(bit_array.concat([output, chunk]))
   }
 }
 
@@ -403,15 +371,15 @@ fn decode_block(
   bytes: BitArray,
   check_type: Int,
   limits: limit.Limits,
-) -> Result(#(BitArray, Int, Int, BitArray), error.CodecError) {
+) -> Result(#(BitArray, Int, Int, BitArray), codec.CodecError) {
   case bytes {
     <<size_byte, _:bytes>> -> {
       let header_size = { size_byte + 1 } * 4
       case bit_array.slice(bytes, 0, header_size) {
         Error(_) ->
-          Error(error.CodecInvalidData(message: "truncated xz block header"))
+          Error(codec.InvalidData(message: "truncated xz block header"))
         Ok(header_chunk) -> {
-          use #(flags, comp_size, uncomp_size, filters, _padding) <- result.try(
+          use #(_flags, comp_size, uncomp_size, filters, _padding) <- result.try(
             parse_block_header(header_chunk, header_size),
           )
           // Multi-filter chains are supported when:
@@ -424,7 +392,6 @@ fn decode_block(
           use #(lzma2_props, pre_filters) <- result.try(split_filter_chain(
             filters,
           ))
-          let _ = flags
           // Slice the compressed data immediately after the header.
           // When the xz block header carries the optional
           // `compressed_size` field we slice exactly that many bytes;
@@ -450,9 +417,7 @@ fn decode_block(
                   Ok(b)
                 }
                 False ->
-                  Error(error.CodecInvalidData(
-                    message: "truncated xz block data",
-                  ))
+                  Error(codec.InvalidData(message: "truncated xz block data"))
               }
             }
           })
@@ -470,7 +435,7 @@ fn decode_block(
               CompressedKnown(v) -> lzma2_consumed != v
               CompressedUnknown -> False
             },
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "xz block compressed_size mismatch",
             )),
           )
@@ -483,7 +448,7 @@ fn decode_block(
               UncompressedKnown(v) -> bit_array.byte_size(plain) != v
               UncompressedUnknown -> False
             },
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "xz block uncompressed size mismatch",
             )),
           )
@@ -494,7 +459,7 @@ fn decode_block(
           use <- bool.guard(
             when: pad > 0
               && !slice_is_zero(bytes, payload_offset + payload_size, pad),
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "xz block padding has non-zero bytes",
             )),
           )
@@ -518,7 +483,7 @@ fn decode_block(
         }
       }
     }
-    _ -> Error(error.CodecInvalidData(message: "truncated xz block header"))
+    _ -> Error(codec.InvalidData(message: "truncated xz block header"))
   }
 }
 
@@ -537,12 +502,12 @@ fn parse_block_header(
   size: Int,
 ) -> Result(
   #(Int, SizeField, UncompressedField, List(#(Int, Int)), BitArray),
-  error.CodecError,
+  codec.CodecError,
 ) {
   // header[0] is size byte, header[size-4..size-1] is CRC32 over header[0..size-5]
   use <- bool.guard(
     when: size < 8,
-    return: Error(error.CodecInvalidData(message: "xz block header too small")),
+    return: Error(codec.InvalidData(message: "xz block header too small")),
   )
   let crc_offset = size - 4
   use header_no_crc <- result.try(slice_required(
@@ -560,9 +525,7 @@ fn parse_block_header(
   let expected = checksum.crc32(header_no_crc)
   use <- bool.guard(
     when: expected != bit_array_to_u32_le(crc_bytes),
-    return: Error(error.CodecInvalidData(
-      message: "xz block header CRC mismatch",
-    )),
+    return: Error(codec.InvalidData(message: "xz block header CRC mismatch")),
   )
 
   // Skip the size byte we already consumed for header_size; parse flags next.
@@ -575,7 +538,7 @@ fn parse_block_header(
       let reserved_bits = int.bitwise_and(flags, 0x3C)
       use <- bool.guard(
         when: reserved_bits != 0,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "xz block header has reserved bits set",
         )),
       )
@@ -596,7 +559,7 @@ fn parse_block_header(
       use #(filters, rest) <- result.try(parse_filters(rest, filter_count, []))
       Ok(#(flags, comp_size, uncomp_size, filters, rest))
     }
-    _ -> Error(error.CodecInvalidData(message: "xz block header missing flags"))
+    _ -> Error(codec.InvalidData(message: "xz block header missing flags"))
   }
 }
 
@@ -604,7 +567,7 @@ fn parse_filters(
   bytes: BitArray,
   remaining: Int,
   acc: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), BitArray), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), BitArray), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {
@@ -644,16 +607,16 @@ fn parse_filters(
 /// pre-filter chain (already in encode-order)".
 fn split_filter_chain(
   filters: List(#(Int, Int)),
-) -> Result(#(Int, List(#(Int, Int))), error.CodecError) {
+) -> Result(#(Int, List(#(Int, Int))), codec.CodecError) {
   case filters {
-    [] -> Error(error.CodecInvalidData(message: "xz block has no filters"))
+    [] -> Error(codec.InvalidData(message: "xz block has no filters"))
     _ -> {
       // The last filter must be LZMA2.
       let reversed = list.reverse(filters)
       case reversed {
-        [] -> Error(error.CodecInvalidData(message: "xz block has no filters"))
+        [] -> Error(codec.InvalidData(message: "xz block has no filters"))
         [#(id, _), ..] if id != 0x21 ->
-          Error(error.CodecNotImplemented(
+          Error(codec.Unsupported(
             feature: "xz blocks whose final filter is not LZMA2",
           ))
         [#(_, props), ..pre_reversed] -> {
@@ -669,7 +632,7 @@ fn split_filter_chain(
 
 fn validate_pre_filters(
   filters: List(#(Int, Int)),
-) -> Result(Nil, error.CodecError) {
+) -> Result(Nil, codec.CodecError) {
   case filters {
     [] -> Ok(Nil)
     [#(0x03, _), ..rest] -> validate_pre_filters(rest)
@@ -682,7 +645,7 @@ fn validate_pre_filters(
     [#(0x0A, _), ..rest] -> validate_pre_filters(rest)
     [#(0x0B, _), ..rest] -> validate_pre_filters(rest)
     [#(id, _), ..] ->
-      Error(error.CodecNotImplemented(
+      Error(codec.Unsupported(
         feature: "xz pre-processor filter id " <> int.to_string(id),
       ))
   }
@@ -694,14 +657,14 @@ fn validate_pre_filters(
 fn apply_pre_filters_reverse(
   bytes: BitArray,
   filters: List(#(Int, Int)),
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   apply_pre_filters_loop(bytes, list.reverse(filters))
 }
 
 fn apply_pre_filters_loop(
   bytes: BitArray,
   reversed_filters: List(#(Int, Int)),
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case reversed_filters {
     [] -> Ok(bytes)
     [#(0x03, props), ..rest] -> {
@@ -746,7 +709,7 @@ fn apply_pre_filters_loop(
       apply_pre_filters_loop(bcj.riscv_decode(bytes, 0), rest)
     }
     [#(id, _), ..] ->
-      Error(error.CodecNotImplemented(
+      Error(codec.Unsupported(
         feature: "xz pre-processor filter id " <> int.to_string(id),
       ))
   }
@@ -823,7 +786,7 @@ fn decode_lzma2(
   payload: BitArray,
   default_props: Int,
   limits: limit.Limits,
-) -> Result(#(BitArray, Int), error.CodecError) {
+) -> Result(#(BitArray, Int), codec.CodecError) {
   let initial = case lzma.properties_of_byte(default_props) {
     Ok(p) -> p
     Error(_) -> lzma.Properties(lc: 3, lp: 0, pb: 2)
@@ -837,7 +800,7 @@ fn decode_lzma2_loop(
   consumed: Int,
   props: lzma.Properties,
   limits: limit.Limits,
-) -> Result(#(BitArray, Int), error.CodecError) {
+) -> Result(#(BitArray, Int), codec.CodecError) {
   case payload {
     <<0x00, _:bytes>> -> Ok(#(output, consumed + 1))
     <<control, _:bytes>> if control == 0x01 || control == 0x02 -> {
@@ -851,7 +814,11 @@ fn decode_lzma2_loop(
             size,
             "lzma2 uncompressed chunk",
           ))
-          use new_output <- result.try(append_with_limit(output, data, limits))
+          use new_output <- result.try(bytes.append_with_limit(
+            output,
+            data,
+            limits,
+          ))
           let assert Ok(next) =
             bit_array.slice(rest, size, bit_array.byte_size(rest) - size)
           // 1 control byte + 2 size bytes + `size` body bytes
@@ -864,18 +831,16 @@ fn decode_lzma2_loop(
           )
         }
         _ ->
-          Error(error.CodecInvalidData(
-            message: "truncated lzma2 uncompressed chunk",
-          ))
+          Error(codec.InvalidData(message: "truncated lzma2 uncompressed chunk"))
       }
     }
     <<control, _:bytes>> if control >= 0x80 ->
       decode_lzma2_lzma_chunk(payload, control, output, consumed, props, limits)
     <<other, _:bytes>> ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "invalid lzma2 control byte " <> int.to_string(other),
       ))
-    _ -> Error(error.CodecInvalidData(message: "truncated lzma2 stream"))
+    _ -> Error(codec.InvalidData(message: "truncated lzma2 stream"))
   }
 }
 
@@ -886,7 +851,7 @@ fn decode_lzma2_lzma_chunk(
   consumed: Int,
   props: lzma.Properties,
   limits: limit.Limits,
-) -> Result(#(BitArray, Int), error.CodecError) {
+) -> Result(#(BitArray, Int), codec.CodecError) {
   let has_new_props = control >= 0xC0
   case payload {
     <<_control, usize_high, usize_low, csize_high, csize_low, rest:bytes>> -> {
@@ -921,7 +886,7 @@ fn decode_lzma2_lzma_chunk(
                 Ok(#(parsed_props, lzma_data, after, 1))
               }
               _ ->
-                Error(error.CodecInvalidData(
+                Error(codec.InvalidData(
                   message: "truncated lzma2 properties byte",
                 ))
             }
@@ -941,10 +906,14 @@ fn decode_lzma2_lzma_chunk(
       use decoder <- result.try(lzma.new(
         lzma_input,
         new_props,
-        limit.max_output_bytes(limits),
+        limits.max_output_bytes,
       ))
       use #(decoded, _state) <- result.try(lzma.decode_into(decoder, usize))
-      use new_output <- result.try(append_with_limit(output, decoded, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        decoded,
+        limits,
+      ))
       // 1 control + 2 usize + 2 csize + optional 1 props + csize body
       let chunk_bytes = 5 + props_byte_count + csize
       decode_lzma2_loop(
@@ -955,8 +924,7 @@ fn decode_lzma2_lzma_chunk(
         limits,
       )
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "truncated lzma2 LZMA chunk header"))
+    _ -> Error(codec.InvalidData(message: "truncated lzma2 LZMA chunk header"))
   }
 }
 
@@ -976,15 +944,14 @@ fn verify_block_check(
   plain: BitArray,
   check_type: Int,
   check_bytes: BitArray,
-) -> Result(Nil, error.CodecError) {
+) -> Result(Nil, codec.CodecError) {
   case check_type {
     0 -> Ok(Nil)
     1 -> {
       let expected = checksum.crc32(plain)
       case expected == bit_array_to_u32_le(check_bytes) {
         True -> Ok(Nil)
-        False ->
-          Error(error.CodecInvalidData(message: "xz block CRC32 mismatch"))
+        False -> Error(codec.InvalidData(message: "xz block CRC32 mismatch"))
       }
     }
     4 ->
@@ -997,10 +964,10 @@ fn verify_block_check(
           case expected == bit_array_to_u64_le_pair(check_bytes) {
             True -> Ok(Nil)
             False ->
-              Error(error.CodecInvalidData(message: "xz block CRC64 mismatch"))
+              Error(codec.InvalidData(message: "xz block CRC64 mismatch"))
           }
         }
-        _ -> Error(error.CodecInvalidData(message: "xz block CRC64 length"))
+        _ -> Error(codec.InvalidData(message: "xz block CRC64 length"))
       }
     10 ->
       case bit_array.byte_size(check_bytes) {
@@ -1009,13 +976,13 @@ fn verify_block_check(
           case expected == check_bytes {
             True -> Ok(Nil)
             False ->
-              Error(error.CodecInvalidData(message: "xz block SHA-256 mismatch"))
+              Error(codec.InvalidData(message: "xz block SHA-256 mismatch"))
           }
         }
-        _ -> Error(error.CodecInvalidData(message: "xz block SHA-256 length"))
+        _ -> Error(codec.InvalidData(message: "xz block SHA-256 length"))
       }
     _ ->
-      Error(error.CodecNotImplemented(
+      Error(codec.Unsupported(
         feature: "xz check type " <> int.to_string(check_type),
       ))
   }
@@ -1028,11 +995,11 @@ fn finalize_stream(
   check_type: Int,
   output: BitArray,
   records: List(#(Int, Int)),
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   use #(num_records, rest) <- result.try(read_varint(bytes))
   use <- bool.guard(
     when: num_records != list.length(records),
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "xz index record count does not match blocks",
     )),
   )
@@ -1041,7 +1008,7 @@ fn finalize_stream(
   )
   use <- bool.guard(
     when: parsed_records != records,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "xz index records do not match block sizes",
     )),
   )
@@ -1049,7 +1016,7 @@ fn finalize_stream(
   let pad = padding_to_align(1 + bytes_after_indicator, 4)
   use <- bool.guard(
     when: pad > 0 && !slice_is_zero(rest, 0, pad),
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "xz index padding has non-zero bytes",
     )),
   )
@@ -1058,7 +1025,7 @@ fn finalize_stream(
   let expected_crc = checksum.crc32(crc_input)
   use <- bool.guard(
     when: expected_crc != bit_array_to_u32_le(crc_bytes),
-    return: Error(error.CodecInvalidData(message: "xz index CRC mismatch")),
+    return: Error(codec.InvalidData(message: "xz index CRC mismatch")),
   )
   let assert Ok(after_index) =
     bit_array.slice(rest, pad + 4, bit_array.byte_size(rest) - pad - 4)
@@ -1077,7 +1044,7 @@ fn finalize_stream(
       Ok(#(output, after_footer))
     }
     _ ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "xz stream footer truncated (need 12 bytes)",
       ))
   }
@@ -1099,7 +1066,7 @@ fn read_index_records(
   bytes: BitArray,
   remaining: Int,
   acc: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), BitArray), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), BitArray), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), bytes))
     _ -> {
@@ -1113,7 +1080,7 @@ fn read_index_records(
 fn verify_stream_footer(
   footer: BitArray,
   check_type: Int,
-) -> Result(Nil, error.CodecError) {
+) -> Result(Nil, codec.CodecError) {
   case footer {
     <<
       crc:bytes-size(4),
@@ -1125,13 +1092,13 @@ fn verify_stream_footer(
     >> -> {
       use <- bool.guard(
         when: flag_zero != 0,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "xz stream footer reserved byte non-zero",
         )),
       )
       use <- bool.guard(
         when: footer_check != check_type,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "xz stream footer check type does not match header",
         )),
       )
@@ -1143,13 +1110,13 @@ fn verify_stream_footer(
         >>)
       use <- bool.guard(
         when: expected != bit_array_to_u32_le(crc),
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "xz stream footer CRC mismatch",
         )),
       )
       Ok(Nil)
     }
-    _ -> Error(error.CodecInvalidData(message: "invalid xz stream footer"))
+    _ -> Error(codec.InvalidData(message: "invalid xz stream footer"))
   }
 }
 
@@ -1163,7 +1130,7 @@ fn records_size(records: List(#(Int, Int))) -> Int {
 
 // -- varint helpers ------------------------------------------------------
 
-fn read_varint(bytes: BitArray) -> Result(#(Int, BitArray), error.CodecError) {
+fn read_varint(bytes: BitArray) -> Result(#(Int, BitArray), codec.CodecError) {
   read_varint_loop(bytes, 0, 0)
 }
 
@@ -1171,7 +1138,7 @@ fn read_varint_loop(
   bytes: BitArray,
   value: Int,
   shift: Int,
-) -> Result(#(Int, BitArray), error.CodecError) {
+) -> Result(#(Int, BitArray), codec.CodecError) {
   case bytes {
     <<b, rest:bytes>> -> {
       let chunk = int.bitwise_and(b, 0x7F)
@@ -1180,13 +1147,13 @@ fn read_varint_loop(
         0 -> Ok(#(value, rest))
         _ -> {
           case shift >= 56 {
-            True -> Error(error.CodecInvalidData(message: "xz varint overflow"))
+            True -> Error(codec.InvalidData(message: "xz varint overflow"))
             False -> read_varint_loop(rest, value, shift + 7)
           }
         }
       }
     }
-    _ -> Error(error.CodecInvalidData(message: "truncated xz varint"))
+    _ -> Error(codec.InvalidData(message: "truncated xz varint"))
   }
 }
 
@@ -1213,15 +1180,14 @@ fn slice_required(
   offset: Int,
   length: Int,
   label: String,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case offset, length {
     -1, _ -> Ok(bytes)
     _, -1 -> Ok(bytes)
     _, _ ->
       case bit_array.slice(bytes, offset, length) {
         Ok(value) -> Ok(value)
-        Error(_) ->
-          Error(error.CodecInvalidData(message: "truncated " <> label))
+        Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
       }
   }
 }

@@ -15,9 +15,9 @@ import gleam/int
 import gleam/list
 import gleam/order
 import gleam/result
-import packkit/checksum
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
+import packkit/internal/bytes
+import packkit/internal/checksum
 import packkit/limit
 
 const block_magic_high: Int = 0x314159
@@ -34,34 +34,11 @@ const max_selectors: Int = 18_002
 
 const group_size: Int = 50
 
-/// bzip2 codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.bzip2()
-}
-
-/// Encode `bytes` as a bzip2 stream using the default block size 9
-/// (900 KiB).  The encoder emits a single block plus the stream
-/// trailer with the combined CRC; large inputs that exceed the
-/// block size will still be packed into one block, so a naive
-/// forward BWT may dominate the running time.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  encode_with_level(bytes: bytes, level: 9)
-}
-
-/// Encode `bytes` as a bzip2 stream with an explicit block-size
-/// level (1..9).  The level only affects the stream header byte; the
-/// encoder always emits a single block so the level mostly carries
-/// over for round-trip tooling.
-pub fn encode_with_level(
-  bytes bytes: BitArray,
-  level level: Int,
-) -> Result(BitArray, error.CodecError) {
-  use <- bool.guard(
-    when: level < 1 || level > 9,
-    return: Error(error.CodecInvalidData(message: "bzip2 level must be in 1..9")),
-  )
-  let level_byte = 0x30 + level
-  let header = <<0x42, 0x5A, 0x68, level_byte>>
+/// Encode `bytes` as a bzip2 stream whose header declares block size 9
+/// (900 KiB).  The encoder writes one block plus the stream trailer, so
+/// large inputs go through one forward BWT.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
+  let header = <<0x42, 0x5A, 0x68, 0x39>>
   case bit_array.byte_size(bytes) {
     0 -> {
       let writer = write_eos_marker(new_writer(), 0)
@@ -83,11 +60,6 @@ fn write_eos_marker(writer: Writer, stream_crc: Int) -> Writer {
   |> write_bits_msb(stream_crc, 32)
 }
 
-/// Decode a bzip2 stream using the shared default `Limits`.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a bzip2 stream using explicit `Limits`.
 ///
 /// Handles multi-stream `.bz2` files (the `bzcat`-style concatenation
@@ -98,10 +70,10 @@ pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -115,7 +87,7 @@ fn decode_streams_loop(
   acc: BitArray,
   accumulated_size: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use rest <- result.try(parse_stream_header(bytes))
   use #(payload, after) <- result.try(decode_blocks_with_remainder(
     new_reader(rest),
@@ -124,12 +96,9 @@ fn decode_streams_loop(
     limits,
   ))
   let next_size = accumulated_size + bit_array.byte_size(payload)
-  case next_size > limit.max_output_bytes(limits) {
+  case next_size > limits.max_output_bytes {
     True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: next_size,
-      ))
+      Error(codec.LimitExceeded(limit: "max_output_bytes", actual: next_size))
     False -> {
       let acc = bit_array.concat([acc, payload])
       case bit_array.byte_size(after) {
@@ -142,11 +111,11 @@ fn decode_streams_loop(
 
 // -- stream header -------------------------------------------------------
 
-fn parse_stream_header(bytes: BitArray) -> Result(BitArray, error.CodecError) {
+fn parse_stream_header(bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   case bytes {
     <<0x42, 0x5A, 0x68, level, rest:bytes>> if level >= 0x31 && level <= 0x39 ->
       Ok(rest)
-    _ -> Error(error.CodecInvalidData(message: "invalid bzip2 stream header"))
+    _ -> Error(codec.InvalidData(message: "invalid bzip2 stream header"))
   }
 }
 
@@ -157,7 +126,7 @@ fn decode_blocks_with_remainder(
   output: BitArray,
   combined_crc: Int,
   limits: limit.Limits,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   use #(magic_high, reader) <- result.try(read_bits(reader, 24))
   use #(magic_low, reader) <- result.try(read_bits(reader, 24))
 
@@ -169,7 +138,7 @@ fn decode_blocks_with_remainder(
       ))
       use _ <- result.try(verify_block_crc(block_bytes, block_crc))
       let combined_crc = combine_block_crc(combined_crc, block_crc)
-      use new_output <- result.try(append_with_limit(
+      use new_output <- result.try(bytes.append_with_limit(
         output,
         block_bytes,
         limits,
@@ -180,12 +149,10 @@ fn decode_blocks_with_remainder(
       use #(stream_crc, reader) <- result.try(read_bits(reader, 32))
       case stream_crc == combined_crc {
         True -> Ok(#(output, byte_aligned_remainder(reader)))
-        False ->
-          Error(error.CodecInvalidData(message: "bzip2 stream CRC mismatch"))
+        False -> Error(codec.InvalidData(message: "bzip2 stream CRC mismatch"))
       }
     }
-    _, _ ->
-      Error(error.CodecInvalidData(message: "unexpected bzip2 block marker"))
+    _, _ -> Error(codec.InvalidData(message: "unexpected bzip2 block marker"))
   }
 }
 
@@ -194,7 +161,6 @@ fn decode_blocks_with_remainder(
 /// the next byte boundary after the stream CRC, so any partial bits
 /// still sitting in `reader.buffer` are padding and we discard them.
 fn byte_aligned_remainder(reader: Reader) -> BitArray {
-  let _ = reader.buffer
   reader.source
 }
 
@@ -210,26 +176,10 @@ fn combine_block_crc(combined: Int, block_crc: Int) -> Int {
 fn verify_block_crc(
   data: BitArray,
   expected: Int,
-) -> Result(Nil, error.CodecError) {
+) -> Result(Nil, codec.CodecError) {
   case checksum.bzip2_crc32(data) == expected {
     True -> Ok(Nil)
-    False -> Error(error.CodecInvalidData(message: "bzip2 block CRC mismatch"))
-  }
-}
-
-fn append_with_limit(
-  output: BitArray,
-  chunk: BitArray,
-  limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
-  let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
-    False -> Ok(bit_array.concat([output, chunk]))
+    False -> Error(codec.InvalidData(message: "bzip2 block CRC mismatch"))
   }
 }
 
@@ -238,12 +188,12 @@ fn append_with_limit(
 fn decode_block(
   reader: Reader,
   limits: limit.Limits,
-) -> Result(#(BitArray, Int, Reader), error.CodecError) {
+) -> Result(#(BitArray, Int, Reader), codec.CodecError) {
   use #(crc, reader) <- result.try(read_bits(reader, 32))
   use #(randomized, reader) <- result.try(read_bits(reader, 1))
   use <- bool.guard(
     when: randomized != 0,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "randomized bzip2 blocks are not supported",
     )),
   )
@@ -253,14 +203,14 @@ fn decode_block(
   let num_syms = list.length(symbols)
   use <- bool.guard(
     when: num_syms == 0,
-    return: Error(error.CodecInvalidData(message: "empty bzip2 symbol map")),
+    return: Error(codec.InvalidData(message: "empty bzip2 symbol map")),
   )
   let alphabet_size = num_syms + 2
 
   use #(num_tables, reader) <- result.try(read_bits(reader, 3))
   use <- bool.guard(
     when: num_tables < 2 || num_tables > 6,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "invalid bzip2 huffman table count",
     )),
   )
@@ -268,9 +218,7 @@ fn decode_block(
   use #(num_selectors, reader) <- result.try(read_bits(reader, 15))
   use <- bool.guard(
     when: num_selectors <= 0 || num_selectors > max_selectors,
-    return: Error(error.CodecInvalidData(
-      message: "invalid bzip2 selector count",
-    )),
+    return: Error(codec.InvalidData(message: "invalid bzip2 selector count")),
   )
 
   use #(selectors, reader) <- result.try(read_selectors(
@@ -294,7 +242,6 @@ fn decode_block(
     selectors_arr,
     eob,
     symbols,
-    num_syms,
     0,
     0,
     1,
@@ -305,9 +252,7 @@ fn decode_block(
 
   use <- bool.guard(
     when: orig_ptr >= l_len,
-    return: Error(error.CodecInvalidData(
-      message: "bzip2 BWT origin out of range",
-    )),
+    return: Error(codec.InvalidData(message: "bzip2 BWT origin out of range")),
   )
 
   let bwt_dict = inverse_bwt(l_string, l_len, orig_ptr)
@@ -320,7 +265,7 @@ fn decode_block(
 
 fn read_symbol_map(
   reader: Reader,
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   use #(present_groups, reader) <- result.try(read_bits(reader, 16))
   read_symbol_groups(reader, present_groups, 0, [])
 }
@@ -330,7 +275,7 @@ fn read_symbol_groups(
   presence: Int,
   group: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case group >= 16 {
     True -> Ok(#(list.reverse(acc), reader))
     False -> {
@@ -372,7 +317,7 @@ fn read_selectors(
   reader: Reader,
   remaining: Int,
   num_tables: Int,
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   let stack = init_selector_stack(num_tables, 0, [])
   read_selectors_loop(reader, remaining, stack, [])
 }
@@ -389,16 +334,14 @@ fn read_selectors_loop(
   remaining: Int,
   stack: List(Int),
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), reader))
     _ -> {
       use #(index, reader) <- result.try(read_unary(reader, 0))
       use <- bool.guard(
         when: index >= list.length(stack),
-        return: Error(error.CodecInvalidData(
-          message: "bzip2 selector out of range",
-        )),
+        return: Error(codec.InvalidData(message: "bzip2 selector out of range")),
       )
       let #(picked, remaining_stack) = pick_at(stack, index, [])
       let stack = [picked, ..remaining_stack]
@@ -410,7 +353,7 @@ fn read_selectors_loop(
 fn read_unary(
   reader: Reader,
   acc: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(bit, reader) <- result.try(read_bits(reader, 1))
   case bit {
     0 -> Ok(#(acc, reader))
@@ -446,7 +389,7 @@ fn read_huffman_tables(
   reader: Reader,
   count: Int,
   alphabet_size: Int,
-) -> Result(#(List(HuffmanTable), Reader), error.CodecError) {
+) -> Result(#(List(HuffmanTable), Reader), codec.CodecError) {
   read_huffman_tables_loop(reader, count, alphabet_size, [])
 }
 
@@ -455,7 +398,7 @@ fn read_huffman_tables_loop(
   remaining: Int,
   alphabet_size: Int,
   acc: List(HuffmanTable),
-) -> Result(#(List(HuffmanTable), Reader), error.CodecError) {
+) -> Result(#(List(HuffmanTable), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), reader))
     _ -> {
@@ -477,14 +420,14 @@ fn read_table_lengths(
   remaining: Int,
   current: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), reader))
     _ -> {
       use #(current, reader) <- result.try(adjust_length(reader, current))
       use <- bool.guard(
         when: current < 1 || current > max_code_length,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "bzip2 huffman length out of range",
         )),
       )
@@ -496,7 +439,7 @@ fn read_table_lengths(
 fn adjust_length(
   reader: Reader,
   current: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(flag, reader) <- result.try(read_bits(reader, 1))
   case flag {
     0 -> Ok(#(current, reader))
@@ -513,13 +456,13 @@ fn adjust_length(
 
 fn build_huffman_table(
   lengths: List(Int),
-) -> Result(HuffmanTable, error.CodecError) {
+) -> Result(HuffmanTable, codec.CodecError) {
   let pairs = enumerate_lengths(lengths, 0, [])
   let min_length = find_min_length(lengths, 21)
   let max_length = find_max_length(lengths, 0)
   use <- bool.guard(
     when: min_length < 1 || max_length > max_code_length || max_length < 1,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "bzip2 huffman length out of range",
     )),
   )
@@ -700,14 +643,13 @@ fn decode_huffman_stream(
   selectors: dict.Dict(Int, Int),
   eob: Int,
   mtf: List(Int),
-  num_syms: Int,
   symbol_count: Int,
   pending_run: Int,
   run_weight: Int,
   out_rev: List(Int),
   out_len: Int,
   limits: limit.Limits,
-) -> Result(#(dict.Dict(Int, Int), Int, Reader), error.CodecError) {
+) -> Result(#(dict.Dict(Int, Int), Int, Reader), codec.CodecError) {
   case
     decode_huffman_step(
       reader,
@@ -725,7 +667,6 @@ fn decode_huffman_stream(
   {
     Error(err) -> Error(err)
     Ok(HuffmanStreamDone(final_out_rev, final_out_len, final_reader)) -> {
-      let _ = num_syms
       let l_string =
         list_to_indexed_dict(list.reverse(final_out_rev), 0, dict.new())
       Ok(#(l_string, final_out_len, final_reader))
@@ -745,7 +686,6 @@ fn decode_huffman_stream(
         selectors,
         eob,
         next_mtf,
-        num_syms,
         next_symbol_count,
         next_pending_run,
         next_run_weight,
@@ -781,7 +721,7 @@ fn decode_huffman_step(
   out_rev: List(Int),
   out_len: Int,
   limits: limit.Limits,
-) -> Result(HuffmanStreamStep, error.CodecError) {
+) -> Result(HuffmanStreamStep, codec.CodecError) {
   let group_index = symbol_count / group_size
   let selector = case dict.get(selectors, group_index) {
     Ok(v) -> v
@@ -865,7 +805,7 @@ fn flush_run(
   mtf: List(Int),
   pending: Int,
   limits: limit.Limits,
-) -> Result(#(List(Int), Int), error.CodecError) {
+) -> Result(#(List(Int), Int), codec.CodecError) {
   case pending {
     0 -> Ok(#(out_rev, out_len))
     _ -> {
@@ -874,8 +814,8 @@ fn flush_run(
         [] -> 0
       }
       use <- bool.guard(
-        when: out_len + pending > limit.max_output_bytes(limits),
-        return: Error(error.CodecLimitExceeded(
+        when: out_len + pending > limits.max_output_bytes,
+        return: Error(codec.LimitExceeded(
           limit: "max_output_bytes",
           actual: out_len + pending,
         )),
@@ -891,10 +831,10 @@ fn emit_byte(
   out_len: Int,
   byte: Int,
   limits: limit.Limits,
-) -> Result(#(List(Int), Int), error.CodecError) {
+) -> Result(#(List(Int), Int), codec.CodecError) {
   use <- bool.guard(
-    when: out_len + 1 > limit.max_output_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: out_len + 1 > limits.max_output_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_output_bytes",
       actual: out_len + 1,
     )),
@@ -912,12 +852,12 @@ fn repeat_prepend(value: Int, count: Int, acc: List(Int)) -> List(Int) {
 fn mtf_pick_byte(
   mtf: List(Int),
   index: Int,
-) -> Result(#(Int, List(Int)), error.CodecError) {
+) -> Result(#(Int, List(Int)), codec.CodecError) {
   case mtf_pick_loop(mtf, index, []) {
     Ok(#(byte, prefix, rest)) ->
       Ok(#(byte, [byte, ..list.append(list.reverse(prefix), rest)]))
     Error(_) ->
-      Error(error.CodecInvalidData(message: "bzip2 MTF index out of range"))
+      Error(codec.InvalidData(message: "bzip2 MTF index out of range"))
   }
 }
 
@@ -948,7 +888,7 @@ fn list_to_indexed_dict(
 fn decode_one_symbol(
   reader: Reader,
   table: HuffmanTable,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(code, reader) <- result.try(read_bits(reader, table.min_length))
   walk_huffman(reader, table, table.min_length, code)
 }
@@ -958,10 +898,9 @@ fn walk_huffman(
   table: HuffmanTable,
   length: Int,
   code: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   case length > table.max_length {
-    True ->
-      Error(error.CodecInvalidData(message: "bzip2 huffman code overflow"))
+    True -> Error(codec.InvalidData(message: "bzip2 huffman code overflow"))
     False -> {
       let limit_value = case dict.get(table.limit, length) {
         Ok(v) -> v
@@ -980,7 +919,7 @@ fn walk_huffman(
           }
           case symbol < 0 {
             True ->
-              Error(error.CodecInvalidData(
+              Error(codec.InvalidData(
                 message: "bzip2 huffman symbol lookup failed",
               ))
             False -> Ok(#(symbol, reader))
@@ -1213,10 +1152,10 @@ fn refill(reader: Reader, needed: Int) -> Reader {
 fn read_bits(
   reader: Reader,
   count: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   let reader = refill(reader, count)
   case reader.bits < count {
-    True -> Error(error.CodecInvalidData(message: "truncated bzip2 stream"))
+    True -> Error(codec.InvalidData(message: "truncated bzip2 stream"))
     False -> {
       let new_bits = reader.bits - count
       let mask = int.bitwise_shift_left(1, count) - 1

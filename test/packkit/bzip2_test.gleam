@@ -1,18 +1,12 @@
 import gleam/bit_array
 import gleeunit/should
-import packkit/bzip2
+import packkit
 import packkit/codec
-import packkit/error
-
-pub fn codec_marker_test() -> Nil {
-  bzip2.codec()
-  |> codec.name
-  |> should.equal("bzip2")
-}
+import packkit/internal/bzip2
 
 pub fn encode_empty_test() -> Nil {
   let assert Ok(encoded) = bzip2.encode(bytes: <<>>)
-  let assert Ok(decoded) = bzip2.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Bzip2)
   decoded
   |> should.equal(<<>>)
 }
@@ -20,7 +14,7 @@ pub fn encode_empty_test() -> Nil {
 pub fn encode_roundtrip_hello_test() -> Nil {
   let payload = <<"hello":utf8>>
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  let assert Ok(decoded) = bzip2.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Bzip2)
   decoded
   |> should.equal(payload)
 }
@@ -28,16 +22,9 @@ pub fn encode_roundtrip_hello_test() -> Nil {
 pub fn encode_roundtrip_pangram_test() -> Nil {
   let payload = <<"The quick brown fox jumps over the lazy dog.\n":utf8>>
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  let assert Ok(decoded) = bzip2.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Bzip2)
   decoded
   |> should.equal(payload)
-}
-
-pub fn encode_rejects_invalid_level_test() -> Nil {
-  bzip2.encode_with_level(bytes: <<"x":utf8>>, level: 0)
-  |> should.equal(
-    Error(error.CodecInvalidData(message: "bzip2 level must be in 1..9")),
-  )
 }
 
 pub fn decode_hello_block_test() -> Nil {
@@ -48,7 +35,7 @@ pub fn decode_hello_block_test() -> Nil {
     0x33, 0x4D, 0x07, 0x33, 0x8B, 0xB9, 0x22, 0x9C, 0x28, 0x48, 0x0C, 0x98, 0xB2,
     0x9E, 0x80,
   >>
-  let assert Ok(plain) = bzip2.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Bzip2)
   plain
   |> should.equal(<<"hello":utf8>>)
 }
@@ -64,7 +51,7 @@ pub fn decode_pangram_block_test() -> Nil {
     0x1A, 0xB2, 0x01, 0xD6, 0x37, 0xBF, 0xE2, 0xEE, 0x48, 0xA7, 0x0A, 0x12, 0x16,
     0x66, 0xB6, 0xDE, 0x40,
   >>
-  let assert Ok(plain) = bzip2.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Bzip2)
   plain
   |> should.equal(<<
     "The quick brown fox jumps over the lazy dog.\n":utf8,
@@ -78,7 +65,7 @@ pub fn decode_repeated_byte_block_test() -> Nil {
     0xF8, 0x00, 0x00, 0x02, 0x21, 0x00, 0x00, 0x10, 0x20, 0x00, 0x20, 0x00, 0x21,
     0x00, 0x82, 0x0B, 0x17, 0x72, 0x45, 0x38, 0x50, 0x90, 0x42, 0x80, 0x9E, 0xF8,
   >>
-  let assert Ok(plain) = bzip2.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Bzip2)
   plain
   |> should.equal(<<
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":utf8,
@@ -86,16 +73,16 @@ pub fn decode_repeated_byte_block_test() -> Nil {
 }
 
 pub fn decode_rejects_missing_magic_test() -> Nil {
-  bzip2.decode(bytes: <<0x00, 0x00, 0x00, 0x00>>)
+  packkit.decompress(<<0x00, 0x00, 0x00, 0x00>>, with: codec.Bzip2)
   |> should.equal(
-    Error(error.CodecInvalidData(message: "invalid bzip2 stream header")),
+    Error(codec.InvalidData(message: "invalid bzip2 stream header")),
   )
 }
 
 pub fn decode_rejects_invalid_level_test() -> Nil {
-  bzip2.decode(bytes: <<0x42, 0x5A, 0x68, 0x40>>)
+  packkit.decompress(<<0x42, 0x5A, 0x68, 0x40>>, with: codec.Bzip2)
   |> should.equal(
-    Error(error.CodecInvalidData(message: "invalid bzip2 stream header")),
+    Error(codec.InvalidData(message: "invalid bzip2 stream header")),
   )
 }
 
@@ -106,7 +93,7 @@ pub fn decode_multi_stream_concatenated_test() -> Nil {
   let assert Ok(s1) = bzip2.encode(bytes: <<"first-part-of-stream":utf8>>)
   let assert Ok(s2) = bzip2.encode(bytes: <<"-second-part-of-stream":utf8>>)
   let combined = bit_array.concat([s1, s2])
-  let assert Ok(plain) = bzip2.decode(bytes: combined)
+  let assert Ok(plain) = packkit.decompress(combined, with: codec.Bzip2)
   plain
   |> should.equal(<<"first-part-of-stream-second-part-of-stream":utf8>>)
 }

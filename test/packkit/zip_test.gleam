@@ -4,15 +4,16 @@ import gleam/list
 import gleam/option
 import gleam/string
 import gleeunit/should
+import packkit
 import packkit/archive
-import packkit/bzip2
-import packkit/checksum
-import packkit/entry
-import packkit/error
-import packkit/level
-import packkit/xz
+import packkit/fixture
+import packkit/internal/bzip2
+import packkit/internal/checksum
+import packkit/internal/entry
+import packkit/internal/xz
+import packkit/internal/zstd
+import packkit/limit
 import packkit/zip
-import packkit/zstd
 
 // Reusable helper: build a single-file archive whose only entry has
 // the requested Unix mtime, encode it through `zip.encode`, then
@@ -22,25 +23,25 @@ import packkit/zstd
 // silently coercing to a sentinel.
 fn zip_roundtrip_mtime(unix_seconds: Int) -> Int {
   let entry_value =
-    entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
-    |> entry.with_modified_at(unix_seconds: unix_seconds)
-  let archive_value = archive.add(zip.new(), entry: entry_value)
-  let assert Ok(bytes) = zip.encode(archive: archive_value)
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [single] = archive.entries(decoded)
-  single |> entry.metadata |> entry.modified_at_unix
+    fixture.file(path: "stamped.txt", body: <<"hi":utf8>>)
+    |> fixture.with_modified_at(unix_seconds: unix_seconds)
+  let archive_value = fixture.add(fixture.new(archive.Zip), entry: entry_value)
+  let assert Ok(bytes) = zip.encode(archive_value, method: zip.Store)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [single] = decoded.entries
+  single.modified_at
 }
 
 pub fn roundtrip_single_file_test() -> Nil {
   let original =
-    zip.new()
+    fixture.new(archive.Zip)
     |> archive_add_file("hello.txt", <<"hello":utf8>>)
 
-  let assert Ok(bytes) = zip.encode(archive: original)
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Store)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
 
-  let assert [restored] = archive.entries(decoded)
-  entry.to_string(entry.path(restored))
+  let assert [restored] = decoded.entries
+  restored.path
   |> should.equal("hello.txt")
   entry.body(restored)
   |> should.equal(<<"hello":utf8>>)
@@ -48,17 +49,17 @@ pub fn roundtrip_single_file_test() -> Nil {
 
 pub fn roundtrip_mixed_entries_test() -> Nil {
   let original =
-    zip.new()
+    fixture.new(archive.Zip)
     |> archive_add_directory("doc")
     |> archive_add_file("doc/spec.md", <<"contents":utf8>>)
     |> archive_add_file("README.md", <<"a":utf8>>)
 
-  let assert Ok(bytes) = zip.encode(archive: original)
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let entries = archive.entries(decoded)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Store)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let entries = decoded.entries
 
-  list.map(entries, entry.kind)
-  |> should.equal([entry.Directory, entry.File, entry.File])
+  list.map(entries, fixture.kind)
+  |> should.equal([fixture.Directory, fixture.File, fixture.File])
 
   let assert [_, doc_spec, readme] = entries
   entry.body(doc_spec)
@@ -69,10 +70,10 @@ pub fn roundtrip_mixed_entries_test() -> Nil {
 
 pub fn rejects_corrupted_crc_test() -> Nil {
   let original =
-    zip.new()
+    fixture.new(archive.Zip)
     |> archive_add_file("data.bin", <<1, 2, 3, 4>>)
 
-  let assert Ok(bytes) = zip.encode(archive: original)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Store)
   // The 8-byte filename "data.bin" sits between the 30-byte LFH and the
   // 4-byte body, so the body lives at offset 38..42.
   let body_offset = 30 + 8
@@ -85,8 +86,8 @@ pub fn rejects_corrupted_crc_test() -> Nil {
     )
   let corrupted = bit_array.concat([prefix, <<0, 0, 0, 0>>, suffix])
 
-  case zip.decode(bytes: corrupted) {
-    Error(error.ArchiveInvalid(_)) -> Nil
+  case packkit.read(corrupted, format: archive.Zip) {
+    Error(archive.InvalidData(_)) -> Nil
     _ -> should.fail()
   }
 }
@@ -96,10 +97,10 @@ pub fn decodes_python_deflate_zip_test() -> Nil {
   //   zf.writestr('hello.txt', 'hello world\n' * 50)
   //   zf.writestr('numbers.txt', '0123456789' * 100)
   let bytes = python_deflate_zip()
-  let assert Ok(archive_value) = zip.decode(bytes: bytes)
-  let entries = archive.entries(archive_value)
+  let assert Ok(archive_value) = packkit.read(bytes, format: archive.Zip)
+  let entries = archive_value.entries
 
-  list.map(entries, fn(e) { entry.to_string(entry.path(e)) })
+  list.map(entries, fn(e) { e.path })
   |> should.equal(["hello.txt", "numbers.txt"])
 
   let assert [hello, numbers] = entries
@@ -113,65 +114,28 @@ pub fn encode_deflate_method_default_level_roundtrip_test() -> Nil {
   // The default level maps to the fixed-Huffman DEFLATE encoder we
   // actually ship; round-trip should be lossless.
   let original =
-    zip.new()
+    fixture.new(archive.Zip)
     |> archive_add_file(
       "greeting.txt",
       repeat_bytes(<<"hello world":utf8>>, 30),
     )
 
-  let assert Ok(bytes) =
-    zip.encode_with_method(
-      archive: original,
-      method: zip.deflate(level.default()),
-    )
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Deflate)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
   entry.body(restored)
   |> should.equal(repeat_bytes(<<"hello world":utf8>>, 30))
-}
-
-pub fn encode_deflate_method_store_level_emits_stored_blocks_test() -> Nil {
-  // Level 0 (store) is honoured by emitting stored DEFLATE blocks
-  // rather than fixed-Huffman blocks.  The output is still a valid
-  // ZIP/deflate stream that the decoder reads back losslessly.
-  let payload = <<"deflate level 0 round trip":utf8>>
-  let original = zip.new() |> archive_add_file("a.bin", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(
-      archive: original,
-      method: zip.deflate(level.store()),
-    )
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
-  entry.body(restored)
-  |> should.equal(payload)
-}
-
-pub fn encode_deflate_method_rejects_non_default_level_test() -> Nil {
-  // Levels that the fixed-Huffman backend can't honour must be
-  // surfaced as a typed `CodecOptionUnsupported` (wrapped as
-  // `ArchiveEntryRejected`), not silently coerced to the default.
-  let original = zip.new() |> archive_add_file("a.bin", <<"data":utf8>>)
-  case
-    zip.encode_with_method(archive: original, method: zip.deflate(level.best()))
-  {
-    Error(error.ArchiveEntryRejected(path: _, reason: reason)) ->
-      reason
-      |> string.contains("zip-deflate")
-      |> should.be_true
-    _ -> should.fail()
-  }
 }
 
 pub fn encode_bzip2_method_roundtrip_test() -> Nil {
   // The bzip2 ZIP method (PKZIP method 12) round-trips through the
   // standard decoder by dispatching to the packkit bzip2 codec.
   let payload = repeat_bytes(<<"bzip2 zip body ":utf8>>, 20)
-  let original = zip.new() |> archive_add_file("data.bin", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.bzip2())
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let original =
+    fixture.new(archive.Zip) |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Bzip2)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
   entry.body(restored) |> should.equal(payload)
 }
 
@@ -179,11 +143,11 @@ pub fn encode_zstd_method_roundtrip_test() -> Nil {
   // The zstd ZIP method (PKZIP method 93) round-trips through the
   // standard decoder by dispatching to the packkit zstd codec.
   let payload = repeat_bytes(<<"zstd zip body ":utf8>>, 20)
-  let original = zip.new() |> archive_add_file("data.bin", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.zstd())
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let original =
+    fixture.new(archive.Zip) |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Zstd)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
   entry.body(restored) |> should.equal(payload)
 }
 
@@ -191,11 +155,11 @@ pub fn encode_xz_method_roundtrip_test() -> Nil {
   // The xz ZIP method (PKZIP method 95) round-trips through the
   // standard decoder by dispatching to the packkit xz codec.
   let payload = repeat_bytes(<<"xz zip body ":utf8>>, 20)
-  let original = zip.new() |> archive_add_file("data.bin", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.xz())
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let original =
+    fixture.new(archive.Zip) |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Xz)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
   entry.body(restored) |> should.equal(payload)
 }
 
@@ -207,11 +171,11 @@ pub fn encode_lzma_method_roundtrip_test() -> Nil {
   // decoder relies on the central-directory uncompressed size rather
   // than an in-stream EOS marker.
   let payload = repeat_bytes(<<"lzma zip body ":utf8>>, 20)
-  let original = zip.new() |> archive_add_file("data.bin", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.lzma())
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let original =
+    fixture.new(archive.Zip) |> archive_add_file("data.bin", payload)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Lzma)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
   entry.body(restored) |> should.equal(payload)
 }
 
@@ -219,11 +183,10 @@ pub fn encode_lzma_method_short_payload_test() -> Nil {
   // Single-byte payload exercises the range coder's bootstrap path
   // (only one literal encoded before finish flushes the cache).
   let payload = <<0x42>>
-  let original = zip.new() |> archive_add_file("x.bin", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.lzma())
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let original = fixture.new(archive.Zip) |> archive_add_file("x.bin", payload)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Lzma)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
   entry.body(restored) |> should.equal(payload)
 }
 
@@ -233,15 +196,14 @@ pub fn encode_mixed_methods_with_directory_test() -> Nil {
   // still round-trip.
   let payload = <<"compressed-body":utf8>>
   let original =
-    zip.new()
+    fixture.new(archive.Zip)
     |> archive_add_directory("doc")
     |> archive_add_file("doc/notes.txt", payload)
-  let assert Ok(bytes) =
-    zip.encode_with_method(archive: original, method: zip.zstd())
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let entries = archive.entries(decoded)
-  list.map(entries, entry.kind)
-  |> should.equal([entry.Directory, entry.File])
+  let assert Ok(bytes) = zip.encode(original, method: zip.Zstd)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let entries = decoded.entries
+  list.map(entries, fixture.kind)
+  |> should.equal([fixture.Directory, fixture.File])
   let assert [_, notes] = entries
   entry.body(notes) |> should.equal(payload)
 }
@@ -251,20 +213,21 @@ pub fn archive_comment_round_trips_through_eocd_test() -> Nil {
   // must be encoded there and restored on decode.  Previously the
   // comment was silently dropped on encode.
   let original =
-    zip.new()
+    fixture.new(archive.Zip)
     |> archive_add_file("a.txt", <<"a":utf8>>)
-    |> archive.with_comment(comment: "packkit zip comment")
-  let assert Ok(bytes) = zip.encode(archive: original)
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  archive.comment(decoded)
+    |> fixture.with_comment(comment: "packkit zip comment")
+  let assert Ok(bytes) = zip.encode(original, method: zip.Store)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  decoded.comment
   |> should.equal(option.Some("packkit zip comment"))
 }
 
 pub fn archive_without_comment_decodes_to_none_test() -> Nil {
-  let original = zip.new() |> archive_add_file("a.txt", <<"a":utf8>>)
-  let assert Ok(bytes) = zip.encode(archive: original)
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  archive.comment(decoded)
+  let original =
+    fixture.new(archive.Zip) |> archive_add_file("a.txt", <<"a":utf8>>)
+  let assert Ok(bytes) = zip.encode(original, method: zip.Store)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  decoded.comment
   |> should.equal(option.None)
 }
 
@@ -311,20 +274,29 @@ pub fn decode_pkware_encrypted_zip_with_correct_password_test() -> Nil {
   let body = <<"hello, pkware!":utf8>>
   let bytes = build_zipcrypto_fixture("hello.txt", body, "secret")
   let assert Ok(archive_value) =
-    zip.decode_with_password(bytes: bytes, password: "secret")
-  let entries = archive.entries(archive_value)
+    zip.decode_with_password(
+      bytes: bytes,
+      password: "secret",
+      limits: limit.default(),
+    )
+  let entries = archive_value.entries
   list.length(entries) |> should.equal(1)
   let assert [decoded] = entries
-  entry.to_string(entry.path(decoded)) |> should.equal("hello.txt")
+  decoded.path |> should.equal("hello.txt")
   entry.body(decoded) |> should.equal(body)
 }
 
 pub fn decode_pkware_encrypted_zip_wrong_password_rejected_test() -> Nil {
   let body = <<"hello, pkware!":utf8>>
   let bytes = build_zipcrypto_fixture("hello.txt", body, "secret")
-  let result = zip.decode_with_password(bytes: bytes, password: "wrong")
+  let result =
+    zip.decode_with_password(
+      bytes: bytes,
+      password: "wrong",
+      limits: limit.default(),
+    )
   case result {
-    Error(error.ArchiveInvalid(message: msg)) ->
+    Error(archive.InvalidData(message: msg)) ->
       case string.contains(msg, "wrong password") {
         True -> Nil
         False -> should.fail()
@@ -336,9 +308,9 @@ pub fn decode_pkware_encrypted_zip_wrong_password_rejected_test() -> Nil {
 pub fn decode_pkware_encrypted_zip_without_password_surfaces_typed_error_test() -> Nil {
   let body = <<"hello, pkware!":utf8>>
   let bytes = build_zipcrypto_fixture("hello.txt", body, "secret")
-  let result = zip.decode(bytes: bytes)
+  let result = packkit.read(bytes, format: archive.Zip)
   case result {
-    Error(error.ArchiveNotImplemented(feature: feature)) ->
+    Error(archive.Unsupported(feature: feature)) ->
       case string.contains(feature, "encrypted ZIP entry") {
         True -> Nil
         False -> should.fail()
@@ -494,18 +466,22 @@ fn build_zipcrypto_fixture(
   bit_array.concat([local, central, eocd])
 }
 
-pub fn entry_with_mode_checked_rejects_overflow_test() -> Nil {
-  // `external_attrs = mode << 16` in the ZIP central directory, and
-  // the field is 32 bits wide, so any mode that doesn't fit in 16
-  // bits would push external_attrs past 2^32.  The mode-side validator
-  // catches that at the `entry` boundary instead of letting it reach
-  // the encoder.
-  let assert Ok(file_entry) =
-    entry.file_checked(path: "x.txt", body: <<"x":utf8>>)
-  case entry.with_mode_checked(file_entry, mode: 0x10000) {
-    Error(entry.ModeOutOfRange(value: 0x10000)) -> Nil
-    _ -> should.fail()
-  }
+pub fn encode_rejects_mode_over_16_bits_test() -> Nil {
+  // ZIP stores `mode << 16` in the 32-bit external attributes, so a
+  // mode that does not fit in 16 bits cannot be written.
+  let wide =
+    fixture.with_mode(fixture.file(path: "x.txt", body: <<>>), mode: 0x10000)
+  zip.encode(
+    fixture.new(archive.Zip) |> fixture.add(entry: wide),
+    method: zip.Store,
+  )
+  |> should.equal(
+    Error(archive.FieldOverflow(
+      field: "zip external_attributes",
+      value: 0x1_0000_0000,
+      max: 0xFFFFFFFF,
+    )),
+  )
 }
 
 fn archive_add_file(
@@ -514,7 +490,7 @@ fn archive_add_file(
   body: BitArray,
 ) -> archive.Archive {
   let assert Ok(file_entry) = entry.file_checked(path: path, body: body)
-  archive.add(archive_value, entry: file_entry)
+  fixture.add(archive_value, entry: file_entry)
 }
 
 fn archive_add_directory(
@@ -522,7 +498,7 @@ fn archive_add_directory(
   path: String,
 ) -> archive.Archive {
   let assert Ok(dir_entry) = entry.directory_checked(path: path)
-  archive.add(archive_value, entry: dir_entry)
+  fixture.add(archive_value, entry: dir_entry)
 }
 
 pub fn decodes_zstd_compressed_entry_test() -> Nil {
@@ -568,10 +544,10 @@ pub fn decodes_pkware_lzma_method_14_entry_test() -> Nil {
     0x74, 0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
     0x36, 0x00, 0x00, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00,
   >>
-  let assert Ok(arch) = zip.decode(bytes: bytes)
-  case archive.entries(arch) {
+  let assert Ok(arch) = packkit.read(bytes, format: archive.Zip)
+  case arch.entries {
     [e] -> {
-      entry.to_string(entry.path(e)) |> should.equal("lzma.txt")
+      e.path |> should.equal("lzma.txt")
       entry.body(e)
       |> should.equal(<<
         "PKWARE LZMA test payload inside ZIP method 14":utf8,
@@ -624,11 +600,11 @@ fn zip_method_round_trip(
     central_size:size(32)-little, local_size:size(32)-little, 0x00, 0x00,
   >>
   let stream = bit_array.concat([entry_bytes, central, eocd])
-  let assert Ok(arch) = zip.decode(bytes: stream)
-  case archive.entries(arch) {
+  let assert Ok(arch) = packkit.read(stream, format: archive.Zip)
+  case arch.entries {
     [e] -> {
       entry.body(e) |> should.equal(payload)
-      entry.to_string(entry.path(e)) |> should.equal("z.dat")
+      e.path |> should.equal("z.dat")
     }
     _ -> should.fail()
   }
@@ -696,15 +672,13 @@ pub fn decodes_system_zip_with_unix_extended_timestamp_test() -> Nil {
     0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x52, 0x00, 0x00, 0x00, 0x51, 0x00, 0x00,
     0x00, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = zip.decode(bytes: fixture)
-  let assert [single] = archive.entries(decoded)
-  entry.to_string(entry.path(single))
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.Zip)
+  let assert [single] = decoded.entries
+  single.path
   |> should.equal("greeting.txt")
   entry.body(single)
   |> should.equal(<<"mtime test\n":utf8>>)
-  single
-  |> entry.metadata
-  |> entry.modified_at_unix
+  single.modified_at
   |> should.equal(1_749_990_896)
 }
 
@@ -735,16 +709,19 @@ pub fn encode_sets_efs_flag_on_non_ascii_filename_test() -> Nil {
   // the encoded entry.
   let payload = <<"hello":utf8>>
   let archive_value =
-    archive.add(zip.new(), entry: entry.file(path: "こんにちは.txt", body: payload))
-  let assert Ok(bytes) = zip.encode(archive: archive_value)
+    fixture.add(
+      fixture.new(archive.Zip),
+      entry: fixture.file(path: "こんにちは.txt", body: payload),
+    )
+  let assert Ok(bytes) = zip.encode(archive_value, method: zip.Store)
   let gp_flag = read_local_gp_flag(bytes)
   int.bitwise_and(gp_flag, 0x0800)
   |> should.equal(0x0800)
 
   // Round-trip should still recover the original (UTF-8) name and body.
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
-  entry.to_string(entry.path(restored))
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [restored] = decoded.entries
+  restored.path
   |> should.equal("こんにちは.txt")
   entry.body(restored)
   |> should.equal(payload)
@@ -755,11 +732,11 @@ pub fn encode_omits_efs_flag_on_ascii_filename_test() -> Nil {
   // EOS-omitted marker) is only set when the method is LZMA, so for
   // a default stored entry every bit must be 0.
   let archive_value =
-    archive.add(
-      zip.new(),
-      entry: entry.file(path: "ascii.txt", body: <<"a":utf8>>),
+    fixture.add(
+      fixture.new(archive.Zip),
+      entry: fixture.file(path: "ascii.txt", body: <<"a":utf8>>),
     )
-  let assert Ok(bytes) = zip.encode(archive: archive_value)
+  let assert Ok(bytes) = zip.encode(archive_value, method: zip.Store)
   let gp_flag = read_local_gp_flag(bytes)
   int.bitwise_and(gp_flag, 0x0800)
   |> should.equal(0)
@@ -777,14 +754,13 @@ pub fn encode_omits_efs_flag_on_ascii_filename_test() -> Nil {
 
 fn zip_roundtrip_owner(uid: Int, gid: Int) -> #(Int, Int) {
   let value =
-    entry.file(path: "owned.txt", body: <<"hi":utf8>>)
-    |> entry.with_owner(user_id: uid, group_id: gid)
-  let archive_value = archive.add(zip.new(), entry: value)
-  let assert Ok(bytes) = zip.encode(archive: archive_value)
-  let assert Ok(decoded) = zip.decode(bytes: bytes)
-  let assert [single] = archive.entries(decoded)
-  let meta = entry.metadata(single)
-  #(entry.user_id(meta), entry.group_id(meta))
+    fixture.file(path: "owned.txt", body: <<"hi":utf8>>)
+    |> fixture.with_owner(user_id: uid, group_id: gid)
+  let archive_value = fixture.add(fixture.new(archive.Zip), entry: value)
+  let assert Ok(bytes) = zip.encode(archive_value, method: zip.Store)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Zip)
+  let assert [single] = decoded.entries
+  #(single.user_id, single.group_id)
 }
 
 pub fn roundtrip_preserves_entry_uid_gid_test() -> Nil {
@@ -833,13 +809,12 @@ pub fn decodes_system_zip_with_unix_uid_gid_extra_test() -> Nil {
     0x00, 0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
     0x4F, 0x00, 0x00, 0x00, 0x4E, 0x00, 0x00, 0x00, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = zip.decode(bytes: fixture)
-  let assert [single] = archive.entries(decoded)
-  entry.to_string(entry.path(single))
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.Zip)
+  let assert [single] = decoded.entries
+  single.path
   |> should.equal("owned.txt")
-  let meta = entry.metadata(single)
-  entry.user_id(meta) |> should.equal(1000)
-  entry.group_id(meta) |> should.equal(1000)
+  single.user_id |> should.equal(1000)
+  single.group_id |> should.equal(1000)
 }
 
 // -- WinZip AE-x decryption -----------------------------------------
@@ -883,9 +858,13 @@ pub fn decode_system_winzip_aes256_archive_test() -> Nil {
     0x01, 0x00, 0x67, 0x00, 0x00, 0x00, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00,
   >>
   let assert Ok(decoded) =
-    zip.decode_with_password(bytes: fixture, password: aex_password)
-  let assert [restored] = archive.entries(decoded)
-  entry.to_string(entry.path(restored))
+    zip.decode_with_password(
+      bytes: fixture,
+      password: aex_password,
+      limits: limit.default(),
+    )
+  let assert [restored] = decoded.entries
+  restored.path
   |> should.equal("secret.txt")
   entry.body(restored)
   |> should.equal(aex_expected_payload)
@@ -916,8 +895,12 @@ pub fn decode_system_winzip_aes128_archive_test() -> Nil {
     0x00, 0x00, 0x00, 0x00,
   >>
   let assert Ok(decoded) =
-    zip.decode_with_password(bytes: fixture, password: aex_password)
-  let assert [restored] = archive.entries(decoded)
+    zip.decode_with_password(
+      bytes: fixture,
+      password: aex_password,
+      limits: limit.default(),
+    )
+  let assert [restored] = decoded.entries
   entry.body(restored)
   |> should.equal(aex_expected_payload)
 }
@@ -947,8 +930,36 @@ pub fn decode_winzip_aes_rejects_wrong_password_test() -> Nil {
     0x03, 0x00, 0x00, 0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
     0x01, 0x00, 0x67, 0x00, 0x00, 0x00, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00,
   >>
-  case zip.decode_with_password(bytes: fixture, password: "definitely_wrong") {
-    Error(error.ArchiveInvalid(_)) -> Nil
+  case
+    zip.decode_with_password(
+      bytes: fixture,
+      password: "definitely_wrong",
+      limits: limit.default(),
+    )
+  {
+    Error(archive.InvalidData(_)) -> Nil
     _ -> should.fail()
   }
+}
+
+pub fn encode_rejects_owner_id_over_32_bits_test() -> Nil {
+  // The InfoZIP owner extra field stores 32-bit ids, so a larger id
+  // must not be cut down silently.
+  let wide =
+    fixture.with_owner(
+      fixture.file(path: "x.txt", body: <<>>),
+      user_id: 0x1_0000_0001,
+      group_id: 0,
+    )
+  zip.encode(
+    fixture.new(archive.Zip) |> fixture.add(entry: wide),
+    method: zip.Store,
+  )
+  |> should.equal(
+    Error(archive.FieldOverflow(
+      field: "zip uid",
+      value: 0x1_0000_0001,
+      max: 0xFFFFFFFF,
+    )),
+  )
 }

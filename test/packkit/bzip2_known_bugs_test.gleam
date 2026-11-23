@@ -13,19 +13,21 @@
 //// accounts for the 259th byte of the run.
 
 import gleeunit/should
-import packkit/bzip2
+import packkit
+import packkit/codec
+import packkit/internal/bzip2
 
 pub fn bug3_repeated_a_1k_test() -> Nil {
   let payload = byte_repeat(0x61, 1000)
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  bzip2.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Bzip2)
   |> should.equal(Ok(payload))
 }
 
 pub fn bug3_zeros_1k_test() -> Nil {
   let payload = byte_repeat(0x00, 1000)
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  bzip2.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Bzip2)
   |> should.equal(Ok(payload))
 }
 
@@ -35,7 +37,7 @@ pub fn bug3_zeros_1k_test() -> Nil {
 pub fn bug3_long_zero_run_3000_test() -> Nil {
   let payload = byte_repeat(0x00, 3000)
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  bzip2.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Bzip2)
   |> should.equal(Ok(payload))
 }
 
@@ -43,7 +45,7 @@ pub fn bug3_long_zero_run_3000_test() -> Nil {
 pub fn bug3_run_at_259_boundary_test() -> Nil {
   let payload = byte_repeat(0x41, 259)
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  bzip2.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Bzip2)
   |> should.equal(Ok(payload))
 }
 
@@ -51,7 +53,7 @@ pub fn bug3_run_at_259_boundary_test() -> Nil {
 pub fn bug3_run_at_260_boundary_test() -> Nil {
   let payload = byte_repeat(0x41, 260)
   let assert Ok(encoded) = bzip2.encode(bytes: payload)
-  bzip2.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Bzip2)
   |> should.equal(Ok(payload))
 }
 

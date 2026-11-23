@@ -28,18 +28,13 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/order
 import gleam/result
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
+import packkit/internal/bytes
 import packkit/internal/fse
 import packkit/internal/huf
 import packkit/limit
 
 const magic: Int = 0xFD2FB528
-
-/// Zstandard codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.zstd()
-}
 
 // Upper bound for any single block this encoder emits.  16 KiB - 1
 // is the largest `regenerated_size` and `compressed_size` the
@@ -73,7 +68,7 @@ const huffman_min_input_size: Int = 64
 /// passes through as raw bytes.  No LZ77 or Huffman compression yet,
 /// no content checksum.  Output is a valid Zstandard frame any
 /// conforming decoder can read.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   let size = bit_array.byte_size(bytes)
   use header <- result.try(frame_header_for_size(size))
   let blocks = build_raw_blocks(bytes, size)
@@ -84,7 +79,7 @@ pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 /// Exposed for tests that need to assert on the FCS layout for sizes
 /// too large to materialise in memory (e.g. 4 GiB+ frames where the
 /// header used to silently truncate the FCS field to its low 32 bits).
-pub fn frame_header_for_size(size: Int) -> Result(BitArray, error.CodecError) {
+pub fn frame_header_for_size(size: Int) -> Result(BitArray, codec.CodecError) {
   // Single_Segment_flag = 1, no Window_Descriptor, no Dictionary_ID,
   // no Content_Checksum.  FCS encoding follows the size — 1 byte for
   // < 256, 2 bytes (FCS_flag = 1) for the 256..65535 range, 4 bytes
@@ -122,7 +117,7 @@ pub fn frame_header_for_size(size: Int) -> Result(BitArray, error.CodecError) {
       let high_half = int.bitwise_shift_right(n, 32)
       use <- bool.guard(
         when: high_half > 0xFFFFFFFF,
-        return: Error(error.CodecLimitExceeded(
+        return: Error(codec.LimitExceeded(
           limit: "zstd frame_content_size",
           actual: n,
         )),
@@ -2558,11 +2553,6 @@ fn build_huffman_literals_section_only(
   }
 }
 
-/// Decode a Zstandard frame using default limits.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a Zstandard frame using explicit limits.  Per RFC 8478 §3,
 /// a zstd "byte stream" is one or more frames concatenated; the
 /// decoder walks the entire input, appending each frame's payload to
@@ -2570,10 +2560,10 @@ pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -2587,7 +2577,7 @@ fn decode_frames_loop(
   acc: BitArray,
   accumulated_size: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   // Skippable frames (RFC 8478 §3.1.2) have magic 0x184D2A5X for X
   // in 0..F.  The 4-byte LE Frame_Size that follows tells us how
   // many bytes of User_Data to skip.  The decoder must skip them
@@ -2605,7 +2595,7 @@ fn decode_data_frame(
   acc: BitArray,
   accumulated_size: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use #(checksum_flag, rest) <- result.try(parse_frame_header(bytes))
   use #(output, rest) <- result.try(decode_blocks(
     rest,
@@ -2615,12 +2605,9 @@ fn decode_data_frame(
   ))
   use rest <- result.try(consume_checksum_returning_rest(rest, checksum_flag))
   let next_size = accumulated_size + bit_array.byte_size(output)
-  case next_size > limit.max_output_bytes(limits) {
+  case next_size > limits.max_output_bytes {
     True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: next_size,
-      ))
+      Error(codec.LimitExceeded(limit: "max_output_bytes", actual: next_size))
     False -> {
       let acc = bit_array.concat([acc, output])
       case bit_array.byte_size(rest) {
@@ -2636,12 +2623,12 @@ fn skip_skippable_frame(
   acc: BitArray,
   accumulated_size: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bytes {
     <<_magic:bytes-size(4), frame_size:little-unsigned-size(32), rest:bytes>> ->
       case bit_array.byte_size(rest) >= frame_size {
         False ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "zstd skippable frame body is shorter than the declared Frame_Size",
           ))
         True ->
@@ -2659,13 +2646,13 @@ fn skip_skippable_frame(
                   decode_frames_loop(after_skip, acc, accumulated_size, limits)
               }
             Error(_) ->
-              Error(error.CodecInvalidData(
+              Error(codec.InvalidData(
                 message: "zstd skippable frame slice failed",
               ))
           }
       }
     _ ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "zstd skippable frame header is shorter than 8 bytes",
       ))
   }
@@ -2674,14 +2661,14 @@ fn skip_skippable_frame(
 fn consume_checksum_returning_rest(
   bytes: BitArray,
   checksum_flag: Bool,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case checksum_flag {
     False -> Ok(bytes)
     True ->
       case bytes {
         <<_crc:bytes-size(4), rest:bytes>> -> Ok(rest)
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "zstd content checksum is shorter than 4 bytes",
           ))
       }
@@ -2692,17 +2679,17 @@ fn consume_checksum_returning_rest(
 
 fn parse_frame_header(
   bytes: BitArray,
-) -> Result(#(Bool, BitArray), error.CodecError) {
+) -> Result(#(Bool, BitArray), codec.CodecError) {
   case bytes {
     <<m:little-unsigned-size(32), rest:bytes>> if m == magic ->
       parse_frame_descriptor(rest)
-    _ -> Error(error.CodecInvalidData(message: "missing zstd frame magic"))
+    _ -> Error(codec.InvalidData(message: "missing zstd frame magic"))
   }
 }
 
 fn parse_frame_descriptor(
   bytes: BitArray,
-) -> Result(#(Bool, BitArray), error.CodecError) {
+) -> Result(#(Bool, BitArray), codec.CodecError) {
   case bytes {
     <<descriptor, rest:bytes>> -> {
       let fcs_flag = int.bitwise_shift_right(descriptor, 6)
@@ -2712,7 +2699,7 @@ fn parse_frame_descriptor(
       let dict_id_flag = int.bitwise_and(descriptor, 0x03)
       use <- bool.guard(
         when: reserved_bit,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "zstd reserved descriptor bit must be zero",
         )),
       )
@@ -2728,24 +2715,23 @@ fn parse_frame_descriptor(
       ))
       Ok(#(checksum_flag, rest))
     }
-    _ -> Error(error.CodecInvalidData(message: "truncated zstd frame header"))
+    _ -> Error(codec.InvalidData(message: "truncated zstd frame header"))
   }
 }
 
 fn skip_window_descriptor(
   bytes: BitArray,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bytes {
     <<_window, rest:bytes>> -> Ok(rest)
-    _ ->
-      Error(error.CodecInvalidData(message: "truncated zstd window descriptor"))
+    _ -> Error(codec.InvalidData(message: "truncated zstd window descriptor"))
   }
 }
 
 fn skip_dictionary_id(
   bytes: BitArray,
   flag: Int,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   let size = case flag {
     0 -> 0
     1 -> 1
@@ -2760,7 +2746,7 @@ fn skip_frame_content_size(
   bytes: BitArray,
   flag: Int,
   single_segment: Bool,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   let size = case flag {
     0 ->
       case single_segment {
@@ -2817,7 +2803,7 @@ fn decode_blocks(
   output: BitArray,
   limits: limit.Limits,
   state: BlockState,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case bytes {
     <<b0, b1, b2, rest:bytes>> -> {
       let header =
@@ -2837,13 +2823,17 @@ fn decode_blocks(
         block_size,
         state,
       ))
-      use new_output <- result.try(append_with_limit(output, plain, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        plain,
+        limits,
+      ))
       case last {
         True -> Ok(#(new_output, rest))
         False -> decode_blocks(rest, new_output, limits, next_state)
       }
     }
-    _ -> Error(error.CodecInvalidData(message: "truncated zstd block header"))
+    _ -> Error(codec.InvalidData(message: "truncated zstd block header"))
   }
 }
 
@@ -2852,7 +2842,7 @@ fn decode_one_block(
   block_type: Int,
   block_size: Int,
   state: BlockState,
-) -> Result(#(BitArray, BitArray, BlockState), error.CodecError) {
+) -> Result(#(BitArray, BitArray, BlockState), codec.CodecError) {
   case block_type {
     0 ->
       decode_raw_block(bytes, block_size)
@@ -2867,7 +2857,7 @@ fn decode_one_block(
         #(plain, rest, append_block_output(state, plain))
       })
     2 -> decode_compressed_block(bytes, block_size, state)
-    _ -> Error(error.CodecInvalidData(message: "zstd reserved block type 3"))
+    _ -> Error(codec.InvalidData(message: "zstd reserved block type 3"))
   }
 }
 
@@ -2886,7 +2876,7 @@ fn decode_compressed_block(
   bytes: BitArray,
   block_size: Int,
   state: BlockState,
-) -> Result(#(BitArray, BitArray, BlockState), error.CodecError) {
+) -> Result(#(BitArray, BitArray, BlockState), codec.CodecError) {
   use payload <- result.try(slice_or_error(
     bytes,
     0,
@@ -2925,7 +2915,7 @@ fn decode_compressed_block(
 fn parse_literals_section(
   bytes: BitArray,
   prev_tree: Option(huf.Tree),
-) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), codec.CodecError) {
   case bytes {
     <<header_byte, _:bytes>> -> {
       let literals_block_type = int.bitwise_and(header_byte, 0x3)
@@ -2956,8 +2946,7 @@ fn parse_literals_section(
           )
       }
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "truncated zstd literals header"))
+    _ -> Error(codec.InvalidData(message: "truncated zstd literals header"))
   }
 }
 
@@ -2984,7 +2973,7 @@ fn parse_compressed_literals(
   size_format: Int,
   treeless: Bool,
   prev_tree: Option(huf.Tree),
-) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), codec.CodecError) {
   use header <- result.try(parse_compressed_literals_header(
     bytes,
     header_byte,
@@ -2999,7 +2988,7 @@ fn parse_compressed_literals(
 fn decode_huffman_literals_block(
   bytes: BitArray,
   header: CompressedLiteralsHeader,
-) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), codec.CodecError) {
   // Slice the literals section payload out of the surrounding block
   // so the Huffman tree parser stops at the right boundary.
   let section_total = header.header_bytes + header.compressed_size
@@ -3046,10 +3035,10 @@ fn decode_treeless_literals_block(
   bytes: BitArray,
   header: CompressedLiteralsHeader,
   prev_tree: Option(huf.Tree),
-) -> Result(#(BitArray, BitArray, Option(huf.Tree)), error.CodecError) {
+) -> Result(#(BitArray, BitArray, Option(huf.Tree)), codec.CodecError) {
   case prev_tree {
     None ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "zstd treeless literals without a prior Huffman tree",
       ))
     Some(tree) -> {
@@ -3088,7 +3077,7 @@ fn decode_huffman_streams(
   tree: huf.Tree,
   bitstream_bytes: BitArray,
   header: CompressedLiteralsHeader,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case header.streams {
     1 ->
       huf.decode_stream(tree, bitstream_bytes, header.regenerated_size)
@@ -3099,13 +3088,13 @@ fn decode_huffman_streams(
   }
 }
 
-fn huf_error_to_codec(err: huf.HufError) -> error.CodecError {
+fn huf_error_to_codec(err: huf.HufError) -> codec.CodecError {
   case err {
-    huf.HufTruncated(message) -> error.CodecInvalidData(message: message)
-    huf.HufInvalidWeights(message) -> error.CodecInvalidData(message: message)
+    huf.HufTruncated(message) -> codec.InvalidData(message: message)
+    huf.HufInvalidWeights(message) -> codec.InvalidData(message: message)
     huf.HufBitstreamError(_) ->
-      error.CodecInvalidData(message: "zstd Huffman bitstream truncated")
-    huf.HufUnsupported(feature) -> error.CodecNotImplemented(feature: feature)
+      codec.InvalidData(message: "zstd Huffman bitstream truncated")
+    huf.HufUnsupported(feature) -> codec.Unsupported(feature: feature)
   }
 }
 
@@ -3113,7 +3102,7 @@ fn parse_compressed_literals_header(
   bytes: BitArray,
   header_byte: Int,
   size_format: Int,
-) -> Result(CompressedLiteralsHeader, error.CodecError) {
+) -> Result(CompressedLiteralsHeader, codec.CodecError) {
   case size_format {
     0 ->
       // 3-byte header, 1 stream, 10-bit regen and compressed sizes.
@@ -3138,7 +3127,7 @@ fn parse_compressed_literals_header(
           ))
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd compressed-literals 3-byte header",
           ))
       }
@@ -3165,7 +3154,7 @@ fn parse_compressed_literals_header(
           ))
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd compressed-literals 3-byte header",
           ))
       }
@@ -3195,7 +3184,7 @@ fn parse_compressed_literals_header(
           ))
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd compressed-literals 4-byte header",
           ))
       }
@@ -3228,7 +3217,7 @@ fn parse_compressed_literals_header(
           ))
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd compressed-literals 5-byte header",
           ))
       }
@@ -3240,7 +3229,7 @@ fn parse_raw_or_rle_literals(
   header_byte: Int,
   size_format: Int,
   is_rle: Bool,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case size_format {
     0 | 2 -> {
       // 1-byte header — size is bits 3..7 of the header byte (5 bits).
@@ -3263,7 +3252,7 @@ fn parse_raw_or_rle_literals(
           finalize_literals(after_header, regenerated_size, is_rle)
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd literals 2-byte header",
           ))
       }
@@ -3286,7 +3275,7 @@ fn parse_raw_or_rle_literals(
           finalize_literals(after_header, regenerated_size, is_rle)
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd literals 3-byte header",
           ))
       }
@@ -3298,13 +3287,12 @@ fn finalize_literals(
   bytes: BitArray,
   size: Int,
   is_rle: Bool,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case is_rle {
     True ->
       case bytes {
         <<byte, rest:bytes>> -> Ok(#(zstd_repeat_byte(byte, size, <<>>), rest))
-        _ ->
-          Error(error.CodecInvalidData(message: "truncated zstd RLE literals"))
+        _ -> Error(codec.InvalidData(message: "truncated zstd RLE literals"))
       }
     False -> {
       use chunk <- result.try(slice_or_error(
@@ -3335,7 +3323,7 @@ fn parse_and_apply_sequences(
   prev_tables: SeqTablesState,
   previous_output_rev: List(Int),
   reps: #(Int, Int, Int),
-) -> Result(#(BitArray, SeqTablesState, #(Int, Int, Int)), error.CodecError) {
+) -> Result(#(BitArray, SeqTablesState, #(Int, Int, Int)), codec.CodecError) {
   case bytes {
     <<>> -> Ok(#(literals, prev_tables, reps))
     <<num_byte, _:bytes>> if num_byte == 0 -> Ok(#(literals, prev_tables, reps))
@@ -3373,8 +3361,7 @@ fn parse_and_apply_sequences(
         reps,
       )
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "truncated zstd sequences header"))
+    _ -> Error(codec.InvalidData(message: "truncated zstd sequences header"))
   }
 }
 
@@ -3386,7 +3373,7 @@ fn parse_sequences(
   prev_tables: SeqTablesState,
   previous_output_rev: List(Int),
   reps: #(Int, Int, Int),
-) -> Result(#(BitArray, SeqTablesState, #(Int, Int, Int)), error.CodecError) {
+) -> Result(#(BitArray, SeqTablesState, #(Int, Int, Int)), codec.CodecError) {
   use after_count <- result.try(slice_after(
     bytes,
     count_size,
@@ -3402,7 +3389,7 @@ fn parse_sequences(
       let reserved = int.bitwise_and(modes, 0x3)
       use <- bool.guard(
         when: reserved != 0,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "zstd sequences mode byte has reserved bits set",
         )),
       )
@@ -3453,9 +3440,7 @@ fn parse_sequences(
       ))
     }
     _ ->
-      Error(error.CodecInvalidData(
-        message: "truncated zstd sequences modes byte",
-      ))
+      Error(codec.InvalidData(message: "truncated zstd sequences modes byte"))
   }
 }
 
@@ -3526,7 +3511,7 @@ fn load_sequence_table(
   mode: Int,
   alphabet: SeqAlphabet,
   prev: Option(#(dict.Dict(Int, fse.StateEntry), Int)),
-) -> Result(#(dict.Dict(Int, fse.StateEntry), Int, BitArray), error.CodecError) {
+) -> Result(#(dict.Dict(Int, fse.StateEntry), Int, BitArray), codec.CodecError) {
   case mode {
     0 -> {
       let #(table, accuracy_log) = predefined_for(alphabet)
@@ -3545,7 +3530,7 @@ fn load_sequence_table(
           Ok(#(table, 0, rest))
         }
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "truncated zstd "
             <> alphabet_label(alphabet)
             <> " RLE mode symbol",
@@ -3571,7 +3556,7 @@ fn load_sequence_table(
       case prev {
         Some(#(table, accuracy_log)) -> Ok(#(table, accuracy_log, bytes))
         None ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "zstd "
             <> alphabet_label(alphabet)
             <> " Repeat_Mode without a prior FSE table",
@@ -3592,10 +3577,10 @@ fn apply_sequences_with_tables(
   ml_log: Int,
   previous_output_rev: List(Int),
   reps: #(Int, Int, Int),
-) -> Result(#(BitArray, #(Int, Int, Int)), error.CodecError) {
+) -> Result(#(BitArray, #(Int, Int, Int)), codec.CodecError) {
   case fse.new_backward_reader(bitstream) {
     Error(_) ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "zstd sequences bitstream is empty or missing marker",
       ))
     Ok(reader) -> {
@@ -3732,10 +3717,10 @@ fn fwd_read(
   reader: FwdBitReader,
   count: Int,
   label: String,
-) -> Result(#(Int, FwdBitReader), error.CodecError) {
+) -> Result(#(Int, FwdBitReader), codec.CodecError) {
   let reader = fwd_refill(reader, count)
   case reader.bits < count {
-    True -> Error(error.CodecInvalidData(message: "truncated zstd " <> label))
+    True -> Error(codec.InvalidData(message: "truncated zstd " <> label))
     False -> {
       let #(value, reader) = fwd_peek(reader, count)
       Ok(#(value, fwd_drop(reader, count)))
@@ -3748,7 +3733,7 @@ fn read_fse_distribution(
   max_accuracy_log: Int,
   max_symbol: Int,
   label: String,
-) -> Result(#(List(Int), Int, BitArray), error.CodecError) {
+) -> Result(#(List(Int), Int, BitArray), codec.CodecError) {
   let reader = new_fwd_reader(bytes)
   use #(accuracy_minus_5, reader) <- result.try(fwd_read(
     reader,
@@ -3758,7 +3743,7 @@ fn read_fse_distribution(
   let accuracy_log = accuracy_minus_5 + 5
   use <- bool.guard(
     when: accuracy_log > max_accuracy_log,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "zstd "
       <> label
       <> " FSE accuracy_log exceeds the alphabet's maximum",
@@ -3785,7 +3770,7 @@ fn read_fse_distribution(
     Ok(rest) ->
       Ok(#(pad_distribution(counts, max_symbol + 1), accuracy_log, rest))
     Error(_) ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "truncated zstd " <> label <> " FSE distribution tail",
       ))
   }
@@ -3802,7 +3787,7 @@ fn decode_fse_distribution(
   max_symbol: Int,
   acc: List(Int),
   label: String,
-) -> Result(#(List(Int), FwdBitReader), error.CodecError) {
+) -> Result(#(List(Int), FwdBitReader), codec.CodecError) {
   case remaining > 1 && charnum <= max_symbol {
     False -> Ok(#(list.reverse(acc), reader))
     True ->
@@ -3879,7 +3864,7 @@ fn decode_count_bits(
 fn read_zero_rle(
   reader: FwdBitReader,
   label: String,
-) -> Result(#(Int, FwdBitReader), error.CodecError) {
+) -> Result(#(Int, FwdBitReader), codec.CodecError) {
   read_zero_rle_loop(reader, 0, label)
 }
 
@@ -3887,7 +3872,7 @@ fn read_zero_rle_loop(
   reader: FwdBitReader,
   acc: Int,
   label: String,
-) -> Result(#(Int, FwdBitReader), error.CodecError) {
+) -> Result(#(Int, FwdBitReader), codec.CodecError) {
   use #(value, reader) <- result.try(fwd_read(
     reader,
     2,
@@ -3929,11 +3914,11 @@ fn read_state_init(
   reader: fse.BackwardReader,
   bits: Int,
   label: String,
-) -> Result(#(Int, fse.BackwardReader), error.CodecError) {
+) -> Result(#(Int, fse.BackwardReader), codec.CodecError) {
   case fse.read_backward_bits(reader, bits) {
     Ok(#(v, r)) -> Ok(#(v, r))
     Error(_) ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "truncated zstd " <> label <> " initial state",
       ))
   }
@@ -3943,7 +3928,7 @@ fn decode_sequence_loop(
   remaining: Int,
   ctx: SeqContext,
   reader: fse.BackwardReader,
-) -> Result(SeqContext, error.CodecError) {
+) -> Result(SeqContext, codec.CodecError) {
   case remaining {
     0 -> Ok(ctx)
     _ -> {
@@ -4034,7 +4019,7 @@ fn update_state(
   table: dict.Dict(Int, fse.StateEntry),
   state: Int,
   label: String,
-) -> Result(#(fse.BackwardReader, Int), error.CodecError) {
+) -> Result(#(fse.BackwardReader, Int), codec.CodecError) {
   let entry = case dict.get(table, state) {
     Ok(e) -> e
     Error(_) -> fse.StateEntry(symbol: 0, nb_bits: 0, baseline: 0)
@@ -4042,7 +4027,7 @@ fn update_state(
   case fse.read_backward_bits(reader, entry.nb_bits) {
     Ok(#(extra, r)) -> Ok(#(r, entry.baseline + extra))
     Error(_) ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "truncated zstd " <> label <> " state-update bits",
       ))
   }
@@ -4052,11 +4037,10 @@ fn read_bits_for(
   reader: fse.BackwardReader,
   count: Int,
   label: String,
-) -> Result(#(Int, fse.BackwardReader), error.CodecError) {
+) -> Result(#(Int, fse.BackwardReader), codec.CodecError) {
   case fse.read_backward_bits(reader, count) {
     Ok(p) -> Ok(p)
-    Error(_) ->
-      Error(error.CodecInvalidData(message: "truncated zstd " <> label))
+    Error(_) -> Error(codec.InvalidData(message: "truncated zstd " <> label))
   }
 }
 
@@ -4141,7 +4125,7 @@ fn resolve_offset(
 fn copy_literals(
   ctx: SeqContext,
   count: Int,
-) -> Result(SeqContext, error.CodecError) {
+) -> Result(SeqContext, codec.CodecError) {
   case count {
     0 -> Ok(ctx)
     _ -> {
@@ -4155,7 +4139,7 @@ fn copy_literals(
             ),
           )
         Error(_) ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "zstd literal copy exceeds literals section",
           ))
       }
@@ -4167,7 +4151,7 @@ fn copy_match(
   ctx: SeqContext,
   offset: Int,
   length: Int,
-) -> Result(SeqContext, error.CodecError) {
+) -> Result(SeqContext, codec.CodecError) {
   copy_match_loop(ctx, offset, length)
 }
 
@@ -4175,7 +4159,7 @@ fn copy_match_loop(
   ctx: SeqContext,
   offset: Int,
   remaining: Int,
-) -> Result(SeqContext, error.CodecError) {
+) -> Result(SeqContext, codec.CodecError) {
   case remaining {
     0 -> Ok(ctx)
     _ -> {
@@ -4187,7 +4171,7 @@ fn copy_match_loop(
             remaining - 1,
           )
         Error(_) ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "zstd match offset exceeds emitted output",
           ))
       }
@@ -4246,10 +4230,10 @@ fn slice_or_error(
   offset: Int,
   length: Int,
   label: String,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bit_array.slice(bytes, offset, length) {
     Ok(v) -> Ok(v)
-    Error(_) -> Error(error.CodecInvalidData(message: "truncated " <> label))
+    Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
   }
 }
 
@@ -4257,17 +4241,17 @@ fn slice_after(
   bytes: BitArray,
   offset: Int,
   label: String,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bit_array.slice(bytes, offset, bit_array.byte_size(bytes) - offset) {
     Ok(v) -> Ok(v)
-    Error(_) -> Error(error.CodecInvalidData(message: "truncated " <> label))
+    Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
   }
 }
 
 fn decode_raw_block(
   bytes: BitArray,
   block_size: Int,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case bit_array.slice(bytes, 0, block_size) {
     Ok(chunk) ->
       case
@@ -4279,20 +4263,19 @@ fn decode_raw_block(
       {
         Ok(rest) -> Ok(#(chunk, rest))
         Error(_) ->
-          Error(error.CodecInvalidData(message: "truncated zstd raw block tail"))
+          Error(codec.InvalidData(message: "truncated zstd raw block tail"))
       }
-    Error(_) ->
-      Error(error.CodecInvalidData(message: "truncated zstd raw block"))
+    Error(_) -> Error(codec.InvalidData(message: "truncated zstd raw block"))
   }
 }
 
 fn decode_rle_block(
   bytes: BitArray,
   block_size: Int,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case bytes {
     <<byte, rest:bytes>> -> Ok(#(repeat_byte(byte, block_size, <<>>), rest))
-    _ -> Error(error.CodecInvalidData(message: "truncated zstd RLE block"))
+    _ -> Error(codec.InvalidData(message: "truncated zstd RLE block"))
   }
 }
 
@@ -4309,30 +4292,13 @@ fn drop_bytes(
   bytes: BitArray,
   count: Int,
   label: String,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case count {
     0 -> Ok(bytes)
     _ ->
       case bit_array.slice(bytes, count, bit_array.byte_size(bytes) - count) {
         Ok(rest) -> Ok(rest)
-        Error(_) ->
-          Error(error.CodecInvalidData(message: "truncated " <> label))
+        Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
       }
-  }
-}
-
-fn append_with_limit(
-  output: BitArray,
-  chunk: BitArray,
-  limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
-  let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
-    False -> Ok(bit_array.concat([output, chunk]))
   }
 }

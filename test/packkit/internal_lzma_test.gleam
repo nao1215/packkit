@@ -28,54 +28,6 @@ pub fn properties_byte_roundtrips_test() -> Nil {
   lzma.properties_to_byte(props_min) |> should.equal(0x00)
 }
 
-pub fn encode_literal_only_self_roundtrips_short_test() -> Nil {
-  // Smallest possible literal stream: a single byte.
-  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
-  let payload = <<0x42>>
-  let encoded = lzma.encode_literal_only(bytes: payload, props: props)
-  let assert Ok(decoder) = lzma.new(encoded, props, 1024)
-  let assert Ok(#(decoded, _state)) =
-    lzma.decode_into(decoder, bit_array.byte_size(payload))
-  decoded |> should.equal(payload)
-}
-
-pub fn encode_literal_only_self_roundtrips_ascii_test() -> Nil {
-  // A few words of ASCII to exercise multiple normalize cycles and
-  // exactly the literal-context indexing the LZMA decoder uses.
-  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
-  let payload = <<"the quick brown fox jumps over the lazy dog":utf8>>
-  let encoded = lzma.encode_literal_only(bytes: payload, props: props)
-  let assert Ok(decoder) = lzma.new(encoded, props, 4096)
-  let assert Ok(#(decoded, _state)) =
-    lzma.decode_into(decoder, bit_array.byte_size(payload))
-  decoded |> should.equal(payload)
-}
-
-pub fn encode_literal_only_self_roundtrips_with_zero_bytes_test() -> Nil {
-  // Zero bytes are an easy corner case because the decoder's
-  // `previous_output_byte` defaults to 0 for the first literal.
-  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
-  let payload = <<0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF>>
-  let encoded = lzma.encode_literal_only(bytes: payload, props: props)
-  let assert Ok(decoder) = lzma.new(encoded, props, 1024)
-  let assert Ok(#(decoded, _state)) =
-    lzma.decode_into(decoder, bit_array.byte_size(payload))
-  decoded |> should.equal(payload)
-}
-
-pub fn encode_literal_only_long_payload_test() -> Nil {
-  // Longer payload to make sure the range coder's shift_low cache
-  // (deferred-carry chain) survives many encode_bit iterations
-  // without losing bits.
-  let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
-  let payload = repeat_bytes(<<"PACKKIT.LZMA.LITERAL.ENCODER.":utf8>>, 30)
-  let encoded = lzma.encode_literal_only(bytes: payload, props: props)
-  let assert Ok(decoder) = lzma.new(encoded, props, 16_384)
-  let assert Ok(#(decoded, _state)) =
-    lzma.decode_into(decoder, bit_array.byte_size(payload))
-  decoded |> should.equal(payload)
-}
-
 pub fn encode_with_lz77_roundtrips_repetitive_test() -> Nil {
   // The classic test: highly repetitive input should round-trip
   // through the LZ77 match path AND come out smaller than the
@@ -83,15 +35,14 @@ pub fn encode_with_lz77_roundtrips_repetitive_test() -> Nil {
   let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
   let payload = repeat_bytes(<<"PACKKIT-LZ77-DEMO-":utf8>>, 50)
   let lz77 = lzma.encode_with_lz77(bytes: payload, props: props)
-  let literal_only = lzma.encode_literal_only(bytes: payload, props: props)
   let assert Ok(decoder) = lzma.new(lz77, props, 8192)
   let assert Ok(#(decoded, _state)) =
     lzma.decode_into(decoder, bit_array.byte_size(payload))
   decoded |> should.equal(payload)
-  // LZ77 must beat literal-only by a wide margin on repeated input.
+  // LZ77 must shrink repeated input to well under half its size.
   let lz_size = bit_array.byte_size(lz77)
-  let lit_size = bit_array.byte_size(literal_only)
-  case lz_size * 2 < lit_size {
+  let plain_size = bit_array.byte_size(payload)
+  case lz_size * 2 < plain_size {
     True -> Nil
     False -> should.fail()
   }
@@ -150,12 +101,11 @@ pub fn encode_with_lz77_short_rep_beats_literal_test() -> Nil {
       repeat_bytes(<<"XYZ":utf8>>, 4),
     ])
   let lz77 = lzma.encode_with_lz77(bytes: payload, props: props)
-  let literal_only = lzma.encode_literal_only(bytes: payload, props: props)
   let assert Ok(decoder) = lzma.new(lz77, props, 1024)
   let assert Ok(#(decoded, _state)) =
     lzma.decode_into(decoder, bit_array.byte_size(payload))
   decoded |> should.equal(payload)
-  case bit_array.byte_size(lz77) < bit_array.byte_size(literal_only) {
+  case bit_array.byte_size(lz77) < bit_array.byte_size(payload) {
     True -> Nil
     False -> should.fail()
   }

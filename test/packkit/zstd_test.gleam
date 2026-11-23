@@ -2,9 +2,9 @@ import gleam/bit_array
 import gleam/int
 import gleam/string
 import gleeunit/should
+import packkit
 import packkit/codec
-import packkit/error
-import packkit/zstd
+import packkit/internal/zstd
 
 pub fn frame_header_fcs_one_byte_test() -> Nil {
   // Single_Segment + 1-byte FCS for sizes < 256.
@@ -72,16 +72,10 @@ pub fn frame_header_fcs_eight_byte_high_test() -> Nil {
   >>)
 }
 
-pub fn codec_marker_test() -> Nil {
-  zstd.codec()
-  |> codec.name
-  |> should.equal("zstd")
-}
-
 pub fn encode_roundtrip_hi_test() -> Nil {
   let payload = <<"hi":utf8>>
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded
   |> should.equal(payload)
 }
@@ -89,7 +83,7 @@ pub fn encode_roundtrip_hi_test() -> Nil {
 pub fn encode_roundtrip_pangram_test() -> Nil {
   let payload = <<"The quick brown fox jumps over the lazy dog.":utf8>>
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded
   |> should.equal(payload)
 }
@@ -98,7 +92,7 @@ pub fn encode_roundtrip_512_test() -> Nil {
   // Use a 512-byte payload to exercise the 2-byte FCS path.
   let payload = repeat_byte(0x41, 512, <<>>)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded
   |> should.equal(payload)
 }
@@ -110,7 +104,7 @@ pub fn encode_uses_huffman_for_compressible_text_test() -> Nil {
   // output must be a notable fraction smaller than the raw size.
   let payload = repeat_bytes(<<"The quick brown fox ":utf8>>, 51)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
   // 1020 bytes of fairly redundant English text should compress to
   // well under 80 % of the raw size — confirms the Huffman path is
@@ -131,7 +125,7 @@ pub fn encode_huffman_multi_chunk_roundtrips_test() -> Nil {
   let payload =
     repeat_bytes(<<"The quick brown fox jumps over the lazy dog. ":utf8>>, 100)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
 }
 
@@ -144,7 +138,7 @@ pub fn encode_huffman_4stream_roundtrips_test() -> Nil {
   let payload =
     repeat_bytes(<<"Lorem ipsum dolor sit amet, consectetur. ":utf8>>, 300)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
   // 12 KiB of repetitive English should compress to under 70 %
   // of raw — confirms 4-stream Huffman is actually being picked.
@@ -164,7 +158,7 @@ pub fn encode_huffman_4stream_multi_block_roundtrips_test() -> Nil {
   let payload =
     repeat_bytes(<<"Lorem ipsum dolor sit amet, consectetur. ":utf8>>, 700)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
 }
 
@@ -176,7 +170,7 @@ pub fn encode_falls_back_to_raw_for_full_byte_range_test() -> Nil {
   // trip cleanly regardless of which form it ended up using.
   let payload = high_byte_cycle(0, 1023, <<>>)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
 }
 
@@ -190,7 +184,7 @@ pub fn encode_uses_fse_huffman_for_wide_alphabet_test() -> Nil {
   // reconstruction) still has to round-trip cleanly.
   let payload = wide_alphabet_payload(0, 200, 4, <<>>)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
 }
 
@@ -208,7 +202,7 @@ pub fn encode_picks_fse_compressed_mode_for_biased_sequences_test() -> Nil {
   let payload = repeat_bytes(<<"ABCDX":utf8>>, 100)
   let payload_size = bit_array.byte_size(payload)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
   case bit_array.byte_size(encoded) * 20 < payload_size {
     True -> Nil
@@ -228,7 +222,7 @@ pub fn encode_uses_zstd_rep_match_for_recurring_distance_test() -> Nil {
   let payload = repeat_bytes(<<"ABCD":utf8>>, 200)
   let payload_size = bit_array.byte_size(payload)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
   case bit_array.byte_size(encoded) * 20 < payload_size {
     True -> Nil
@@ -246,7 +240,7 @@ pub fn encode_emits_lz77_sequences_block_for_repetitive_text_test() -> Nil {
   let payload = repeat_bytes(<<"PACKKIT-ZSTD-LZ\n":utf8>>, 50)
   let payload_size = bit_array.byte_size(payload)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
   // Sequence-based encoding should compress this payload to well
   // under 25 % of its raw size — fail if not.
@@ -266,7 +260,7 @@ pub fn encode_compresses_skewed_wide_alphabet_via_fse_huffman_test() -> Nil {
   let payload = skewed_wide_payload()
   let payload_size = bit_array.byte_size(payload)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded |> should.equal(payload)
   case bit_array.byte_size(encoded) < payload_size {
     True -> Nil
@@ -337,7 +331,7 @@ pub fn encode_uses_rle_block_for_uniform_runs_test() -> Nil {
   // Verifies both the new encoder branch and the round-trip.
   let payload = repeat_byte(0x41, 1000, <<>>)
   let assert Ok(encoded) = zstd.encode(bytes: payload)
-  let assert Ok(decoded) = zstd.decode(bytes: encoded)
+  let assert Ok(decoded) = packkit.decompress(encoded, with: codec.Zstd)
   decoded
   |> should.equal(payload)
   // The encoder should shrink the payload significantly; assert
@@ -371,7 +365,7 @@ pub fn decode_raw_block_hi_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x58, 0x11, 0x00, 0x00, 0x68, 0x69, 0xFA, 0x38,
     0x26, 0xEA,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(<<"hi":utf8>>)
 }
@@ -382,7 +376,7 @@ pub fn decode_raw_block_abc_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x58, 0x19, 0x00, 0x00, 0x61, 0x62, 0x63, 0x99,
     0x09, 0x77, 0xAD,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(<<"abc":utf8>>)
 }
@@ -395,7 +389,7 @@ pub fn decode_compressed_block_repeated_byte_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x58, 0x45, 0x00, 0x00, 0x10, 0x61, 0x61, 0x01,
     0x00, 0x1E, 0xC0, 0x02, 0xF7, 0xAF, 0x47, 0xE3,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(<<"aaaaaaaaaaaaaaaaaaaa":utf8>>)
 }
@@ -408,7 +402,7 @@ pub fn decode_compressed_block_alternating_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x58, 0x45, 0x00, 0x00, 0x10, 0x61, 0x62, 0x01,
     0x00, 0xD1, 0x0E, 0x0B, 0xCB, 0xC5, 0x16, 0x03,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(<<"ababababababababababab":utf8>>)
 }
@@ -424,7 +418,7 @@ pub fn decode_compressed_repeating_short_match_test() -> Nil {
     0x6C, 0x6C, 0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0x20, 0x01, 0x00, 0x49,
     0x5E, 0x95, 0x24, 0xDE, 0x82, 0x7E, 0x8E,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   let expected = repeat_text("hello world ", 50)
   plain
   |> should.equal(expected)
@@ -437,7 +431,7 @@ pub fn decode_compressed_repeating_long_match_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x64, 0xB8, 0x0A, 0x55, 0x00, 0x00, 0x18, 0x61, 0x62,
     0x63, 0x01, 0x00, 0xB2, 0xD3, 0x77, 0x43, 0xC6, 0x03, 0x49, 0x84,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   let expected = repeat_text("abc", 1000)
   plain
   |> should.equal(expected)
@@ -460,7 +454,7 @@ pub fn decode_repeat_mode_multi_block_roundtrip_test() -> Nil {
     0x75, 0x67, 0x68, 0x20, 0x78, 0x79, 0x7A, 0x7A, 0x79, 0x01, 0x00, 0x01, 0x9A,
     0x56, 0x0A, 0x0A, 0xDC, 0xFB, 0xF3, 0x2C,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   let expected =
     repeat_text("foo bar baz qux quux corge waldo fred plugh xyzzy", 20)
   plain
@@ -493,7 +487,7 @@ pub fn decode_compressed_huffman_skewed_distribution_test() -> Nil {
     0x80, 0xC3, 0x80, 0x23, 0xC0, 0x39, 0xE0, 0x30, 0xE0, 0x62, 0xE6, 0x52, 0x4F,
     0x92, 0xCC, 0x29, 0xF7,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   let expected = build_pangram_lines(1, 30, <<>>)
   plain
   |> should.equal(expected)
@@ -524,7 +518,7 @@ pub fn decode_skippable_frame_is_silently_skipped_test() -> Nil {
   >>
   let assert Ok(data_frame) = zstd.encode(bytes: <<"hello":utf8>>)
   let stream = bit_array.concat([skippable, data_frame])
-  let assert Ok(plain) = zstd.decode(bytes: stream)
+  let assert Ok(plain) = packkit.decompress(stream, with: codec.Zstd)
   plain
   |> should.equal(<<"hello":utf8>>)
 }
@@ -533,7 +527,7 @@ pub fn decode_skippable_frame_alone_is_empty_output_test() -> Nil {
   // A stream that consists of a single skippable frame should
   // decode to zero bytes, not panic and not error.
   let stream = <<0x50, 0x2A, 0x4D, 0x18, 0x03, 0x00, 0x00, 0x00, "xyz":utf8>>
-  let assert Ok(plain) = zstd.decode(bytes: stream)
+  let assert Ok(plain) = packkit.decompress(stream, with: codec.Zstd)
   plain
   |> should.equal(<<>>)
 }
@@ -556,7 +550,7 @@ pub fn decode_compressed_block_pangram_test() -> Nil {
     0x6F, 0x67, 0x2E, 0x20, 0x01, 0x00, 0x0D, 0x9A, 0xAA, 0x0C, 0x9D, 0xB4, 0xCD,
     0x6C,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(<<
     "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.":utf8,
@@ -564,10 +558,8 @@ pub fn decode_compressed_block_pangram_test() -> Nil {
 }
 
 pub fn decode_rejects_missing_magic_test() -> Nil {
-  zstd.decode(bytes: <<0x00, 0x00, 0x00, 0x00>>)
-  |> should.equal(
-    Error(error.CodecInvalidData(message: "missing zstd frame magic")),
-  )
+  packkit.decompress(<<0x00, 0x00, 0x00, 0x00>>, with: codec.Zstd)
+  |> should.equal(Error(codec.InvalidData(message: "missing zstd frame magic")))
 }
 
 pub fn treeless_literals_without_prior_tree_is_invalid_data_test() -> Nil {
@@ -589,8 +581,8 @@ pub fn treeless_literals_without_prior_tree_is_invalid_data_test() -> Nil {
       block_payload,
     ])
 
-  case zstd.decode(bytes: frame) {
-    Error(error.CodecInvalidData(message: message)) ->
+  case packkit.decompress(frame, with: codec.Zstd) {
+    Error(codec.InvalidData(message: message)) ->
       case string.contains(does: message, contain: "treeless") {
         True -> Nil
         False -> should.fail()
@@ -607,7 +599,7 @@ pub fn decode_multi_frame_concatenated_test() -> Nil {
   let assert Ok(f1) = zstd.encode(bytes: <<"first-frame-payload":utf8>>)
   let assert Ok(f2) = zstd.encode(bytes: <<"-second-frame-payload":utf8>>)
   let combined = bit_array.concat([f1, f2])
-  let assert Ok(plain) = zstd.decode(bytes: combined)
+  let assert Ok(plain) = packkit.decompress(combined, with: codec.Zstd)
   plain
   |> should.equal(<<"first-frame-payload-second-frame-payload":utf8>>)
 }
@@ -643,7 +635,7 @@ pub fn decode_real_zstd_huffman_literals_fixture_test() -> Nil {
   let expected = <<
     "gdcdmegkiphgjdofgkcknfpimhgeadpihojpfdocmjppkaahnbgbeafidmadegmflocnjljgbccccdimmnbncbejadgnggfboolghekkenldmkdembhpeionmioeogkjekjpkhgofklpdkckklndnfgbiaeklcmhdllhijkmmdabejpgfipjempmgchcchnlgpceejognohoohcbdhafhfljikjgcjaafdmchlgmbcefidilknbklncbmkcnljmjfafkdcbhplagkbmdhmnbnonmffagecpomebgbfjfffna":utf8,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(expected)
 }

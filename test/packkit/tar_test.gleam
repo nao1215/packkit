@@ -3,32 +3,31 @@ import gleam/list
 import gleam/option.{Some}
 import gleam/string
 import gleeunit/should
+import packkit
 import packkit/archive
-import packkit/entry
-import packkit/error
+import packkit/fixture
+import packkit/internal/entry
+import packkit/internal/tar
 import packkit/limit
-import packkit/tar
 
 pub fn roundtrip_single_file_test() -> Nil {
   let original =
-    tar.new()
-    |> tar.add_file(path: "README.md", body: <<"hello":utf8>>)
+    fixture.new(archive.Tar)
+    |> fixture.add_file(path: "README.md", body: <<"hello":utf8>>)
 
   let assert Ok(bytes) = tar.encode(archive: original)
-  let assert Ok(decoded) = tar.decode(bytes: bytes)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Tar)
 
-  archive.entry_count(decoded)
+  list.length(decoded.entries)
   |> should.equal(1)
 
-  let entries = archive.entries(decoded)
+  let entries = decoded.entries
   let assert [readme] = entries
 
-  entry.kind(readme)
-  |> should.equal(entry.File)
+  fixture.kind(readme)
+  |> should.equal(fixture.File)
 
-  readme
-  |> entry.path
-  |> entry.to_string
+  readme.path
   |> should.equal("README.md")
 
   entry.body(readme)
@@ -37,18 +36,18 @@ pub fn roundtrip_single_file_test() -> Nil {
 
 pub fn roundtrip_mixed_entries_test() -> Nil {
   let original =
-    tar.new()
-    |> tar.add_directory(path: "doc")
-    |> tar.add_file(path: "doc/spec.md", body: <<"contents":utf8>>)
-    |> tar.add_symlink(path: "doc/current", target: "spec.md")
+    fixture.new(archive.Tar)
+    |> fixture.add_directory(path: "doc")
+    |> fixture.add_file(path: "doc/spec.md", body: <<"contents":utf8>>)
+    |> fixture.add_symlink(path: "doc/current", target: "spec.md")
 
   let assert Ok(bytes) = tar.encode(archive: original)
-  let assert Ok(decoded) = tar.decode(bytes: bytes)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Tar)
 
-  let entries = archive.entries(decoded)
+  let entries = decoded.entries
 
-  list.map(entries, entry.kind)
-  |> should.equal([entry.Directory, entry.File, entry.Symlink])
+  list.map(entries, fixture.kind)
+  |> should.equal([fixture.Directory, fixture.File, fixture.Symlink])
 
   let assert [_, file_entry, symlink_entry] = entries
 
@@ -61,9 +60,9 @@ pub fn roundtrip_mixed_entries_test() -> Nil {
 
 pub fn output_is_block_aligned_test() -> Nil {
   let archive_value =
-    tar.new()
-    |> tar.add_file(path: "a.txt", body: <<"1234":utf8>>)
-    |> tar.add_file(path: "b.txt", body: <<"abcdefghij":utf8>>)
+    fixture.new(archive.Tar)
+    |> fixture.add_file(path: "a.txt", body: <<"1234":utf8>>)
+    |> fixture.add_file(path: "b.txt", body: <<"abcdefghij":utf8>>)
 
   let assert Ok(bytes) = tar.encode(archive: archive_value)
 
@@ -72,23 +71,22 @@ pub fn output_is_block_aligned_test() -> Nil {
 }
 
 pub fn empty_archive_is_two_zero_blocks_test() -> Nil {
-  let assert Ok(bytes) = tar.encode(archive: tar.new())
+  let assert Ok(bytes) = tar.encode(archive: fixture.new(archive.Tar))
 
   bit_array.byte_size(bytes)
   |> should.equal(1024)
 
-  let assert Ok(decoded) = tar.decode(bytes: bytes)
-  archive.entry_count(decoded)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Tar)
+  list.length(decoded.entries)
   |> should.equal(0)
 }
 
 pub fn input_size_limit_is_enforced_test() -> Nil {
-  let assert Ok(bytes) = tar.encode(archive: tar.new())
-  let assert Ok(limits) =
-    limit.with_max_input_bytes_checked(limit.default(), bytes: 100)
+  let assert Ok(bytes) = tar.encode(archive: fixture.new(archive.Tar))
+  let limits = limit.Limits(..limit.default(), max_input_bytes: 100)
 
-  case tar.decode_with_limits(bytes: bytes, limits: limits) {
-    Error(error.ArchiveLimitExceeded(limit: name, actual: _)) ->
+  case packkit.read_with_limits(bytes, format: archive.Tar, limits: limits) {
+    Error(archive.LimitExceeded(limit: name, actual: _)) ->
       should.equal(name, "max_input_bytes")
     _ -> should.fail()
   }
@@ -96,17 +94,16 @@ pub fn input_size_limit_is_enforced_test() -> Nil {
 
 pub fn member_count_limit_is_enforced_test() -> Nil {
   let archive_value =
-    tar.new()
-    |> tar.add_file(path: "a.txt", body: <<>>)
-    |> tar.add_file(path: "b.txt", body: <<>>)
-    |> tar.add_file(path: "c.txt", body: <<>>)
+    fixture.new(archive.Tar)
+    |> fixture.add_file(path: "a.txt", body: <<>>)
+    |> fixture.add_file(path: "b.txt", body: <<>>)
+    |> fixture.add_file(path: "c.txt", body: <<>>)
 
   let assert Ok(bytes) = tar.encode(archive: archive_value)
-  let assert Ok(limits) =
-    limit.with_max_members_checked(limit.default(), count: 2)
+  let limits = limit.Limits(..limit.default(), max_members: 2)
 
-  case tar.decode_with_limits(bytes: bytes, limits: limits) {
-    Error(error.ArchiveLimitExceeded(limit: "max_members", actual: _)) -> Nil
+  case packkit.read_with_limits(bytes, format: archive.Tar, limits: limits) {
+    Error(archive.LimitExceeded(limit: "max_members", actual: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -242,11 +239,9 @@ pub fn ustar_decodes_100_char_name_test() -> Nil {
       tar_zero_block(),
     ])
 
-  let assert Ok(decoded) = tar.decode(bytes: stream)
-  let assert [file_entry] = archive.entries(decoded)
-  file_entry
-  |> entry.path
-  |> entry.to_string
+  let assert Ok(decoded) = packkit.read(stream, format: archive.Tar)
+  let assert [file_entry] = decoded.entries
+  file_entry.path
   |> should.equal(name)
   entry.body(file_entry)
   |> should.equal(body)
@@ -291,11 +286,9 @@ pub fn decodes_gnu_long_name_test() -> Nil {
       tar_zero_block(),
     ])
 
-  let assert Ok(decoded) = tar.decode(bytes: stream)
-  let assert [file_entry] = archive.entries(decoded)
-  file_entry
-  |> entry.path
-  |> entry.to_string
+  let assert Ok(decoded) = packkit.read(stream, format: archive.Tar)
+  let assert [file_entry] = decoded.entries
+  file_entry.path
   |> should.equal(long_name)
   entry.body(file_entry)
   |> should.equal(body)
@@ -306,12 +299,12 @@ pub fn encoder_rejects_mtime_overflow_test() -> Nil {
   // value that fits.  Anything bigger silently dropped its high bits
   // before, corrupting the timestamp on round-trip.
   let assert Ok(base) = entry.file_checked(path: "x.txt", body: <<>>)
-  let overflowing = base |> entry.with_modified_at(unix_seconds: 8_589_934_592)
+  let overflowing =
+    base |> fixture.with_modified_at(unix_seconds: 8_589_934_592)
   let archive_value =
-    archive.new(format: tar.format()) |> archive.add(entry: overflowing)
+    fixture.new(archive.Tar) |> fixture.add(entry: overflowing)
   case tar.encode(archive: archive_value) {
-    Error(error.ArchiveFieldOverflow(field: "tar mtime", value: _, max: _)) ->
-      Nil
+    Error(archive.FieldOverflow(field: "tar mtime", value: _, max: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -319,9 +312,8 @@ pub fn encoder_rejects_mtime_overflow_test() -> Nil {
 pub fn encoder_accepts_boundary_mtime_test() -> Nil {
   // 2^33-1 is exactly representable in the 11-octal-digit field.
   let assert Ok(base) = entry.file_checked(path: "x.txt", body: <<>>)
-  let max_mtime = base |> entry.with_modified_at(unix_seconds: 8_589_934_591)
-  let archive_value =
-    archive.new(format: tar.format()) |> archive.add(entry: max_mtime)
+  let max_mtime = base |> fixture.with_modified_at(unix_seconds: 8_589_934_591)
+  let archive_value = fixture.new(archive.Tar) |> fixture.add(entry: max_mtime)
   case tar.encode(archive: archive_value) {
     Ok(_) -> Nil
     _ -> should.fail()
@@ -331,11 +323,10 @@ pub fn encoder_accepts_boundary_mtime_test() -> Nil {
 pub fn encoder_rejects_uid_overflow_test() -> Nil {
   // USTAR uid is 7 octal digits + NUL, so 2^21-1 is the boundary.
   let assert Ok(base) = entry.file_checked(path: "x.txt", body: <<>>)
-  let huge = base |> entry.with_owner(user_id: 2_097_152, group_id: 0)
-  let archive_value =
-    archive.new(format: tar.format()) |> archive.add(entry: huge)
+  let huge = base |> fixture.with_owner(user_id: 2_097_152, group_id: 0)
+  let archive_value = fixture.new(archive.Tar) |> fixture.add(entry: huge)
   case tar.encode(archive: archive_value) {
-    Error(error.ArchiveFieldOverflow(field: "tar uid", value: _, max: _)) -> Nil
+    Error(archive.FieldOverflow(field: "tar uid", value: _, max: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -345,11 +336,11 @@ pub fn tar_encoder_rejects_archive_comment_test() -> Nil {
   // comment was silently dropped on encode; now it's surfaced as a
   // typed `ArchiveCommentUnsupported`.
   let with_note =
-    tar.new()
-    |> tar.add_file(path: "a.txt", body: <<"a":utf8>>)
-    |> archive.with_comment(comment: "should be rejected")
+    fixture.new(archive.Tar)
+    |> fixture.add_file(path: "a.txt", body: <<"a":utf8>>)
+    |> fixture.with_comment(comment: "should be rejected")
   case tar.encode(archive: with_note) {
-    Error(error.ArchiveCommentUnsupported(format: "tar")) -> Nil
+    Error(archive.CommentUnsupported(format: archive.Tar)) -> Nil
     _ -> should.fail()
   }
 }
@@ -359,15 +350,15 @@ pub fn rejects_single_zero_block_terminator_test() -> Nil {
   // Truncating after only one zero block must be rejected, otherwise we
   // silently accept malformed (or maliciously truncated) streams.
   let archive_value =
-    tar.new()
-    |> tar.add_file(path: "a.txt", body: <<"data":utf8>>)
+    fixture.new(archive.Tar)
+    |> fixture.add_file(path: "a.txt", body: <<"data":utf8>>)
   let assert Ok(bytes) = tar.encode(archive: archive_value)
   let total = bit_array.byte_size(bytes)
   // Drop the trailing zero block, leaving exactly one zero block as EOF.
   let assert Ok(truncated) = bit_array.slice(bytes, 0, total - tar_block_size)
 
-  case tar.decode(bytes: truncated) {
-    Error(error.ArchiveInvalid(_)) -> Nil
+  case packkit.read(truncated, format: archive.Tar) {
+    Error(archive.InvalidData(_)) -> Nil
     _ -> should.fail()
   }
 }
@@ -382,7 +373,7 @@ pub fn rejects_single_zero_block_truncation_via_with_limits_test() -> Nil {
     ])
 
   case tar.decode_with_limits(bytes: bytes, limits: limit.default()) {
-    Error(error.ArchiveInvalid(_)) -> Nil
+    Error(archive.InvalidData(_)) -> Nil
     _ -> should.fail()
   }
 }
@@ -391,25 +382,36 @@ pub fn round_trips_metadata_test() -> Nil {
   let assert Ok(base) = entry.file_checked(path: "data.bin", body: <<1, 2, 3>>)
   let with_metadata =
     base
-    |> entry.with_mode(mode: 0o640)
-    |> entry.with_owner(user_id: 1000, group_id: 1000)
-    |> entry.with_modified_at(unix_seconds: 1_700_000_000)
+    |> fixture.with_mode(mode: 0o640)
+    |> fixture.with_owner(user_id: 1000, group_id: 1000)
+    |> fixture.with_modified_at(unix_seconds: 1_700_000_000)
 
   let archive_value =
-    archive.new(format: tar.format())
-    |> archive.add(entry: with_metadata)
+    fixture.new(archive.Tar)
+    |> fixture.add(entry: with_metadata)
 
   let assert Ok(bytes) = tar.encode(archive: archive_value)
-  let assert Ok(decoded) = tar.decode(bytes: bytes)
-  let assert [restored] = archive.entries(decoded)
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Tar)
+  let assert [restored] = decoded.entries
 
-  let meta = entry.metadata(restored)
-  entry.mode(meta)
+  restored.mode
   |> should.equal(0o640)
-  entry.user_id(meta)
+  restored.user_id
   |> should.equal(1000)
-  entry.group_id(meta)
+  restored.group_id
   |> should.equal(1000)
-  entry.modified_at_unix(meta)
+  restored.modified_at
   |> should.equal(1_700_000_000)
+}
+
+pub fn decode_keeps_mode_wider_than_16_bits_test() -> Nil {
+  // A tar mode field holds seven octal digits.  Reading one above
+  // 0xFFFF used to panic in the entry builder; it is now kept as is.
+  let wide =
+    fixture.with_mode(fixture.file(path: "a", body: <<>>), mode: 0o7777777)
+  let assert Ok(bytes) =
+    packkit.write(fixture.new(archive.Tar) |> fixture.add(entry: wide))
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Tar)
+  decoded.entries
+  |> should.equal([wide])
 }

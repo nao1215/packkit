@@ -4,12 +4,13 @@
 //// payload to exercise the sentinel paths.
 
 import gleam/bit_array
-@target(erlang)
 import gleam/list
 import gleeunit/should
+import packkit
 import packkit/archive
-import packkit/checksum
-import packkit/entry
+import packkit/fixture
+import packkit/internal/checksum
+import packkit/internal/entry
 @target(erlang)
 import packkit/limit
 import packkit/zip
@@ -143,14 +144,13 @@ pub fn decodes_zip64_eocd_locator_fixture_test() -> Nil {
       eocd,
     ])
 
-  let assert Ok(arch) = zip.decode(bytes: stream)
-  archive.entry_count(arch)
+  let assert Ok(arch) = packkit.read(stream, format: archive.Zip)
+  list.length(arch.entries)
   |> should.equal(1)
 
-  case archive.entries(arch) {
+  case arch.entries {
     [entry_value] -> {
-      entry.path(entry_value)
-      |> entry.to_string
+      entry_value.path
       |> should.equal("z.txt")
       entry.body(entry_value)
       |> should.equal(<<"Z":utf8>>)
@@ -164,9 +164,9 @@ pub fn encoder_emits_normal_zip_without_zip64_test() -> Nil {
   // EOCD record / locator.  The byte size should stay the same as
   // before we added the Zip64 trailer logic.
   let archive_value =
-    zip.new()
-    |> archive.add(entry: entry.file(path: "a.txt", body: <<"hi":utf8>>))
-  let assert Ok(bytes) = zip.encode(archive: archive_value)
+    fixture.new(archive.Zip)
+    |> fixture.add(entry: fixture.file(path: "a.txt", body: <<"hi":utf8>>))
+  let assert Ok(bytes) = zip.encode(archive_value, method: zip.Store)
   // No Zip64 markers should appear anywhere in the stream — both
   // signatures (PK\6\6 and PK\6\7) should be absent.
   contains_subbytes(bytes, <<0x50, 0x4B, 0x06, 0x06>>)
@@ -192,13 +192,13 @@ pub fn encoder_emits_zip64_for_many_entries_test() -> Nil {
   // entry count.
   let arch =
     list.repeat(<<>>, 65_537)
-    |> list.index_fold(zip.new(), fn(acc, _body, index) {
-      archive.add(
+    |> list.index_fold(fixture.new(archive.Zip), fn(acc, _body, index) {
+      fixture.add(
         acc,
-        entry: entry.file(path: "e" <> int_to_string(index), body: <<>>),
+        entry: fixture.file(path: "e" <> int_to_string(index), body: <<>>),
       )
     })
-  let assert Ok(bytes) = zip.encode(archive: arch)
+  let assert Ok(bytes) = zip.encode(arch, method: zip.Store)
   // The Zip64 EOCD record signature MUST appear.
   contains_subbytes(bytes, <<0x50, 0x4B, 0x06, 0x06>>)
   |> should.equal(True)
@@ -209,9 +209,10 @@ pub fn encoder_emits_zip64_for_many_entries_test() -> Nil {
   // Round-trip must agree on the entry count.  Default
   // `max_members` is 10 000 so we have to relax it explicitly to
   // accept a 65 537-entry archive.
-  let relaxed = limit.default() |> limit.with_max_members(count: 100_000)
-  let assert Ok(decoded) = zip.decode_with_limits(bytes: bytes, limits: relaxed)
-  archive.entry_count(decoded)
+  let relaxed = limit.Limits(..limit.default(), max_members: 100_000)
+  let assert Ok(decoded) =
+    packkit.read_with_limits(bytes, format: archive.Zip, limits: relaxed)
+  list.length(decoded.entries)
   |> should.equal(65_537)
 }
 
