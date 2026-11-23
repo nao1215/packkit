@@ -113,13 +113,7 @@ fn emit_lzma_chunks(
         True -> lzma2_lzma_chunk_max
         False -> n
       }
-      let assert Ok(payload) = bit_array.slice(remaining, 0, chunk_size)
-      let assert Ok(rest) =
-        bit_array.slice(
-          remaining,
-          chunk_size,
-          bit_array.byte_size(remaining) - chunk_size,
-        )
+      let #(payload, rest) = bytes.split_at(remaining, chunk_size)
       let compressed = lzma.encode_with_lz77(bytes: payload, props: props)
       let csize = bit_array.byte_size(compressed)
       let prop_byte = lzma.properties_to_byte(props)
@@ -404,22 +398,9 @@ fn decode_block(
           use payload <- result.try(case comp_size {
             CompressedKnown(v) ->
               slice_required(bytes, payload_offset, v, "xz block data")
-            CompressedUnknown -> {
-              let total = bit_array.byte_size(bytes)
-              case total >= payload_offset {
-                True -> {
-                  let assert Ok(b) =
-                    bit_array.slice(
-                      bytes,
-                      payload_offset,
-                      total - payload_offset,
-                    )
-                  Ok(b)
-                }
-                False ->
-                  Error(codec.InvalidData(message: "truncated xz block data"))
-              }
-            }
+            CompressedUnknown ->
+              split_required(bytes, payload_offset, "xz block data")
+              |> result.map(fn(parts) { parts.1 })
           })
           use #(lzma_out, lzma2_consumed) <- result.try(decode_lzma2(
             payload,
@@ -473,12 +454,11 @@ fn decode_block(
           use _ <- result.try(verify_block_check(plain, check_type, check_bytes))
           let total_block = after_padding + check_size
           let unpadded = header_size + payload_size + check_size
-          let assert Ok(rest) =
-            bit_array.slice(
-              bytes,
-              total_block,
-              bit_array.byte_size(bytes) - total_block,
-            )
+          use #(_, rest) <- result.try(split_required(
+            bytes,
+            total_block,
+            "xz block check",
+          ))
           Ok(#(plain, unpadded, bit_array.byte_size(plain), rest))
         }
       }
@@ -529,9 +509,8 @@ fn parse_block_header(
   )
 
   // Skip the size byte we already consumed for header_size; parse flags next.
-  let assert Ok(after_size) = bit_array.slice(header_no_crc, 1, crc_offset - 1)
-  case after_size {
-    <<flags, rest:bytes>> -> {
+  case header_no_crc {
+    <<_size, flags, rest:bytes>> -> {
       let filter_count = int.bitwise_and(flags, 0x03) + 1
       let has_comp_size = int.bitwise_and(flags, 0x40) != 0
       let has_uncomp_size = int.bitwise_and(flags, 0x80) != 0
@@ -573,23 +552,13 @@ fn parse_filters(
     _ -> {
       use #(filter_id, bytes) <- result.try(read_varint(bytes))
       use #(props_size, bytes) <- result.try(read_varint(bytes))
-      use _props_bytes <- result.try(slice_required(
+      use #(props_bytes, rest) <- result.try(split_required(
         bytes,
-        0,
         props_size,
         "xz filter properties",
       ))
-      let assert Ok(rest) =
-        bit_array.slice(
-          bytes,
-          props_size,
-          bit_array.byte_size(bytes) - props_size,
-        )
-      let props_int = case props_size {
-        1 -> {
-          let assert <<v, _:bytes>> = bytes
-          v
-        }
+      let props_int = case props_bytes {
+        <<v>> -> v
         _ -> 0
       }
       parse_filters(rest, remaining - 1, [#(filter_id, props_int), ..acc])
@@ -808,9 +777,8 @@ fn decode_lzma2_loop(
         <<_control, size_high, size_low, rest:bytes>> -> {
           let size =
             int.bitwise_or(int.bitwise_shift_left(size_high, 8), size_low) + 1
-          use data <- result.try(slice_required(
+          use #(data, next) <- result.try(split_required(
             rest,
-            0,
             size,
             "lzma2 uncompressed chunk",
           ))
@@ -819,8 +787,6 @@ fn decode_lzma2_loop(
             data,
             limits,
           ))
-          let assert Ok(next) =
-            bit_array.slice(rest, size, bit_array.byte_size(rest) - size)
           // 1 control byte + 2 size bytes + `size` body bytes
           decode_lzma2_loop(
             next,
@@ -871,18 +837,11 @@ fn decode_lzma2_lzma_chunk(
                 use parsed_props <- result.try(lzma.properties_of_byte(
                   props_byte,
                 ))
-                use lzma_data <- result.try(slice_required(
+                use #(lzma_data, after) <- result.try(split_required(
                   rest_after_props,
-                  0,
                   csize,
                   "lzma2 LZMA data",
                 ))
-                let assert Ok(after) =
-                  bit_array.slice(
-                    rest_after_props,
-                    csize,
-                    bit_array.byte_size(rest_after_props) - csize,
-                  )
                 Ok(#(parsed_props, lzma_data, after, 1))
               }
               _ ->
@@ -891,14 +850,11 @@ fn decode_lzma2_lzma_chunk(
                 ))
             }
           False -> {
-            use lzma_data <- result.try(slice_required(
+            use #(lzma_data, after) <- result.try(split_required(
               rest,
-              0,
               csize,
               "lzma2 LZMA data",
             ))
-            let assert Ok(after) =
-              bit_array.slice(rest, csize, bit_array.byte_size(rest) - csize)
             Ok(#(props, lzma_data, after, 0))
           }
         },
@@ -1027,20 +983,13 @@ fn finalize_stream(
     when: expected_crc != bit_array_to_u32_le(crc_bytes),
     return: Error(codec.InvalidData(message: "xz index CRC mismatch")),
   )
-  let assert Ok(after_index) =
-    bit_array.slice(rest, pad + 4, bit_array.byte_size(rest) - pad - 4)
+  use #(_, after_index) <- result.try(split_required(rest, pad + 4, "xz index"))
   // The stream footer is always exactly 12 bytes, so the first 12
   // bytes of `after_index` are the footer and everything after that
   // is either inter-stream padding or the next stream.
-  case bit_array.slice(after_index, 0, stream_footer_size) {
-    Ok(footer) -> {
+  case after_index {
+    <<footer:bytes-size(stream_footer_size), after_footer:bytes>> -> {
       use _ <- result.try(verify_stream_footer(footer, check_type))
-      let assert Ok(after_footer) =
-        bit_array.slice(
-          after_index,
-          stream_footer_size,
-          bit_array.byte_size(after_index) - stream_footer_size,
-        )
       Ok(#(output, after_footer))
     }
     _ ->
@@ -1181,14 +1130,23 @@ fn slice_required(
   length: Int,
   label: String,
 ) -> Result(BitArray, codec.CodecError) {
-  case offset, length {
-    -1, _ -> Ok(bytes)
-    _, -1 -> Ok(bytes)
-    _, _ ->
-      case bit_array.slice(bytes, offset, length) {
-        Ok(value) -> Ok(value)
-        Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
-      }
+  use #(_, rest) <- result.try(split_required(bytes, offset, label))
+  use #(value, _) <- result.try(split_required(rest, length, label))
+  Ok(value)
+}
+
+// Splits `bytes` after `count` bytes, or fails when `bytes` is shorter or
+// `count` is negative.
+fn split_required(
+  bytes: BitArray,
+  count: Int,
+  label: String,
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
+  let truncated = Error(codec.InvalidData(message: "truncated " <> label))
+  use <- bool.guard(when: count < 0, return: truncated)
+  case bytes {
+    <<head:bytes-size(count), rest:bytes>> -> Ok(#(head, rest))
+    _ -> truncated
   }
 }
 
