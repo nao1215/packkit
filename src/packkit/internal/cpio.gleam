@@ -68,45 +68,47 @@ fn decode_loop(
   count: Int,
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) < header_size,
-    return: Error(archive.InvalidData(message: "cpio header truncated")),
-  )
-
-  let assert Ok(header_bits) = bit_array.slice(bytes, 0, header_size)
+  use #(header_bits, after_header) <- result.try(case bytes {
+    <<header_bits:bytes-size(header_size), after_header:bytes>> ->
+      Ok(#(header_bits, after_header))
+    _ -> Error(archive.InvalidData(message: "cpio header truncated"))
+  })
   use header <- result.try(parse_header(header_bits))
 
-  let name_offset = header_size
+  // The name and the body are each padded to a multiple of 4 bytes,
+  // counted from the start of the header.
   let name_size = header.namesize
-  let assert Ok(name_bytes_with_nul) =
-    bit_array.slice(bytes, name_offset, name_size)
-  use name <- result.try(
-    bytes_to_string(bytes.strip_trailing_nul(name_bytes_with_nul)),
-  )
-
-  let header_plus_name = header_size + name_size
-  let after_name_padding = pad_to_align(header_plus_name)
-  let body_offset = after_name_padding
+  let name_padding =
+    pad_to_align(header_size + name_size) - header_size - name_size
   let body_size = header.filesize
   let body_padding = pad_to_align(body_size) - body_size
-  let next_offset = body_offset + body_size + body_padding
-
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) < body_offset + body_size,
-    return: Error(archive.InvalidData(message: "cpio entry truncated")),
-  )
+  use #(name_bits, body, rest) <- result.try(case after_header {
+    <<
+      name_bits:bytes-size(name_size),
+      _:bytes-size(name_padding),
+      body:bytes-size(body_size),
+      rest:bytes,
+    >> -> Ok(#(name_bits, body, skip(rest, body_padding)))
+    _ -> Error(archive.InvalidData(message: "cpio entry truncated"))
+  })
+  use name <- result.try(bytes_to_string(bytes.strip_trailing_nul(name_bits)))
 
   case name == trailer_name {
     True -> Ok(acc)
     False -> {
       use _ <- result.try(check_member_limit(count + 1, limits))
-      let assert Ok(body) = bit_array.slice(bytes, body_offset, body_size)
       use entry_value <- result.try(header_to_entry(header, name, body, limits))
-      let advance = next_offset
-      let remaining = bit_array.byte_size(bytes) - advance
-      let assert Ok(rest) = bit_array.slice(bytes, advance, remaining)
       decode_loop(rest, [entry_value, ..acc], count + 1, limits)
     }
+  }
+}
+
+// Drops up to `count` padding bytes. The padding after the last body may
+// be missing; the reader then fails on the missing trailer.
+fn skip(bytes: BitArray, count: Int) -> BitArray {
+  case bytes {
+    <<_:bytes-size(count), rest:bytes>> -> rest
+    _ -> <<>>
   }
 }
 
