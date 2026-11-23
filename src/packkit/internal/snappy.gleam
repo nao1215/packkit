@@ -1,14 +1,10 @@
-//// Snappy raw-block and framed codec.
+//// Snappy framed codec (`sNaPpY` stream identifier and chunked layout).
 ////
-//// `snappy.raw_decode` and `snappy.raw_encode` operate on the original
-//// Snappy block format documented in `snappy-format-description`.
-//// `snappy.decode` and `snappy.encode` operate on the streaming
-//// framed form (`sNaPpY` stream identifier and chunked layout).  The
-//// raw encoder runs a greedy 4-byte hash-chain match-finder and
-//// emits literal + copy-1 / copy-2 / copy-4 sequences in the
-//// canonical block layout; the framed encoder dispatches each chunk
-//// through the raw encoder and picks the smaller of the compressed
-//// (`0x00`) and uncompressed (`0x01`) chunk types.
+//// Compressed chunks hold a raw block in the format described in
+//// `snappy-format-description`. The raw encoder runs a greedy 4-byte
+//// hash-chain match-finder and emits literal + copy-1 / copy-2 /
+//// copy-4 sequences; the framed encoder picks the smaller of the
+//// compressed (`0x00`) and uncompressed (`0x01`) chunk types.
 
 import gleam/bit_array
 import gleam/bool
@@ -19,6 +15,7 @@ import gleam/result
 import packkit/codec
 import packkit/internal/bytes
 import packkit/internal/checksum
+import packkit/internal/lz77
 import packkit/limit
 
 const stream_identifier: BitArray = <<
@@ -47,24 +44,13 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   case bytes {
     <<0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59, rest:bytes>> ->
       decode_chunks(rest, <<>>, limits)
     _ -> Error(codec.InvalidData(message: "snappy: missing stream identifier"))
   }
-}
-
-/// Decode a single Snappy raw block.
-pub fn raw_decode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
-  raw_decode_with_limits(bytes: bytes, limits: limit.default())
 }
 
 /// Decode a Snappy raw block using explicit resource limits.
@@ -95,18 +81,6 @@ fn raw_decode_with_limits(
   }
 }
 
-/// Encode `bytes` as a Snappy raw block.  Runs a greedy LZ77 match-
-/// finder (4-byte hash table, 16-bit hash) and emits literal +
-/// copy-1 / copy-2 / copy-4 sequences in the canonical block layout.
-/// Inputs of fewer than 4 bytes — where no copy can fit the 4-byte
-/// minimum match — degenerate to a single literal run.
-pub fn raw_encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
-  let length = bit_array.byte_size(bytes)
-  let length_varint = write_varint(length)
-  let body = compress_raw_body(bytes, length)
-  Ok(bit_array.concat([length_varint, body]))
-}
-
 fn encode_uncompressed_chunks(
   remaining: BitArray,
   acc: List(BitArray),
@@ -119,9 +93,7 @@ fn encode_uncompressed_chunks(
         True -> max_uncompressed_chunk
         False -> total
       }
-      let assert Ok(chunk) = bit_array.slice(remaining, 0, chunk_size)
-      let assert Ok(after) =
-        bit_array.slice(remaining, chunk_size, total - chunk_size)
+      let #(chunk, after) = bytes.split_at(remaining, chunk_size)
 
       let crc = checksum.snappy_mask(crc: checksum.crc32c(data: chunk))
       // Try Snappy compression and pick the chunk type that produces
@@ -168,41 +140,42 @@ fn decode_chunks(
 ) -> Result(BitArray, codec.CodecError) {
   case bytes {
     <<>> -> Ok(output)
-    <<chunk_type, length:size(24)-little, rest:bytes>> -> {
-      case bit_array.byte_size(rest) < length {
-        True ->
-          Error(codec.InvalidData(message: "snappy: chunk payload truncated"))
-        False -> {
-          let assert Ok(body) = bit_array.slice(rest, 0, length)
-          let assert Ok(after) =
-            bit_array.slice(rest, length, bit_array.byte_size(rest) - length)
-
-          use new_output <- result.try(case chunk_type {
-            t if t == chunk_uncompressed ->
-              decode_uncompressed_chunk(body, output, limits)
-            t if t == chunk_compressed ->
-              decode_compressed_chunk(body, output, limits)
-            t if t == chunk_padding -> Ok(output)
-            t if t == chunk_stream_identifier ->
-              case body == <<0x73, 0x4E, 0x61, 0x50, 0x70, 0x59>> {
-                True -> Ok(output)
-                False ->
-                  Error(codec.InvalidData(
-                    message: "snappy: repeated stream identifier mismatched",
-                  ))
-              }
-            t if t >= 0x80 -> Ok(output)
-            _ ->
+    <<chunk_type, length:size(24)-little, body:bytes-size(length), after:bytes>> -> {
+      use new_output <- result.try(case chunk_type {
+        t if t == chunk_uncompressed ->
+          decode_uncompressed_chunk(body, output, limits)
+        t if t == chunk_compressed ->
+          decode_compressed_chunk(body, output, limits)
+        t if t == chunk_padding -> Ok(output)
+        t if t == chunk_stream_identifier ->
+          case body == <<0x73, 0x4E, 0x61, 0x50, 0x70, 0x59>> {
+            True -> Ok(output)
+            False ->
               Error(codec.InvalidData(
-                message: "snappy: unsupported reserved chunk type",
+                message: "snappy: repeated stream identifier mismatched",
               ))
-          })
+          }
+        t if t >= 0x80 -> Ok(output)
+        _ ->
+          Error(codec.InvalidData(
+            message: "snappy: unsupported reserved chunk type",
+          ))
+      })
 
-          decode_chunks(after, new_output, limits)
-        }
-      }
+      decode_chunks(after, new_output, limits)
     }
+    <<_, _:size(24), _:bytes>> ->
+      Error(codec.InvalidData(message: "snappy: chunk payload truncated"))
     _ -> Error(codec.InvalidData(message: "snappy: chunk header truncated"))
+  }
+}
+
+// Each data chunk starts with the masked CRC-32C of its uncompressed
+// bytes.
+fn check_crc(stored: Int, data: BitArray) -> Result(Nil, codec.CodecError) {
+  case stored == checksum.snappy_mask(crc: checksum.crc32c(data: data)) {
+    True -> Ok(Nil)
+    False -> Error(codec.InvalidData(message: "snappy: chunk CRC mismatch"))
   }
 }
 
@@ -212,8 +185,10 @@ fn decode_uncompressed_chunk(
   limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
   case body {
-    <<_crc:size(32)-little, data:bytes>> ->
+    <<crc:size(32)-little, data:bytes>> -> {
+      use _ <- result.try(check_crc(crc, data))
       bytes.append_with_limit(output, data, limits)
+    }
     _ ->
       Error(codec.InvalidData(message: "snappy: uncompressed chunk too short"))
   }
@@ -225,11 +200,12 @@ fn decode_compressed_chunk(
   limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
   case body {
-    <<_crc:size(32)-little, payload:bytes>> -> {
+    <<crc:size(32)-little, payload:bytes>> -> {
       use decoded <- result.try(raw_decode_with_limits(
         bytes: payload,
         limits: limits,
       ))
+      use _ <- result.try(check_crc(crc, decoded))
       bytes.append_with_limit(output, decoded, limits)
     }
     _ -> Error(codec.InvalidData(message: "snappy: compressed chunk too short"))
@@ -309,19 +285,12 @@ fn handle_literal(
     _ -> read_literal_extra(rest, 4)
   })
 
-  case bit_array.byte_size(after_extra) < length {
-    True -> Error(codec.InvalidData(message: "snappy: literal run truncated"))
-    False -> {
-      let assert Ok(chunk) = bit_array.slice(after_extra, 0, length)
-      let assert Ok(after) =
-        bit_array.slice(
-          after_extra,
-          length,
-          bit_array.byte_size(after_extra) - length,
-        )
+  case after_extra {
+    <<chunk:bytes-size(length), after:bytes>> -> {
       use output <- result.try(bytes.append_with_limit(output, chunk, limits))
       decode_raw_loop(after, output, limits)
     }
+    _ -> Error(codec.InvalidData(message: "snappy: literal run truncated"))
   }
 }
 
@@ -329,28 +298,13 @@ fn read_literal_extra(
   rest: BitArray,
   width: Int,
 ) -> Result(#(Int, BitArray), codec.CodecError) {
-  case bit_array.byte_size(rest) < width {
-    True ->
+  let bits = width * 8
+  case rest {
+    <<value:size(bits)-little, after:bytes>> -> Ok(#(value + 1, after))
+    _ ->
       Error(codec.InvalidData(
         message: "snappy: literal length extension truncated",
       ))
-    False -> {
-      let assert Ok(prefix) = bit_array.slice(rest, 0, width)
-      let assert Ok(after) =
-        bit_array.slice(rest, width, bit_array.byte_size(rest) - width)
-      let value = read_le(prefix, width)
-      Ok(#(value + 1, after))
-    }
-  }
-}
-
-fn read_le(bytes: BitArray, width: Int) -> Int {
-  case width, bytes {
-    1, <<b>> -> b
-    2, <<b1, b2>> -> b1 + b2 * 256
-    3, <<b1, b2, b3>> -> b1 + b2 * 256 + b3 * 65_536
-    4, <<b1, b2, b3, b4>> -> b1 + b2 * 256 + b3 * 65_536 + b4 * 16_777_216
-    _, _ -> 0
   }
 }
 
@@ -417,35 +371,8 @@ fn apply_copy(
     )),
   )
 
-  use new_output <- result.try(case offset >= length {
-    True -> {
-      let assert Ok(chunk) = bit_array.slice(output, size - offset, length)
-      bytes.append_with_limit(output, chunk, limits)
-    }
-    False -> copy_byte_by_byte(output, offset, length, limits)
-  })
+  use new_output <- result.try(bytes.copy_back(output, offset, length, limits))
   decode_raw_loop(rest, new_output, limits)
-}
-
-fn copy_byte_by_byte(
-  output: BitArray,
-  offset: Int,
-  length: Int,
-  limits: limit.Limits,
-) -> Result(BitArray, codec.CodecError) {
-  case length {
-    0 -> Ok(output)
-    _ -> {
-      let size = bit_array.byte_size(output)
-      let assert Ok(byte_slice) = bit_array.slice(output, size - offset, 1)
-      use new_output <- result.try(bytes.append_with_limit(
-        output,
-        byte_slice,
-        limits,
-      ))
-      copy_byte_by_byte(new_output, offset, length - 1, limits)
-    }
-  }
 }
 
 // -- raw-block LZ77 compressor -----------------------------------------
@@ -466,7 +393,7 @@ fn compress_raw_body(bytes: BitArray, size: Int) -> BitArray {
   case size < snappy_min_match {
     True -> emit_literal(bytes)
     False -> {
-      let table = build_snappy_byte_table(bytes, 0, dict.new())
+      let table = lz77.table(bytes)
       snappy_compress_loop(table, size, 0, 0, dict.new(), [])
     }
   }
@@ -485,7 +412,7 @@ fn snappy_compress_loop(
       let lit_len = size - last_lit_start
       let tail = case lit_len {
         0 -> <<>>
-        _ -> emit_literal(snappy_slice(table, last_lit_start, lit_len, <<>>))
+        _ -> emit_literal(lz77.table_slice(table, last_lit_start, lit_len))
       }
       bit_array.concat(list.reverse([tail, ..acc]))
     }
@@ -502,11 +429,11 @@ fn snappy_step(
   acc: List(BitArray),
 ) -> BitArray {
   let key =
-    snappy_hash4(
-      snappy_byte_at(table, pos),
-      snappy_byte_at(table, pos + 1),
-      snappy_byte_at(table, pos + 2),
-      snappy_byte_at(table, pos + 3),
+    lz77.hash4(
+      lz77.table_at(table, pos),
+      lz77.table_at(table, pos + 1),
+      lz77.table_at(table, pos + 2),
+      lz77.table_at(table, pos + 3),
     )
   case dict.get(hashes, key) {
     Ok(prev) -> {
@@ -514,7 +441,7 @@ fn snappy_step(
       let valid =
         offset >= 1
         && offset <= snappy_max_distance
-        && snappy_bytes4_equal(table, prev, pos)
+        && lz77.same4(table, prev, pos)
       case valid {
         False ->
           snappy_compress_loop(
@@ -526,7 +453,7 @@ fn snappy_step(
             acc,
           )
         True -> {
-          let match_len = snappy_match_length(table, prev, pos, size, 0)
+          let match_len = lz77.table_match_length(table, prev, pos, size, 0)
           case match_len < snappy_min_match {
             True ->
               snappy_compress_loop(
@@ -540,20 +467,17 @@ fn snappy_step(
             False -> {
               let literals = case pos > last_lit_start {
                 True ->
-                  emit_literal(
-                    snappy_slice(
-                      table,
-                      last_lit_start,
-                      pos - last_lit_start,
-                      <<>>,
-                    ),
-                  )
+                  emit_literal(lz77.table_slice(
+                    table,
+                    last_lit_start,
+                    pos - last_lit_start,
+                  ))
                 False -> <<>>
               }
               let copy = emit_copy_for(offset, match_len, <<>>)
               let next_pos = pos + match_len
               let new_hashes =
-                snappy_insert_hashes(
+                lz77.insert_hashes4(
                   table,
                   dict.insert(hashes, key, pos),
                   pos + 1,
@@ -579,110 +503,6 @@ fn snappy_step(
         dict.insert(hashes, key, pos),
         acc,
       )
-  }
-}
-
-fn build_snappy_byte_table(
-  bytes: BitArray,
-  index: Int,
-  acc: dict.Dict(Int, Int),
-) -> dict.Dict(Int, Int) {
-  case bytes {
-    <<b, rest:bytes>> ->
-      build_snappy_byte_table(rest, index + 1, dict.insert(acc, index, b))
-    _ -> acc
-  }
-}
-
-fn snappy_byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
-  case dict.get(table, index) {
-    Ok(b) -> b
-    _ -> 0
-  }
-}
-
-fn snappy_hash4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int {
-  let combined =
-    int.bitwise_or(
-      b0,
-      int.bitwise_or(
-        int.bitwise_shift_left(b1, 8),
-        int.bitwise_or(
-          int.bitwise_shift_left(b2, 16),
-          int.bitwise_shift_left(b3, 24),
-        ),
-      ),
-    )
-  int.bitwise_and(combined * 2_654_435_761, 0xFFFF)
-}
-
-fn snappy_bytes4_equal(table: dict.Dict(Int, Int), p1: Int, p2: Int) -> Bool {
-  snappy_byte_at(table, p1) == snappy_byte_at(table, p2)
-  && snappy_byte_at(table, p1 + 1) == snappy_byte_at(table, p2 + 1)
-  && snappy_byte_at(table, p1 + 2) == snappy_byte_at(table, p2 + 2)
-  && snappy_byte_at(table, p1 + 3) == snappy_byte_at(table, p2 + 3)
-}
-
-fn snappy_match_length(
-  table: dict.Dict(Int, Int),
-  base: Int,
-  cursor: Int,
-  limit_pos: Int,
-  acc: Int,
-) -> Int {
-  case cursor + acc >= limit_pos {
-    True -> acc
-    False ->
-      case
-        snappy_byte_at(table, base + acc) == snappy_byte_at(table, cursor + acc)
-      {
-        True -> snappy_match_length(table, base, cursor, limit_pos, acc + 1)
-        False -> acc
-      }
-  }
-}
-
-fn snappy_insert_hashes(
-  table: dict.Dict(Int, Int),
-  hashes: dict.Dict(Int, Int),
-  from: Int,
-  to: Int,
-  size: Int,
-) -> dict.Dict(Int, Int) {
-  case from > to || from + snappy_min_match > size {
-    True -> hashes
-    False -> {
-      let key =
-        snappy_hash4(
-          snappy_byte_at(table, from),
-          snappy_byte_at(table, from + 1),
-          snappy_byte_at(table, from + 2),
-          snappy_byte_at(table, from + 3),
-        )
-      snappy_insert_hashes(
-        table,
-        dict.insert(hashes, key, from),
-        from + 1,
-        to,
-        size,
-      )
-    }
-  }
-}
-
-fn snappy_slice(
-  table: dict.Dict(Int, Int),
-  start: Int,
-  count: Int,
-  acc: BitArray,
-) -> BitArray {
-  case count {
-    0 -> acc
-    _ ->
-      snappy_slice(table, start + 1, count - 1, <<
-        acc:bits,
-        snappy_byte_at(table, start),
-      >>)
   }
 }
 

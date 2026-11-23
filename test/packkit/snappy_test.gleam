@@ -2,12 +2,38 @@ import gleam/bit_array
 import gleeunit/should
 import packkit
 import packkit/codec
+import packkit/internal/checksum
 import packkit/internal/snappy
+
+// Wraps a raw block in a framed stream: the stream identifier, then one
+// compressed chunk with the masked CRC-32C of `plain`.
+fn framed(raw: BitArray, plain: BitArray) -> BitArray {
+  let crc = checksum.snappy_mask(crc: checksum.crc32c(data: plain))
+  let length = bit_array.byte_size(raw) + 4
+  <<
+    0xFF, 0x06, 0x00, 0x00, "sNaPpY", 0x00, length:size(24)-little,
+    crc:size(32)-little, raw:bits,
+  >>
+}
+
+fn raw_decode(
+  raw: BitArray,
+  plain: BitArray,
+) -> Result(BitArray, codec.CodecError) {
+  packkit.decompress(framed(raw, plain), with: codec.Snappy)
+}
+
+fn round_trip(payload: BitArray) -> BitArray {
+  let assert Ok(encoded) = packkit.compress(payload, with: codec.Snappy)
+  let assert Ok(restored) = packkit.decompress(encoded, with: codec.Snappy)
+  assert restored == payload
+  encoded
+}
 
 pub fn raw_decode_hello_test() -> Nil {
   // `snappyjs.compress(Buffer.from("hello"))` from npm.
   let compressed = <<0x05, 0x10, 0x68, 0x65, 0x6c, 0x6c, 0x6f>>
-  let assert Ok(plain) = snappy.raw_decode(bytes: compressed)
+  let assert Ok(plain) = raw_decode(compressed, <<"hello">>)
   plain
   |> should.equal(<<"hello":utf8>>)
 }
@@ -17,7 +43,7 @@ pub fn raw_decode_hello_world_test() -> Nil {
   let compressed = <<
     0x0b, 0x28, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x77, 0x6f, 0x72, 0x6c, 0x64,
   >>
-  let assert Ok(plain) = snappy.raw_decode(bytes: compressed)
+  let assert Ok(plain) = raw_decode(compressed, <<"hello world">>)
   plain
   |> should.equal(<<"hello world":utf8>>)
 }
@@ -30,13 +56,13 @@ pub fn raw_decode_repeated_abc_test() -> Nil {
     0xb4, 0x01, 0x08, 0x61, 0x62, 0x63, 0xfe, 0x03, 0x00, 0xfe, 0x03, 0x00, 0xc2,
     0x03, 0x00,
   >>
-  let assert Ok(plain) = snappy.raw_decode(bytes: compressed)
-  bit_array.byte_size(plain)
-  |> should.equal(180)
   let expected =
     bit_array.from_string(
       "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc",
     )
+  let assert Ok(plain) = raw_decode(compressed, expected)
+  bit_array.byte_size(plain)
+  |> should.equal(180)
   plain |> should.equal(expected)
 }
 
@@ -55,37 +81,9 @@ pub fn framed_roundtrip_empty_test() -> Nil {
   |> should.equal(<<>>)
 }
 
-pub fn raw_encode_decode_roundtrip_test() -> Nil {
-  let payload = <<"raw snappy literal-only round-trip":utf8>>
-  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
-  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
-  restored
-  |> should.equal(payload)
-}
-
-pub fn raw_encode_compresses_run_test() -> Nil {
-  // 1 KiB of 'a' — extremely compressible.  The new LZ77 raw
-  // encoder must shrink it well below the input size; the previous
-  // literal-only encoder produced ~1 KiB + 3 bytes of varint
-  // overhead.
-  let payload = repeat_byte(0x61, 1024, <<>>)
-  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
-  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
-  restored
-  |> should.equal(payload)
-  // The encoder must shrink the input significantly — the precise
-  // output size depends on copy-tag fragmentation, but a 16-fold
-  // (or better) reduction is the floor.
-  { bit_array.byte_size(encoded) < 64 }
-  |> should.be_true
-}
-
-pub fn raw_encode_compresses_repeated_pattern_test() -> Nil {
+pub fn compresses_repeated_pattern_test() -> Nil {
   let payload = bit_array.concat(list_repeat(<<"abcabcabc":utf8>>, 50))
-  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
-  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
-  restored
-  |> should.equal(payload)
+  let encoded = round_trip(payload)
   { bit_array.byte_size(encoded) < bit_array.byte_size(payload) }
   |> should.be_true
 }
@@ -107,15 +105,18 @@ pub fn framed_encode_compresses_run_test() -> Nil {
   |> should.be_true
 }
 
-pub fn raw_encode_random_short_roundtrip_test() -> Nil {
+pub fn random_short_roundtrip_test() -> Nil {
   let assert Ok(payload) =
     bit_array.base16_decode(
       "DE7374EF0634215A02948D5CBADC072B286F8175B5FE2FA00B1FCCB187702CF8",
     )
-  let assert Ok(encoded) = snappy.raw_encode(bytes: payload)
-  let assert Ok(restored) = snappy.raw_decode(bytes: encoded)
-  restored
-  |> should.equal(payload)
+  round_trip(payload)
+  Nil
+}
+
+pub fn literal_only_roundtrip_test() -> Nil {
+  round_trip(<<"raw snappy literal-only round-trip":utf8>>)
+  Nil
 }
 
 fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {

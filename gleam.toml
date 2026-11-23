@@ -38,18 +38,19 @@ unused_exports = "off"
   "short_variable_name",
   "unused_exports",
 ]
-"test/packkit/*_fuzz_test.gleam" = ["discarded_result"]
+"test/packkit/*_fuzz_test.gleam" = ["discarded_result", "thrown_away_error"]
+# The recursive loops stay in tail position for the JavaScript target,
+# which `use <- bool.guard` would break.
+"src/packkit/internal/bytes.gleam" = ["prefer_guard_clause"]
+"src/packkit/internal/lz77.gleam" = ["prefer_guard_clause"]
 "src/packkit/internal/ar.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
 ]
 "src/packkit/internal/cpio.gleam" = [
-  "assert_ok_pattern",
   "prefer_guard_clause",
 ]
 "src/packkit/internal/bzip2.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
   "prefer_guard_clause",
@@ -57,13 +58,11 @@ unused_exports = "off"
   "thrown_away_error",
 ]
 "src/packkit/internal/brotli.gleam" = [
-  "assert_ok_pattern",
   "prefer_guard_clause",
   "thrown_away_error",
 ]
 "src/packkit/internal/checksum.gleam" = ["short_variable_name"]
 "src/packkit/internal/deflate.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
   "prefer_guard_clause",
@@ -71,28 +70,23 @@ unused_exports = "off"
   "thrown_away_error",
 ]
 "src/packkit/gzip.gleam" = [
-  "assert_ok_pattern",
   "discarded_result",
   "thrown_away_error",
 ]
 "src/packkit/internal/lz4.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
 ]
 "src/packkit/internal/lzw.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
   "thrown_away_error",
 ]
 "src/packkit/internal/snappy.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
 ]
 "src/packkit/internal/tar.gleam" = [
-  "assert_ok_pattern",
   "prefer_guard_clause",
   "thrown_away_error",
 ]
@@ -106,37 +100,28 @@ unused_exports = "off"
   "thrown_away_error",
 ]
 "src/packkit/internal/lzma.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
   "prefer_guard_clause",
   "thrown_away_error",
 ]
 "src/packkit/seven_z.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
   "prefer_guard_clause",
 ]
 "src/packkit/internal/xz.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
   "thrown_away_error",
 ]
-"src/packkit/internal/zlib.gleam" = [
-  "assert_ok_pattern",
-]
 "src/packkit/internal/zstd.gleam" = [
-  "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
   "short_variable_name",
   "thrown_away_error",
 ]
 "src/packkit/internal/brotli_transform.gleam" = [
-  "assert_ok_pattern",
   "discarded_result",
   "prefer_guard_clause",
 ]
-"src/packkit/internal/brotli_context.gleam" = ["assert_ok_pattern"]

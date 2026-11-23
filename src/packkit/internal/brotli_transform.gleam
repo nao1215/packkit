@@ -9,6 +9,7 @@
 
 import gleam/bit_array
 import gleam/int
+import packkit/internal/bytes
 
 /// Number of transform entries (matches brotli's `kBrotliTransforms.num_transforms`).
 pub const num_transforms: Int = 121
@@ -695,20 +696,12 @@ pub fn apply(word: BitArray, idx: Int) -> BitArray {
   bit_array.concat([prefix, body, suffix])
 }
 
+// Each entry is a length byte followed by that many bytes.
 fn prefix_suffix_slice(id: Int) -> BitArray {
   let start = prefix_suffix_offset(id)
-  let assert Ok(len_bits) = bit_array.slice(prefix_suffix_bytes, start, 1)
-  let len = case len_bits {
-    <<n>> -> n
-    _ -> 0
-  }
-  case len {
-    0 -> <<>>
-    _ -> {
-      let assert Ok(payload) =
-        bit_array.slice(prefix_suffix_bytes, start + 1, len)
-      payload
-    }
+  case prefix_suffix_bytes {
+    <<_:bytes-size(start), len, payload:bytes-size(len), _:bytes>> -> payload
+    _ -> <<>>
   }
 }
 
@@ -719,18 +712,12 @@ fn apply_op(word: BitArray, op: Op) -> BitArray {
     OmitLast(n) ->
       case n >= len {
         True -> <<>>
-        False -> {
-          let assert Ok(slice) = bit_array.slice(word, 0, len - n)
-          slice
-        }
+        False -> bytes.split_at(word, len - n).0
       }
     OmitFirst(n) ->
       case n >= len {
         True -> <<>>
-        False -> {
-          let assert Ok(slice) = bit_array.slice(word, n, len - n)
-          slice
-        }
+        False -> bytes.split_at(word, n).1
       }
     UppercaseFirst -> uppercase_first(word)
     UppercaseAll -> uppercase_all(word, 0, len)
@@ -765,8 +752,7 @@ fn uppercase_all(word: BitArray, taken: Int, total: Int) -> BitArray {
   case taken >= total {
     True -> word
     False -> {
-      let assert Ok(head) = bit_array.slice(word, 0, taken)
-      let assert Ok(tail) = bit_array.slice(word, taken, total - taken)
+      let #(head, tail) = bytes.split_at(word, taken)
       let new_tail = uppercase_first(tail)
       let step = uppercase_step(tail)
       uppercase_all(bit_array.concat([head, new_tail]), taken + step, total)

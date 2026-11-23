@@ -10,7 +10,6 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
-import gleam/option
 import gleam/result
 import gleam/string
 import packkit/archive
@@ -52,20 +51,9 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(archive.Archive, archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(archive.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(entry.check_input(bytes, limits))
   decode_loop(bytes, [], 0, limits)
-  |> result.map(list.reverse)
-  |> result.map(archive.Archive(
-    format: archive.Cpio,
-    entries: _,
-    comment: option.None,
-  ))
+  |> result.try(entry.finish(_, archive.Cpio, limits))
 }
 
 fn decode_loop(
@@ -74,55 +62,50 @@ fn decode_loop(
   count: Int,
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) < header_size,
-    return: Error(archive.InvalidData(message: "cpio header truncated")),
-  )
-
-  let assert Ok(header_bits) = bit_array.slice(bytes, 0, header_size)
+  // Gleam 1.14 on JavaScript cannot use a module constant as a segment
+  // size, so it is bound to a local first.
+  let header_length = header_size
+  use #(header_bits, after_header) <- result.try(case bytes {
+    <<header_bits:bytes-size(header_length), after_header:bytes>> ->
+      Ok(#(header_bits, after_header))
+    _ -> Error(archive.InvalidData(message: "cpio header truncated"))
+  })
   use header <- result.try(parse_header(header_bits))
 
-  let name_offset = header_size
+  // The name and the body are each padded to a multiple of 4 bytes,
+  // counted from the start of the header.
   let name_size = header.namesize
-  let assert Ok(name_bytes_with_nul) =
-    bit_array.slice(bytes, name_offset, name_size)
-  use name <- result.try(
-    bytes_to_string(bytes.strip_trailing_nul(name_bytes_with_nul)),
-  )
-
-  let header_plus_name = header_size + name_size
-  let after_name_padding = pad_to_align(header_plus_name)
-  let body_offset = after_name_padding
+  let name_padding =
+    pad_to_align(header_size + name_size) - header_size - name_size
   let body_size = header.filesize
   let body_padding = pad_to_align(body_size) - body_size
-  let next_offset = body_offset + body_size + body_padding
-
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) < body_offset + body_size,
-    return: Error(archive.InvalidData(message: "cpio entry truncated")),
-  )
+  use #(name_bits, body, rest) <- result.try(case after_header {
+    <<
+      name_bits:bytes-size(name_size),
+      _:bytes-size(name_padding),
+      body:bytes-size(body_size),
+      rest:bytes,
+    >> -> Ok(#(name_bits, body, skip(rest, body_padding)))
+    _ -> Error(archive.InvalidData(message: "cpio entry truncated"))
+  })
+  use name <- result.try(bytes_to_string(bytes.strip_trailing_nul(name_bits)))
 
   case name == trailer_name {
     True -> Ok(acc)
     False -> {
-      use _ <- result.try(check_member_limit(count + 1, limits))
-      let assert Ok(body) = bit_array.slice(bytes, body_offset, body_size)
+      use _ <- result.try(entry.check_member_limit(count + 1, limits))
       use entry_value <- result.try(header_to_entry(header, name, body, limits))
-      let advance = next_offset
-      let remaining = bit_array.byte_size(bytes) - advance
-      let assert Ok(rest) = bit_array.slice(bytes, advance, remaining)
       decode_loop(rest, [entry_value, ..acc], count + 1, limits)
     }
   }
 }
 
-fn check_member_limit(
-  count: Int,
-  limits: limit.Limits,
-) -> Result(Nil, archive.ArchiveError) {
-  case count > limits.max_members {
-    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
-    False -> Ok(Nil)
+// Drops up to `count` padding bytes. The padding after the last body may
+// be missing; the reader then fails on the missing trailer.
+fn skip(bytes: BitArray, count: Int) -> BitArray {
+  case bytes {
+    <<_:bytes-size(count), rest:bytes>> -> rest
+    _ -> <<>>
   }
 }
 
@@ -377,7 +360,7 @@ fn hex_digits_loop(value: Int, remaining: Int, acc: BitArray) -> BitArray {
 
 fn align_padding(position: Int) -> BitArray {
   let aligned = pad_to_align(position)
-  byte_repeat(0, aligned - position)
+  bytes.repeat(0, aligned - position)
 }
 
 fn pad_to_align(position: Int) -> Int {
@@ -387,26 +370,15 @@ fn pad_to_align(position: Int) -> Int {
   }
 }
 
-fn byte_repeat(byte: Int, count: Int) -> BitArray {
-  byte_repeat_loop(byte, count, <<>>)
-}
-
-fn byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
-  }
-}
-
 fn slice_or_error(
   block: BitArray,
   offset: Int,
   width: Int,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(block, offset, width) {
-    Ok(value) -> Ok(value)
-    Error(_) -> Error(archive.InvalidData(message: "cpio field out of bounds"))
-  }
+  bytes.slice(block, offset, width)
+  |> result.replace_error(archive.InvalidData(
+    message: "cpio field out of bounds",
+  ))
 }
 
 fn read_hex_field(

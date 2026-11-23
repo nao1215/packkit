@@ -32,6 +32,7 @@ import packkit/codec
 import packkit/internal/bytes
 import packkit/internal/fse
 import packkit/internal/huf
+import packkit/internal/lz77
 import packkit/limit
 
 const magic: Int = 0xFD2FB528
@@ -76,7 +77,7 @@ pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
 }
 
 /// Build the Zstandard frame header for a payload of `size` bytes.
-/// Exposed for tests that need to assert on the FCS layout for sizes
+/// Public for tests that need to assert on the FCS layout for sizes
 /// too large to materialise in memory (e.g. 4 GiB+ frames where the
 /// header used to silently truncate the FCS field to its low 32 bits).
 pub fn frame_header_for_size(size: Int) -> Result(BitArray, codec.CodecError) {
@@ -159,13 +160,7 @@ fn emit_raw_blocks_loop(
         False -> n
       }
       let is_last = chunk_size == n
-      let assert Ok(chunk) = bit_array.slice(remaining_bytes, 0, chunk_size)
-      let assert Ok(rest) =
-        bit_array.slice(
-          remaining_bytes,
-          chunk_size,
-          bit_array.byte_size(remaining_bytes) - chunk_size,
-        )
+      let #(chunk, rest) = bytes.split_at(remaining_bytes, chunk_size)
       let chunk_block = pick_best_block(chunk, chunk_size, is_last)
       emit_raw_blocks_loop(
         rest,
@@ -429,11 +424,9 @@ fn split_chunk_4(
   // N divisible by 4 but diverge otherwise — we follow the reference
   // implementation to keep the encoder and decoder in lockstep.
   let per_stream = { chunk_size + 3 } / 4
-  let s4_len = chunk_size - per_stream * 3
-  let assert Ok(p1) = bit_array.slice(chunk, 0, per_stream)
-  let assert Ok(p2) = bit_array.slice(chunk, per_stream, per_stream)
-  let assert Ok(p3) = bit_array.slice(chunk, per_stream * 2, per_stream)
-  let assert Ok(p4) = bit_array.slice(chunk, per_stream * 3, s4_len)
+  let #(p1, rest) = bytes.split_at(chunk, per_stream)
+  let #(p2, rest) = bytes.split_at(rest, per_stream)
+  let #(p3, p4) = bytes.split_at(rest, per_stream)
   #(p1, p2, p3, p4)
 }
 
@@ -694,17 +687,6 @@ fn assign_codes_loop(
   }
 }
 
-fn max_length_in_list(lengths: List(Int), acc: Int) -> Int {
-  case lengths {
-    [] -> acc
-    [head, ..rest] ->
-      case head > acc {
-        True -> max_length_in_list(rest, head)
-        False -> max_length_in_list(rest, acc)
-      }
-  }
-}
-
 fn trim_trailing_zero_weights(
   reversed: List(Int),
   acc: List(Int),
@@ -748,20 +730,13 @@ fn encode_huffman_bitstream(
   chunk: BitArray,
   codes: dict.Dict(Int, #(Int, Int)),
 ) -> BitArray {
-  let bytes = bit_array_to_list_forward(chunk, [])
+  let bytes = bytes.to_list(chunk)
   let reversed = list.reverse(bytes)
   let #(buf, bits, out) = emit_codes_reverse(reversed, codes, 0, 0, <<>>)
   // Append the terminator at the next position.
   let buf2 = int.bitwise_or(buf, int.bitwise_shift_left(1, bits))
   let bits2 = bits + 1
   flush_final_bits(buf2, bits2, out)
-}
-
-fn bit_array_to_list_forward(bytes: BitArray, acc: List(Int)) -> List(Int) {
-  case bytes {
-    <<byte, rest:bytes>> -> bit_array_to_list_forward(rest, [byte, ..acc])
-    _ -> list.reverse(acc)
-  }
 }
 
 fn emit_codes_reverse(
@@ -925,7 +900,7 @@ fn normalize_fse_weight_counts(
     0 -> Error(Nil)
     _ -> {
       let raw = build_floor_normalized(counts, total, 0, max_used, [])
-      let sum = sum_int_list(raw, 0)
+      let sum = int.sum(raw)
       let diff = fse_weight_table_size - sum
       case diff {
         0 -> Ok(raw)
@@ -970,13 +945,6 @@ fn build_floor_normalized(
         ..acc
       ])
     }
-  }
-}
-
-fn sum_int_list(list: List(Int), acc: Int) -> Int {
-  case list {
-    [] -> acc
-    [head, ..rest] -> sum_int_list(rest, acc + head)
   }
 }
 
@@ -1467,7 +1435,7 @@ fn fse_encode_transitions(
 /// when neither form fits — the caller drops Huffman for the chunk
 /// and emits a Raw / RLE block instead.
 fn serialize_huffman_tree_unified(lengths: List(Int)) -> Option(BitArray) {
-  let max_bits = max_length_in_list(lengths, 0)
+  let max_bits = list.fold(lengths, 0, int.max)
   let weights =
     list.map(lengths, fn(l) {
       case l {
@@ -1634,10 +1602,10 @@ fn zstd_lz77_loop(
             literals,
           )
         False -> {
-          let b0 = zstd_byte_at(bytes, pos)
-          let b1 = zstd_byte_at(bytes, pos + 1)
-          let b2 = zstd_byte_at(bytes, pos + 2)
-          let key = zstd_hash3(b0, b1, b2)
+          let b0 = lz77.byte_at(bytes, pos)
+          let b1 = lz77.byte_at(bytes, pos + 1)
+          let b2 = lz77.byte_at(bytes, pos + 2)
+          let key = lz77.hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) ->
               zstd_lz77_loop(
@@ -1667,7 +1635,7 @@ fn zstd_lz77_loop(
                     True -> size - pos
                     False -> seq_lz77_max_match
                   }
-                  let m_len = zstd_match_len(bytes, prev, pos, cap, 0)
+                  let m_len = lz77.match_length(bytes, prev, pos, cap, 0)
                   case m_len >= seq_lz77_min_match {
                     True -> {
                       let lit_len = pos - last_emit
@@ -1679,7 +1647,7 @@ fn zstd_lz77_loop(
                           offset: distance,
                         )
                       let hashes =
-                        zstd_update_hashes_range(
+                        lz77.insert_hashes3(
                           bytes,
                           dict.insert(hashes, key, pos),
                           pos + 1,
@@ -1716,73 +1684,10 @@ fn zstd_lz77_loop(
   }
 }
 
-fn zstd_hash3(b0: Int, b1: Int, b2: Int) -> Int {
-  int.bitwise_and(
-    int.bitwise_exclusive_or(
-      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
-      b2 * 2_246_822_519,
-    ),
-    0xFFFF,
-  )
-}
-
-fn zstd_byte_at(bytes: BitArray, pos: Int) -> Int {
-  case bit_array.slice(bytes, pos, 1) {
-    Ok(<<b>>) -> b
-    _ -> 0
-  }
-}
-
 fn zstd_byte_slice(bytes: BitArray, offset: Int, length: Int) -> BitArray {
   case bit_array.slice(bytes, offset, length) {
     Ok(v) -> v
     Error(_) -> <<>>
-  }
-}
-
-fn zstd_match_len(
-  bytes: BitArray,
-  base: Int,
-  cursor: Int,
-  cap: Int,
-  acc: Int,
-) -> Int {
-  case acc >= cap {
-    True -> acc
-    False ->
-      case
-        zstd_byte_at(bytes, base + acc) == zstd_byte_at(bytes, cursor + acc)
-      {
-        True -> zstd_match_len(bytes, base, cursor, cap, acc + 1)
-        False -> acc
-      }
-  }
-}
-
-fn zstd_update_hashes_range(
-  bytes: BitArray,
-  hashes: dict.Dict(Int, Int),
-  from: Int,
-  to: Int,
-  size: Int,
-) -> dict.Dict(Int, Int) {
-  case from >= to || from + seq_lz77_min_match > size {
-    True -> hashes
-    False -> {
-      let key =
-        zstd_hash3(
-          zstd_byte_at(bytes, from),
-          zstd_byte_at(bytes, from + 1),
-          zstd_byte_at(bytes, from + 2),
-        )
-      zstd_update_hashes_range(
-        bytes,
-        dict.insert(hashes, key, from),
-        from + 1,
-        to,
-        size,
-      )
-    }
   }
 }
 
@@ -2253,7 +2158,7 @@ fn normalize_seq_counts(
     _ -> {
       let raw =
         build_floor_normalized_seq(counts, total, table_size, 0, max_used, [])
-      let sum = sum_int_list(raw, 0)
+      let sum = int.sum(raw)
       let diff = table_size - sum
       case diff {
         0 -> Ok(raw)
@@ -2561,13 +2466,7 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   decode_frames_loop(bytes, <<>>, 0, limits)
 }
@@ -2877,14 +2776,11 @@ fn decode_compressed_block(
   block_size: Int,
   state: BlockState,
 ) -> Result(#(BitArray, BitArray, BlockState), codec.CodecError) {
-  use payload <- result.try(slice_or_error(
+  use #(payload, rest) <- result.try(split_or_error(
     bytes,
-    0,
     block_size,
     "zstd compressed block payload",
   ))
-  let assert Ok(rest) =
-    bit_array.slice(bytes, block_size, bit_array.byte_size(bytes) - block_size)
 
   use #(literals, after_literals, next_huffman) <- result.try(
     parse_literals_section(payload, state.huffman),
@@ -2992,25 +2888,16 @@ fn decode_huffman_literals_block(
   // Slice the literals section payload out of the surrounding block
   // so the Huffman tree parser stops at the right boundary.
   let section_total = header.header_bytes + header.compressed_size
-  use section <- result.try(slice_or_error(
+  use #(section, after_section) <- result.try(split_or_error(
     bytes,
-    0,
     section_total,
     "zstd compressed literals section body",
   ))
-  let assert Ok(after_section) =
-    bit_array.slice(
-      bytes,
-      section_total,
-      bit_array.byte_size(bytes) - section_total,
-    )
-
-  let assert Ok(tree_bytes) =
-    bit_array.slice(
-      section,
-      header.header_bytes,
-      section_total - header.header_bytes,
-    )
+  use tree_bytes <- result.try(slice_after(
+    section,
+    header.header_bytes,
+    "zstd compressed literals section body",
+  ))
   case huf.read_tree(tree_bytes) {
     Error(reason) -> Error(huf_error_to_codec(reason))
     Ok(#(tree, tree_consumed)) -> {
@@ -3043,18 +2930,11 @@ fn decode_treeless_literals_block(
       ))
     Some(tree) -> {
       let section_total = header.header_bytes + header.compressed_size
-      use section <- result.try(slice_or_error(
+      use #(section, after_section) <- result.try(split_or_error(
         bytes,
-        0,
         section_total,
         "zstd treeless literals section body",
       ))
-      let assert Ok(after_section) =
-        bit_array.slice(
-          bytes,
-          section_total,
-          bit_array.byte_size(bytes) - section_total,
-        )
       // Treeless literals omit the Huffman_Tree_Description so the
       // whole compressed_size is the bitstream payload.
       use bitstream_bytes <- result.try(slice_or_error(
@@ -3234,21 +3114,22 @@ fn parse_raw_or_rle_literals(
     0 | 2 -> {
       // 1-byte header — size is bits 3..7 of the header byte (5 bits).
       let regenerated_size = int.bitwise_shift_right(header_byte, 3)
-      let assert Ok(after_header) =
-        bit_array.slice(bytes, 1, bit_array.byte_size(bytes) - 1)
+      use after_header <- result.try(slice_after(
+        bytes,
+        1,
+        "zstd literals header",
+      ))
       finalize_literals(after_header, regenerated_size, is_rle)
     }
     1 -> {
       // 2-byte header — bits 4..7 of byte 0 + all of byte 1 (12 bits).
       case bytes {
-        <<_h, b1, _:bytes>> -> {
+        <<_h, b1, after_header:bytes>> -> {
           let regenerated_size =
             int.bitwise_or(
               int.bitwise_shift_right(header_byte, 4),
               int.bitwise_shift_left(b1, 4),
             )
-          let assert Ok(after_header) =
-            bit_array.slice(bytes, 2, bit_array.byte_size(bytes) - 2)
           finalize_literals(after_header, regenerated_size, is_rle)
         }
         _ ->
@@ -3261,7 +3142,7 @@ fn parse_raw_or_rle_literals(
       // size_format = 3: 3-byte header, 20-bit regen_size:
       //   bits 4..7 of byte 0 + all of byte 1 + all of byte 2.
       case bytes {
-        <<_h, b1, b2, _:bytes>> -> {
+        <<_h, b1, b2, after_header:bytes>> -> {
           let regenerated_size =
             int.bitwise_or(
               int.bitwise_shift_right(header_byte, 4),
@@ -3270,8 +3151,6 @@ fn parse_raw_or_rle_literals(
                 int.bitwise_shift_left(b2, 12),
               ),
             )
-          let assert Ok(after_header) =
-            bit_array.slice(bytes, 3, bit_array.byte_size(bytes) - 3)
           finalize_literals(after_header, regenerated_size, is_rle)
         }
         _ ->
@@ -3291,27 +3170,12 @@ fn finalize_literals(
   case is_rle {
     True ->
       case bytes {
-        <<byte, rest:bytes>> -> Ok(#(zstd_repeat_byte(byte, size, <<>>), rest))
+        <<byte, rest:bytes>> -> Ok(#(bytes.repeat(byte, size), rest))
         _ -> Error(codec.InvalidData(message: "truncated zstd RLE literals"))
       }
     False -> {
-      use chunk <- result.try(slice_or_error(
-        bytes,
-        0,
-        size,
-        "zstd raw literals body",
-      ))
-      let assert Ok(rest) =
-        bit_array.slice(bytes, size, bit_array.byte_size(bytes) - size)
-      Ok(#(chunk, rest))
+      split_or_error(bytes, size, "zstd raw literals body")
     }
-  }
-}
-
-fn zstd_repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> zstd_repeat_byte(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 
@@ -4195,15 +4059,15 @@ fn prepend_bytes(chunk: BitArray, acc: List(Int)) -> List(Int) {
 }
 
 fn append_remaining_literals(ctx: SeqContext) -> BitArray {
-  let remaining = bit_array.byte_size(ctx.literals) - ctx.literal_pos
-  let assert Ok(tail) =
-    bit_array.slice(ctx.literals, ctx.literal_pos, remaining)
+  // `literal_pos` only moves past literals that were there, so it is
+  // never past the end.
+  let #(_, tail) = bytes.split_at(ctx.literals, ctx.literal_pos)
   // ctx.output_rev now contains the previous blocks' bytes plus
   // this block's bytes (most-recent first).  Trim the tail bytes
   // that belong to previous blocks so we return only this block's
   // payload.
   let this_block_rev = list_drop_tail(ctx.output_rev, ctx.output_prev_size)
-  let prefix = reverse_list_to_bit_array(this_block_rev, <<>>)
+  let prefix = bytes.from_reversed_list(this_block_rev)
   bit_array.concat([prefix, tail])
 }
 
@@ -4218,23 +4082,14 @@ fn list_drop_tail(items: List(Int), n: Int) -> List(Int) {
   }
 }
 
-fn reverse_list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> reverse_list_to_bit_array(rest, <<head, acc:bits>>)
-  }
-}
-
 fn slice_or_error(
-  bytes: BitArray,
+  source: BitArray,
   offset: Int,
   length: Int,
   label: String,
 ) -> Result(BitArray, codec.CodecError) {
-  case bit_array.slice(bytes, offset, length) {
-    Ok(v) -> Ok(v)
-    Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
-  }
+  bytes.slice(source, offset, length)
+  |> result.replace_error(codec.InvalidData(message: "truncated " <> label))
 }
 
 fn slice_after(
@@ -4242,10 +4097,17 @@ fn slice_after(
   offset: Int,
   label: String,
 ) -> Result(BitArray, codec.CodecError) {
-  case bit_array.slice(bytes, offset, bit_array.byte_size(bytes) - offset) {
-    Ok(v) -> Ok(v)
-    Error(_) -> Error(codec.InvalidData(message: "truncated " <> label))
-  }
+  use #(_, rest) <- result.try(split_or_error(bytes, offset, label))
+  Ok(rest)
+}
+
+fn split_or_error(
+  source: BitArray,
+  count: Int,
+  label: String,
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
+  bytes.split(source, count)
+  |> result.replace_error(codec.InvalidData(message: "truncated " <> label))
 }
 
 fn decode_raw_block(
@@ -4274,15 +4136,8 @@ fn decode_rle_block(
   block_size: Int,
 ) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case bytes {
-    <<byte, rest:bytes>> -> Ok(#(repeat_byte(byte, block_size, <<>>), rest))
+    <<byte, rest:bytes>> -> Ok(#(bytes.repeat(byte, block_size), rest))
     _ -> Error(codec.InvalidData(message: "truncated zstd RLE block"))
-  }
-}
-
-fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 

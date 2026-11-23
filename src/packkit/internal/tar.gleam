@@ -49,21 +49,10 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(archive.Archive, archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(archive.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(entry.check_input(bytes, limits))
 
   decode_loop(bytes, [], 0, limits)
-  |> result.map(list.reverse)
-  |> result.map(archive.Archive(
-    format: archive.Tar,
-    entries: _,
-    comment: option.None,
-  ))
+  |> result.try(entry.finish(_, archive.Tar, limits))
 }
 
 type PendingOverride {
@@ -90,34 +79,31 @@ fn decode_loop_with_pending(
   limits: limit.Limits,
   pending: PendingOverride,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) < block_size,
-    return: Error(archive.InvalidData(
-      message: "tar stream ended before terminator blocks",
-    )),
-  )
-  let assert Ok(header_bits) = bit_array.slice(bytes, 0, block_size)
+  // Gleam 1.14 on JavaScript cannot use a module constant as a segment
+  // size, so it is bound to a local first.
+  let block_length = block_size
+  use header_bits <- result.try(case bytes {
+    <<header_bits:bytes-size(block_length), _:bytes>> -> Ok(header_bits)
+    _ ->
+      Error(archive.InvalidData(
+        message: "tar stream ended before terminator blocks",
+      ))
+  })
   // POSIX 1003.1 requires two consecutive zero blocks at end-of-archive;
   // a single zero block followed by truncation is malformed.
-  use <- bool.lazy_guard(when: is_zero_block(header_bits), return: fn() {
+  use <- bool.lazy_guard(when: bytes.all_zero(header_bits), return: fn() {
     verify_double_zero_terminator(bytes, acc)
   })
   use header <- result.try(parse_header(header_bits))
-  let body_padded = round_up_to_block(header.size)
-  let total_advance = block_size + body_padded
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) < total_advance,
-    return: Error(archive.InvalidData(
-      message: "tar entry body extends beyond the input",
-    )),
-  )
-  let assert Ok(rest) =
-    bit_array.slice(
-      bytes,
-      total_advance,
-      bit_array.byte_size(bytes) - total_advance,
-    )
-  dispatch_typeflag(bytes, rest, acc, count, limits, pending, header)
+  let total_advance = block_size + round_up_to_block(header.size)
+  case bytes {
+    <<_:bytes-size(total_advance), rest:bytes>> ->
+      dispatch_typeflag(bytes, rest, acc, count, limits, pending, header)
+    _ ->
+      Error(archive.InvalidData(
+        message: "tar entry body extends beyond the input",
+      ))
+  }
 }
 
 fn dispatch_typeflag(
@@ -177,7 +163,7 @@ fn dispatch_typeflag(
     }
     _ -> {
       let merged_header = apply_pending(header, pending)
-      use _ <- result.try(check_member_limit(count + 1, limits))
+      use _ <- result.try(entry.check_member_limit(count + 1, limits))
       use entry_value <- result.try(header_to_entry(
         merged_header,
         bytes,
@@ -213,15 +199,14 @@ fn apply_pending(
 /// Returns the raw bytes; the caller is responsible for parsing
 /// the "<length> <key>=<value>\n" records inside.
 fn read_pax_body(
-  bytes: BitArray,
+  source: BitArray,
   start: Int,
   size: Int,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(bytes, start, size) {
-    Ok(chunk) -> Ok(chunk)
-    Error(_) ->
-      Error(archive.InvalidData(message: "truncated tar PAX extended header"))
-  }
+  bytes.slice(source, start, size)
+  |> result.replace_error(archive.InvalidData(
+    message: "truncated tar PAX extended header",
+  ))
 }
 
 /// Walk a PAX extended-header body and lift the keys we know how
@@ -233,17 +218,7 @@ fn apply_pax_records(
   pending: PendingOverride,
   body: BitArray,
 ) -> PendingOverride {
-  case bit_array.to_string(body) {
-    Ok(text) -> apply_pax_records_loop(pending, text)
-    Error(_) -> pending
-  }
-}
-
-fn apply_pax_records_loop(
-  pending: PendingOverride,
-  text: String,
-) -> PendingOverride {
-  case extract_pax_record(text) {
+  case extract_pax_record(body) {
     Error(_) -> pending
     Ok(#(key, value, rest)) -> {
       let pending = case key {
@@ -251,31 +226,49 @@ fn apply_pax_records_loop(
         "linkpath" -> PendingOverride(..pending, linkname: value)
         _ -> pending
       }
-      apply_pax_records_loop(pending, rest)
+      apply_pax_records(pending, rest)
     }
   }
 }
 
-/// Parse one "<length> <key>=<value>\n" PAX record off the front
-/// of `text` and return (key, value, remaining_text).
-fn extract_pax_record(text: String) -> Result(#(String, String, String), Nil) {
-  use #(length_str, after_space) <- result.try(string.split_once(text, " "))
-  use length <- result.try(int.parse(length_str))
-  // The length is total bytes including the leading digits, the
-  // space, and the trailing \n.  We can recover the inner part
-  // as `length - (len(length_str) + 1) - 1` characters because
-  // length covers <length_str><space><key=value><\n>.
-  let head_size = string.length(length_str) + 1
-  let inner_size = length - head_size - 1
-  use <- bool.guard(when: inner_size < 0, return: Error(Nil))
-  case string.slice(after_space, 0, inner_size) {
-    "" -> Error(Nil)
-    body -> {
-      use #(key, value) <- result.try(string.split_once(body, "="))
-      let rest =
-        string.slice(after_space, inner_size + 1, string.length(after_space))
+/// Parse one "<length> <key>=<value>\n" PAX record off the front of
+/// `body` and return (key, value, rest). The length counts bytes, and
+/// covers the digits, the space and the newline.
+fn extract_pax_record(
+  body: BitArray,
+) -> Result(#(String, String, BitArray), Nil) {
+  use #(length, digits) <- result.try(pax_length(body, 0, 0))
+  let inner_size = length - digits - 2
+  use <- bool.guard(when: inner_size <= 0, return: Error(Nil))
+  case body {
+    <<
+      _:bytes-size(digits),
+      " ",
+      inner:bytes-size(inner_size),
+      "\n",
+      rest:bytes,
+    >> -> {
+      use #(key, value) <- result.try(
+        bit_array.to_string(inner) |> result.try(string.split_once(_, "=")),
+      )
       Ok(#(key, value, rest))
     }
+    _ -> Error(Nil)
+  }
+}
+
+// Reads the decimal length before the first space, and the number of
+// digits it took.
+fn pax_length(
+  body: BitArray,
+  acc: Int,
+  digits: Int,
+) -> Result(#(Int, Int), Nil) {
+  case body {
+    <<" ", _:bytes>> if digits > 0 -> Ok(#(acc, digits))
+    <<digit, rest:bytes>> if digit >= 0x30 && digit <= 0x39 ->
+      pax_length(rest, acc * 10 + digit - 0x30, digits + 1)
+    _ -> Error(Nil)
   }
 }
 
@@ -285,41 +278,13 @@ fn read_string_body(
   size: Int,
   label: String,
 ) -> Result(String, archive.ArchiveError) {
-  case bit_array.slice(bytes, start, size) {
-    Ok(chunk) -> {
-      // Drop a trailing NUL if present.
-      let trimmed_size = trim_trailing_nul_size(chunk, size)
-      let assert Ok(name_bits) = bit_array.slice(chunk, 0, trimmed_size)
-      case bit_array.to_string(name_bits) {
-        Ok(value) -> Ok(value)
-        Error(_) ->
-          Error(archive.InvalidData(
-            message: "tar " <> label <> " is not valid UTF-8",
-          ))
-      }
-    }
-    Error(_) -> Error(archive.InvalidData(message: "truncated tar " <> label))
-  }
-}
-
-fn trim_trailing_nul_size(bytes: BitArray, size: Int) -> Int {
-  case size {
-    0 -> 0
-    n ->
-      case bit_array.slice(bytes, n - 1, 1) {
-        Ok(<<0>>) -> trim_trailing_nul_size(bytes, n - 1)
-        _ -> n
-      }
-  }
-}
-
-fn check_member_limit(
-  count: Int,
-  limits: limit.Limits,
-) -> Result(Nil, archive.ArchiveError) {
-  case count > limits.max_members {
-    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
-    False -> Ok(Nil)
+  case bytes {
+    <<_:bytes-size(start), chunk:bytes-size(size), _:bytes>> ->
+      bit_array.to_string(bytes.strip_trailing_nul(chunk))
+      |> result.replace_error(archive.InvalidData(
+        message: "tar " <> label <> " is not valid UTF-8",
+      ))
+    _ -> Error(archive.InvalidData(message: "truncated tar " <> label))
   }
 }
 
@@ -393,7 +358,7 @@ fn header_to_entry(
       ))
   })
 
-  let name_for_depth = trim_trailing_slash(header.name)
+  let name_for_depth = entry.strip_trailing_slash(header.name)
   case entry.check_path(name_for_depth) {
     Ok(Nil) ->
       case entry.depth(name_for_depth) > limits.max_entry_depth {
@@ -432,7 +397,7 @@ fn regular_entry(
 fn directory_entry(
   header: ParsedHeader,
 ) -> Result(archive.Entry, archive.ArchiveError) {
-  entry.directory_checked(path: trim_trailing_slash(header.name))
+  entry.directory_checked(path: entry.strip_trailing_slash(header.name))
   |> result.map_error(entry.to_archive_error(_, header.name))
 }
 
@@ -526,7 +491,7 @@ fn build_header(
     "mtime",
   ))
 
-  let initial =
+  let before_checksum =
     bit_array.concat([
       name_field,
       mode_field,
@@ -534,7 +499,9 @@ fn build_header(
       gid_field,
       size_field,
       mtime_field,
-      checksum_blank_field(),
+    ])
+  let after_checksum =
+    bit_array.concat([
       <<typeflag>>,
       linkname_field,
       magic_field(),
@@ -546,18 +513,17 @@ fn build_header(
       prefix_field,
       tail_padding(),
     ])
-
-  let checksum_value = compute_checksum(initial)
-  let assert Ok(prefix_bits) = bit_array.slice(initial, 0, 148)
-  let assert Ok(suffix_bits) =
-    bit_array.slice(initial, 156, bit_array.byte_size(initial) - 156)
-  Ok(
-    bit_array.concat([
-      prefix_bits,
-      checksum_value_field(checksum_value),
-      suffix_bits,
-    ]),
-  )
+  let checksum_value =
+    compute_checksum(<<
+      before_checksum:bits,
+      checksum_blank_field():bits,
+      after_checksum:bits,
+    >>)
+  Ok(<<
+    before_checksum:bits,
+    checksum_value_field(checksum_value):bits,
+    after_checksum:bits,
+  >>)
 }
 
 fn split_name_field(
@@ -575,8 +541,8 @@ fn split_name_field(
   case size <= name_size {
     True ->
       Ok(#(
-        right_pad(canonical_bytes, name_size, 0),
-        right_pad(<<>>, prefix_size, 0),
+        bytes.pad_end(canonical_bytes, name_size, 0),
+        bytes.pad_end(<<>>, prefix_size, 0),
       ))
     False -> attempt_prefix_split(canonical, size)
   }
@@ -597,8 +563,8 @@ fn attempt_prefix_split(
       case find_prefix_split(segments) {
         Some(#(prefix, rest)) ->
           Ok(#(
-            right_pad(bit_array.from_string(rest), name_size, 0),
-            right_pad(bit_array.from_string(prefix), prefix_size, 0),
+            bytes.pad_end(bit_array.from_string(rest), name_size, 0),
+            bytes.pad_end(bit_array.from_string(prefix), prefix_size, 0),
           ))
         None ->
           Error(archive.EntryRejected(
@@ -676,7 +642,7 @@ fn fit_field(
         path: value,
         reason: kind <> " longer than " <> int.to_string(width) <> " bytes",
       ))
-    False -> Ok(right_pad(bytes, width, 0))
+    False -> Ok(bytes.pad_end(bytes, width, 0))
   }
 }
 
@@ -718,7 +684,7 @@ fn pow_int_loop(base: Int, exponent: Int, acc: Int) -> Int {
 }
 
 fn checksum_blank_field() -> BitArray {
-  byte_repeat(0x20, 8)
+  bytes.repeat(0x20, 8)
 }
 
 fn checksum_value_field(value: Int) -> BitArray {
@@ -728,7 +694,7 @@ fn checksum_value_field(value: Int) -> BitArray {
 
 fn magic_field() -> BitArray {
   bit_array.from_string("ustar")
-  |> right_pad(6, 0)
+  |> bytes.pad_end(6, 0)
 }
 
 fn version_field() -> BitArray {
@@ -736,11 +702,11 @@ fn version_field() -> BitArray {
 }
 
 fn uname_field() -> BitArray {
-  byte_repeat(0, 32)
+  bytes.repeat(0, 32)
 }
 
 fn gname_field() -> BitArray {
-  byte_repeat(0, 32)
+  bytes.repeat(0, 32)
 }
 
 fn devmajor_field() -> BitArray {
@@ -752,46 +718,24 @@ fn devminor_field() -> BitArray {
 }
 
 fn tail_padding() -> BitArray {
-  byte_repeat(0, 12)
+  bytes.repeat(0, 12)
 }
 
 fn end_marker() -> BitArray {
-  byte_repeat(0, block_size * 2)
+  bytes.repeat(0, block_size * 2)
 }
 
 fn pad_to_block(body: BitArray) -> BitArray {
   let size = bit_array.byte_size(body)
   let padded_size = round_up_to_block(size)
   let padding = padded_size - size
-  bit_array.concat([body, byte_repeat(0, padding)])
+  bit_array.concat([body, bytes.repeat(0, padding)])
 }
 
 fn round_up_to_block(size: Int) -> Int {
   case size % block_size {
     0 -> size
     rem -> size + { block_size - rem }
-  }
-}
-
-fn right_pad(value: BitArray, width: Int, fill: Int) -> BitArray {
-  let size = bit_array.byte_size(value)
-  case size >= width {
-    True -> {
-      let assert Ok(slice) = bit_array.slice(value, 0, width)
-      slice
-    }
-    False -> bit_array.concat([value, byte_repeat(fill, width - size)])
-  }
-}
-
-fn byte_repeat(byte: Int, count: Int) -> BitArray {
-  byte_repeat_loop(byte, count, <<>>)
-}
-
-fn byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 
@@ -897,20 +841,13 @@ fn read_byte(
   }
 }
 
-fn trim_trailing_slash(value: String) -> String {
-  case string.ends_with(value, "/") {
-    True -> string.drop_end(value, 1)
-    False -> value
-  }
-}
-
 fn verify_double_zero_terminator(
   bytes: BitArray,
   acc: List(archive.Entry),
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
   case bit_array.slice(bytes, block_size, block_size) {
     Ok(second) ->
-      case is_zero_block(second) {
+      case bytes.all_zero(second) {
         True -> Ok(acc)
         False ->
           Error(archive.InvalidData(
@@ -921,13 +858,5 @@ fn verify_double_zero_terminator(
       Error(archive.InvalidData(
         message: "tar stream ended after a single zero block",
       ))
-  }
-}
-
-fn is_zero_block(block: BitArray) -> Bool {
-  case block {
-    <<>> -> True
-    <<0, rest:bytes>> -> is_zero_block(rest)
-    _ -> False
   }
 }

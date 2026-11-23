@@ -128,6 +128,10 @@ pub fn decompress_with_limits(
         when: size > limits.max_input_bytes,
         return: Error(LimitExceeded(limit: "max_input_bytes", actual: size)),
       )
+      use <- bool.guard(
+        when: size > limits.max_output_bytes,
+        return: Error(LimitExceeded(limit: "max_output_bytes", actual: size)),
+      )
       Ok(bytes)
     }
     Deflate -> deflate.decode_with_limits(bytes:, limits:)

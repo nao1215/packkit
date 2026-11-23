@@ -71,13 +71,7 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   decode_streams_loop(bytes, <<>>, 0, limits)
 }
@@ -1064,7 +1058,7 @@ fn walk_bwt(
 fn rle1_decode(input: dict.Dict(Int, Int), length: Int) -> BitArray {
   rle1_decode_loop(input, 0, length, -1, 0, [])
   |> list.reverse
-  |> bytes_list_to_bit_array(<<>>)
+  |> bytes.from_list
 }
 
 fn rle1_decode_loop(
@@ -1100,13 +1094,6 @@ fn rle1_decode_loop(
         }
       }
     }
-  }
-}
-
-fn bytes_list_to_bit_array(bytes: List(Int), acc: BitArray) -> BitArray {
-  case bytes {
-    [] -> acc
-    [head, ..rest] -> bytes_list_to_bit_array(rest, <<acc:bits, head>>)
   }
 }
 
@@ -1931,12 +1918,5 @@ fn flush_writer_msb(writer: Writer) -> BitArray {
       Writer(bytes_rev: [byte, ..writer.bytes_rev], buffer: 0, bits: 0)
     }
   }
-  list_to_bit_array(list.reverse(writer.bytes_rev), <<>>)
-}
-
-fn list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> list_to_bit_array(rest, <<acc:bits, head>>)
-  }
+  bytes.from_reversed_list(writer.bytes_rev)
 }

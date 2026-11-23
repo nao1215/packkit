@@ -1,26 +1,7 @@
 import gleam/dict
 import gleam/int
-import gleam/list
 import gleeunit/should
 import packkit/internal/fse
-
-pub fn predefined_literal_length_total_test() -> Nil {
-  // Predefined literal-length distribution must sum to (1 << 6) = 64.
-  distribution_total(fse.predefined_literal_length())
-  |> should.equal(64)
-}
-
-pub fn predefined_match_length_total_test() -> Nil {
-  // Predefined match-length distribution must sum to (1 << 6) = 64.
-  distribution_total(fse.predefined_match_length())
-  |> should.equal(64)
-}
-
-pub fn predefined_offset_total_test() -> Nil {
-  // Predefined offset distribution must sum to (1 << 5) = 32.
-  distribution_total(fse.predefined_offset())
-  |> should.equal(32)
-}
 
 pub fn literal_length_table_size_test() -> Nil {
   fse.predefined_literal_length_table()
@@ -115,20 +96,9 @@ pub fn offset_table_covers_all_symbols_test() -> Nil {
     dict.fold(table, dict.new(), fn(acc, _state, entry) {
       dict.insert(acc, entry.symbol, True)
     })
-  let expected_symbols = list.length(fse.predefined_offset())
+  // RFC 8878 section 3.1.1.3.2.2.3: 29 offset codes.
   dict.size(symbols_in_table)
-  |> should.equal(expected_symbols)
-}
-
-// Sum a normalized distribution, counting each -1 (less-than-one
-// probability) cell as one state.
-fn distribution_total(normalized: List(Int)) -> Int {
-  list.fold(normalized, 0, fn(acc, n) {
-    case n {
-      -1 -> acc + 1
-      v -> acc + v
-    }
-  })
+  |> should.equal(29)
 }
 
 fn state_count(accuracy_log: Int) -> Int {

@@ -18,6 +18,7 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
+import packkit/internal/bytes
 
 const mask32: Int = 0xFFFFFFFF
 
@@ -34,7 +35,7 @@ pub fn x86_decode(
   case total < 5 {
     True -> bytes
     False -> {
-      let byte_list = bit_array_to_byte_list(bytes, [])
+      let byte_list = bytes.to_list(bytes)
       let initial =
         X86State(
           // The reference initialises prev_pos to "now_pos - 5" so
@@ -46,7 +47,7 @@ pub fn x86_decode(
       let limit = total - 5
       let decoded =
         x86_decode_loop(byte_list, 0, limit, start_offset, initial, [])
-      byte_list_to_bit_array(decoded, <<>>)
+      bytes.from_list(decoded)
     }
   }
 }
@@ -780,20 +781,6 @@ fn arm_decode_words(
   }
 }
 
-fn bit_array_to_byte_list(bytes: BitArray, acc: List(Int)) -> List(Int) {
-  case bytes {
-    <<b, rest:bytes>> -> bit_array_to_byte_list(rest, [b, ..acc])
-    _ -> list.reverse(acc)
-  }
-}
-
-fn byte_list_to_bit_array(bytes: List(Int), acc: BitArray) -> BitArray {
-  case bytes {
-    [] -> acc
-    [b, ..rest] -> byte_list_to_bit_array(rest, <<acc:bits, b>>)
-  }
-}
-
 // ---------- IA-64 (Itanium) BCJ ----------
 
 /// Decode an IA-64 BCJ-encoded byte sequence.  IA-64 bundles three
@@ -855,9 +842,9 @@ fn ia64_decode_bundle(bundle: BitArray, now_pos: Int) -> BitArray {
       case mask {
         0 -> bundle
         _ -> {
-          let byte_list = bit_array_to_byte_list(bundle, [])
+          let byte_list = bytes.to_list(bundle)
           let updated = ia64_process_slots(byte_list, mask, 0, 5, now_pos)
-          byte_list_to_bit_array(updated, <<>>)
+          bytes.from_list(updated)
         }
       }
     }
@@ -1043,9 +1030,9 @@ pub fn riscv_decode(
   case total < 8 {
     True -> bytes
     False -> {
-      let byte_list = bit_array_to_byte_list(bytes, [])
+      let byte_list = bytes.to_list(bytes)
       let decoded = riscv_decode_loop(byte_list, 0, total - 8, aligned_start)
-      byte_list_to_bit_array(decoded, <<>>)
+      bytes.from_list(decoded)
     }
   }
 }
@@ -1274,4 +1261,31 @@ fn le32_bytes(value: Int) -> List(Int) {
     int.bitwise_and(int.bitwise_shift_right(masked, 16), 0xFF),
     int.bitwise_and(int.bitwise_shift_right(masked, 24), 0xFF),
   ]
+}
+
+// ---------- Delta ----------
+
+/// Decodes the Delta filter of xz and 7z: each byte is added to the
+/// byte `distance` places before it in the output, modulo 256. The first
+/// `distance` bytes pass through unchanged.
+pub fn delta_decode(input: BitArray, distance: Int) -> BitArray {
+  delta_loop(input, distance, <<>>)
+}
+
+fn delta_loop(input: BitArray, distance: Int, output: BitArray) -> BitArray {
+  let start = bit_array.byte_size(output) - distance
+  case input, start >= 0 {
+    <<byte, rest:bytes>>, True ->
+      case output {
+        <<_:bytes-size(start), previous, _:bytes>> ->
+          delta_loop(rest, distance, <<
+            output:bits,
+            int.bitwise_and(byte + previous, 0xFF),
+          >>)
+        _ -> delta_loop(rest, distance, <<output:bits, byte>>)
+      }
+    <<byte, rest:bytes>>, False ->
+      delta_loop(rest, distance, <<output:bits, byte>>)
+    _, _ -> output
+  }
 }

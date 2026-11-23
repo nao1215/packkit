@@ -7,7 +7,6 @@
 //// literal context for a byte position is
 //// `lookup[mode*512 + P1] | lookup[mode*512 + 256 + P2]`.
 
-import gleam/bit_array
 import gleam/int
 
 const lookup: BitArray = <<
@@ -2072,9 +2071,8 @@ pub fn context_id(mode: Int, prev1: Int, prev2: Int) -> Int {
 }
 
 fn byte_at(offset: Int) -> Int {
-  let assert Ok(slice) = bit_array.slice(lookup, offset, 1)
-  case slice {
-    <<b>> -> b
+  case lookup {
+    <<_:bytes-size(offset), b, _:bytes>> -> b
     _ -> 0
   }
 }

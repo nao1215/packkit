@@ -25,6 +25,7 @@ import gleam/order
 import gleam/result
 import packkit/codec
 import packkit/internal/bytes
+import packkit/internal/lz77
 import packkit/limit
 
 const max_bits: Int = 15
@@ -44,13 +45,7 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   let reader = Reader(buffer: 0, bits: 0, source: bytes, overflow: False)
   case inflate(reader, <<>>, limits) {
@@ -72,13 +67,7 @@ pub fn decode_with_remainder(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(#(BitArray, BitArray), codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   let reader = Reader(buffer: 0, bits: 0, source: bytes, overflow: False)
   use #(output, final_reader) <- result.try(inflate(reader, <<>>, limits))
@@ -476,13 +465,9 @@ fn inflate_fixed(
   output: BitArray,
   limits: limit.Limits,
 ) -> Result(#(BitArray, Reader), codec.CodecError) {
-  inflate_huffman_block(
-    reader,
-    output,
-    fixed_literal_tree(),
-    fixed_distance_tree(),
-    limits,
-  )
+  use ltree <- result.try(build_tree(build_fixed_literal_lengths()))
+  use dtree <- result.try(build_tree(list.repeat(5, 32)))
+  inflate_huffman_block(reader, output, ltree, dtree, limits)
 }
 
 fn inflate_dynamic(
@@ -766,52 +751,10 @@ fn apply_backref(
     when: distance <= 0 || distance > size,
     return: Error(codec.InvalidData(message: "back-reference out of range")),
   )
-
-  case distance >= length {
-    True -> {
-      let assert Ok(chunk) = bit_array.slice(output, size - distance, length)
-      bytes.append_with_limit(output, chunk, limits)
-    }
-    False -> apply_backref_byte_by_byte(output, distance, length, limits)
-  }
-}
-
-fn apply_backref_byte_by_byte(
-  output: BitArray,
-  distance: Int,
-  length: Int,
-  limits: limit.Limits,
-) -> Result(BitArray, codec.CodecError) {
-  case length {
-    0 -> Ok(output)
-    _ -> {
-      let size = bit_array.byte_size(output)
-      let assert Ok(byte_slice) = bit_array.slice(output, size - distance, 1)
-      use new_output <- result.try(bytes.append_with_limit(
-        output,
-        byte_slice,
-        limits,
-      ))
-      apply_backref_byte_by_byte(new_output, distance, length - 1, limits)
-    }
-  }
+  bytes.copy_back(output, distance, length, limits)
 }
 
 // -- fixed huffman tables -----------------------------------------------
-
-fn fixed_literal_tree() -> Tree {
-  let lengths = build_fixed_literal_lengths()
-  // Reusing the canonical builder keeps the symbol order consistent
-  // with dynamically-built trees.
-  let assert Ok(tree) = build_tree(lengths)
-  tree
-}
-
-fn fixed_distance_tree() -> Tree {
-  let lengths = list.repeat(5, 32)
-  let assert Ok(tree) = build_tree(lengths)
-  tree
-}
 
 fn build_fixed_literal_lengths() -> List(Int) {
   // 0..143:   length 8
@@ -982,7 +925,7 @@ fn encode_huffman(bytes: BitArray) -> BitArray {
       flush_writer(writer)
     }
     _ -> {
-      let byte_table = build_byte_table(bytes, 0, dict.new())
+      let byte_table = lz77.table(bytes)
       let writer =
         new_writer()
         |> write_bits(1, 1)
@@ -992,35 +935,6 @@ fn encode_huffman(bytes: BitArray) -> BitArray {
       flush_writer(writer)
     }
   }
-}
-
-fn build_byte_table(
-  bytes: BitArray,
-  index: Int,
-  acc: dict.Dict(Int, Int),
-) -> dict.Dict(Int, Int) {
-  case bytes {
-    <<b, rest:bytes>> ->
-      build_byte_table(rest, index + 1, dict.insert(acc, index, b))
-    _ -> acc
-  }
-}
-
-fn byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
-  case dict.get(table, index) {
-    Ok(value) -> value
-    Error(_) -> 0
-  }
-}
-
-fn hash3(b0: Int, b1: Int, b2: Int) -> Int {
-  int.bitwise_and(
-    int.bitwise_exclusive_or(
-      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
-      b2 * 2_246_822_519,
-    ),
-    0xFFFF,
-  )
 }
 
 fn emit_lz77(
@@ -1035,14 +949,15 @@ fn emit_lz77(
     False ->
       case pos + min_match_length > size {
         True -> {
-          let writer = write_fixed_literal_code(writer, byte_at(table, pos))
+          let writer =
+            write_fixed_literal_code(writer, lz77.table_at(table, pos))
           emit_lz77(table, size, pos + 1, hashes, writer)
         }
         False -> {
-          let b0 = byte_at(table, pos)
-          let b1 = byte_at(table, pos + 1)
-          let b2 = byte_at(table, pos + 2)
-          let key = hash3(b0, b1, b2)
+          let b0 = lz77.table_at(table, pos)
+          let b1 = lz77.table_at(table, pos + 1)
+          let b2 = lz77.table_at(table, pos + 2)
+          let key = lz77.hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) -> {
               let writer = write_fixed_literal_code(writer, b0)
@@ -1114,7 +1029,9 @@ fn match_length(
   case acc >= max || cursor + acc >= size {
     True -> acc
     False ->
-      case byte_at(table, base + acc) == byte_at(table, cursor + acc) {
+      case
+        lz77.table_at(table, base + acc) == lz77.table_at(table, cursor + acc)
+      {
         True -> match_length(table, base, cursor, size, max, acc + 1)
         False -> acc
       }
@@ -1132,10 +1049,10 @@ fn insert_hashes_in_range(
     True -> hashes
     False -> {
       let key =
-        hash3(
-          byte_at(table, from),
-          byte_at(table, from + 1),
-          byte_at(table, from + 2),
+        lz77.hash3(
+          lz77.table_at(table, from),
+          lz77.table_at(table, from + 1),
+          lz77.table_at(table, from + 2),
         )
       insert_hashes_in_range(
         table,
@@ -1309,14 +1226,7 @@ fn flush_writer(writer: Writer) -> BitArray {
         bits: 0,
       )
   }
-  list_to_bit_array(list.reverse(writer.bytes), <<>>)
-}
-
-fn list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> list_to_bit_array(rest, <<acc:bits, head>>)
-  }
+  bytes.from_reversed_list(writer.bytes)
 }
 
 // -- small list helpers --------------------------------------------------
@@ -1382,7 +1292,7 @@ fn encode_dynamic_or_fixed(bytes: BitArray) -> BitArray {
   case size {
     0 -> empty_dynamic_block()
     _ -> {
-      let table = build_byte_table(bytes, 0, dict.new())
+      let table = lz77.table(bytes)
       let tokens = collect_lz77_tokens(table, size, 0, dict.new(), [])
       case build_dynamic_block(tokens) {
         Ok(bytes) -> bytes
@@ -1420,14 +1330,14 @@ fn collect_lz77_tokens(
       case pos + min_match_length > size {
         True ->
           collect_lz77_tokens(table, size, pos + 1, hashes, [
-            TokLit(byte_at(table, pos)),
+            TokLit(lz77.table_at(table, pos)),
             ..acc
           ])
         False -> {
-          let b0 = byte_at(table, pos)
-          let b1 = byte_at(table, pos + 1)
-          let b2 = byte_at(table, pos + 2)
-          let key = hash3(b0, b1, b2)
+          let b0 = lz77.table_at(table, pos)
+          let b1 = lz77.table_at(table, pos + 1)
+          let b2 = lz77.table_at(table, pos + 2)
+          let key = lz77.hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) ->
               collect_lz77_tokens(

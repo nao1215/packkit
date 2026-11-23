@@ -1,14 +1,5 @@
-//// Pure-Gleam implementation of the xxHash32 algorithm.
-////
-//// Only the variant required by the LZ4 frame format is exposed:
-//// `digest(bytes, seed)` returns the 32-bit hash as a non-negative
-//// `Int`.  LZ4 frame headers are always shorter than 16 bytes
-//// (FLG + BD + at most an 8-byte content size + an optional 4-byte
-//// dictionary id = 14 bytes maximum), so this implementation
-//// covers only the "short input" branch of xxHash32.  Adding
-//// support for longer inputs would require the 16-byte block
-//// loop; until a caller actually needs it, keeping the surface
-//// small means there is less untested code to drift.
+//// Pure-Gleam implementation of the xxHash32 algorithm, used by the LZ4
+//// frame format for the header, block and content checksums.
 ////
 //// The arithmetic is split into 16-bit halves so partial products
 //// stay within the 53-bit safe-integer range that the JavaScript
@@ -29,22 +20,55 @@ const prime4: Int = 0x27D4EB2F
 
 const prime5: Int = 0x165667B1
 
-/// Compute the xxHash32 of a short (< 16 byte) input.  Inputs of
-/// 16 bytes or more are clamped to their leading 15 bytes — there
-/// is no production caller that ever passes more than 14 bytes,
-/// so clamping is preferable to crashing.  Callers that genuinely
-/// need long-input support should extend this module with the
-/// 16-byte block loop.
+/// Computes the xxHash32 of `bytes` as a non-negative `Int`.
 pub fn digest(bytes bytes: BitArray, seed seed: Int) -> Int {
   let total = bit_array.byte_size(bytes)
-  let #(slice, slice_len) = case bit_array.slice(bytes, 0, 15) {
-    Ok(prefix) if total >= 16 -> #(prefix, 15)
-    _ -> #(bytes, total)
+  let #(h, tail) = case total >= 16 {
+    True -> {
+      let lanes =
+        stripes(
+          bytes,
+          add32(add32(seed, prime1), prime2),
+          add32(seed, prime2),
+          int.bitwise_and(seed, mask32),
+          add32(seed, mask32 + 1 - prime1),
+        )
+      #(lanes.0, lanes.1)
+    }
+    False -> #(add32(seed, prime5), bytes)
   }
-  let initial = add32(seed, prime5)
-  let with_length = add32(initial, slice_len)
-  let after_tail = mix_tail(slice, with_length)
-  avalanche(after_tail)
+  avalanche(mix_tail(tail, add32(h, total)))
+}
+
+// Consumes 16-byte stripes into four accumulators, then merges them.
+fn stripes(
+  bytes: BitArray,
+  v1: Int,
+  v2: Int,
+  v3: Int,
+  v4: Int,
+) -> #(Int, BitArray) {
+  case bytes {
+    <<
+      a:size(32)-little,
+      b:size(32)-little,
+      c:size(32)-little,
+      d:size(32)-little,
+      rest:bytes,
+    >> -> stripes(rest, round(v1, a), round(v2, b), round(v3, c), round(v4, d))
+    _ -> {
+      let merged =
+        add32(
+          add32(rotl32(v1, 1), rotl32(v2, 7)),
+          add32(rotl32(v3, 12), rotl32(v4, 18)),
+        )
+      #(merged, bytes)
+    }
+  }
+}
+
+fn round(acc: Int, lane: Int) -> Int {
+  mul32(rotl32(add32(acc, mul32(lane, prime2)), 13), prime1)
 }
 
 fn mix_tail(bytes: BitArray, h: Int) -> Int {

@@ -1,12 +1,14 @@
 //// Checks shared by the archive readers and writers: entry paths must be
 //// relative and safe to extract, and metadata must not be negative.
 
+import gleam/bit_array
 import gleam/bool
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import packkit/archive.{type Archive, type ArchiveError, type Entry, Entry}
+import packkit/limit.{type Limits}
 
 /// Why a path or link target was rejected.
 pub type EntryError {
@@ -165,5 +167,60 @@ pub fn reject_comment(archive: Archive) -> Result(Nil, ArchiveError) {
   case archive.comment {
     None -> Ok(Nil)
     Some(_) -> Error(archive.CommentUnsupported(format: archive.format))
+  }
+}
+
+/// Builds the archive a reader returns from its entries in reverse order,
+/// after checking that the file bodies together fit in
+/// `max_output_bytes`. The tar, cpio and ar readers slice the bodies out
+/// of the input, so the check runs once at the end.
+pub fn finish(
+  reversed: List(Entry),
+  format: archive.ArchiveFormat,
+  limits: Limits,
+) -> Result(Archive, ArchiveError) {
+  let total =
+    list.fold(reversed, 0, fn(total, entry) {
+      total + bit_array.byte_size(body(entry))
+    })
+  use <- bool.guard(
+    when: total > limits.max_output_bytes,
+    return: Error(archive.LimitExceeded(
+      limit: "max_output_bytes",
+      actual: total,
+    )),
+  )
+  Ok(archive.Archive(format:, entries: list.reverse(reversed), comment: None))
+}
+
+/// Returns `LimitExceeded` when a reader is about to keep its
+/// `count`-th entry and `count` is over `max_members`.
+pub fn check_member_limit(
+  count: Int,
+  limits: Limits,
+) -> Result(Nil, ArchiveError) {
+  use <- bool.guard(
+    when: count > limits.max_members,
+    return: Error(archive.LimitExceeded(limit: "max_members", actual: count)),
+  )
+  Ok(Nil)
+}
+
+/// Drops one trailing `/`, which tar and ZIP put after directory names.
+pub fn strip_trailing_slash(path: String) -> String {
+  use <- bool.guard(when: !string.ends_with(path, "/"), return: path)
+  string.drop_end(path, 1)
+}
+
+/// Returns `LimitExceeded` when the archive is larger than
+/// `max_input_bytes`.
+pub fn check_input(
+  input: BitArray,
+  limits: Limits,
+) -> Result(Nil, ArchiveError) {
+  let size = bit_array.byte_size(input)
+  case size > limits.max_input_bytes {
+    True -> Error(archive.LimitExceeded(limit: "max_input_bytes", actual: size))
+    False -> Ok(Nil)
   }
 }

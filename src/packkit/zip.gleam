@@ -16,6 +16,7 @@ import gleam/string
 import packkit/archive
 import packkit/codec
 import packkit/internal/aes
+import packkit/internal/bytes
 import packkit/internal/bzip2
 import packkit/internal/checksum
 import packkit/internal/deflate
@@ -343,13 +344,7 @@ fn decode_internal(
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(archive.Archive, archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(archive.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(entry.check_input(bytes, limits))
 
   use eocd_offset <- result.try(locate_eocd(bytes))
   use eocd <- result.try(read_eocd(bytes, eocd_offset))
@@ -1296,7 +1291,7 @@ fn parse_central_directory(
         )),
       )
 
-      let cleaned_name = strip_trailing_slash(name)
+      let cleaned_name = entry.strip_trailing_slash(name)
       let depth = path_depth(cleaned_name)
       use <- bool.guard(
         when: depth > limits.max_entry_depth,
@@ -1573,7 +1568,7 @@ fn read_local_entry(
 
   case is_directory {
     True ->
-      entry.directory_checked(path: strip_trailing_slash(name))
+      entry.directory_checked(path: entry.strip_trailing_slash(name))
       |> result.map_error(entry.to_archive_error(_, name))
       |> result.map(apply_metadata)
     False ->
@@ -2094,13 +2089,6 @@ fn encode_pkware_lzma(plain: BitArray) -> BitArray {
   bit_array.concat([preamble, <<prop_byte>>, dict_size_bytes, stream])
 }
 
-fn strip_trailing_slash(value: String) -> String {
-  case string.ends_with(value, "/") {
-    True -> string.drop_end(value, 1)
-    False -> value
-  }
-}
-
 fn path_depth(name: String) -> Int {
   case name {
     "" -> 0
@@ -2130,14 +2118,14 @@ fn codec_to_archive_error(
 }
 
 fn slice_or_error(
-  bytes: BitArray,
+  source: BitArray,
   offset: Int,
   width: Int,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(bytes, offset, width) {
-    Ok(value) -> Ok(value)
-    Error(_) -> Error(archive.InvalidData(message: "ZIP slice out of bounds"))
-  }
+  bytes.slice(source, offset, width)
+  |> result.replace_error(archive.InvalidData(
+    message: "ZIP slice out of bounds",
+  ))
 }
 
 fn bytes_to_string(bytes: BitArray) -> Result(String, archive.ArchiveError) {

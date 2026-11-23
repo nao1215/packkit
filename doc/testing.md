@@ -6,6 +6,12 @@
 
 `test/packkit/<format>_test.gleam` checks each codec and archive format (tar, zip, 7z, ar, cpio, gzip, zstd, xz, bzip2, lz4, snappy, brotli, LZW) against hand-made and specification inputs, including malformed and truncated streams and resource limits. `test/packkit/readme_examples_test.gleam` runs the README examples.
 
+## Limits and malformed input
+
+`test/packkit/limits_matrix_test.gleam` reads a valid archive with every reader, ZIP method and 7z method and encryption mode, and a valid stream with every codec, with one field of `Limits` set just below what the input needs, and expects `LimitExceeded` naming that field. `test/packkit/length_field_test.gleam` and `unsafe_path_read_test.gleam` feed hand-made headers with negative, oversized or inconsistent length fields and paths with `..`, and `checksum_verification_test.gleam` flips bytes covered by the LZ4 and Snappy checksums.
+
+`test/packkit/mutation_fuzz_test.gleam` starts from valid streams and archives for every decoder, applies one to four random edits (flipped bytes, truncation, inserted bytes, 32-bit fields overwritten with values such as `0xFFFFFFFF`, deleted runs) and checks that the decoder returns a `Result` within the limits: no panic or hang, no output over `max_output_bytes`, no more entries than `max_members`, and only safe paths within the name and depth limits. It uses metamon, so it draws a new seed on every run and the nightly job runs it with ten times the cases.
+
 ## Generated properties
 
 `test/packkit/property_test.gleam` uses metamon: every codec decodes what it encodes, the tar and zip recipes round-trip random entries, `entry_by_path` agrees with a linear search, and the cumulative output limit holds across multi-member streams.

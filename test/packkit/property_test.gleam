@@ -92,18 +92,6 @@ pub fn property_snappy_round_trip_test() -> Nil {
   )
 }
 
-pub fn property_snappy_raw_round_trip_test() -> Nil {
-  metamon.forall_round_trip(
-    gen: bytes_gen(),
-    name: "snappy_raw",
-    encode: fn(b) {
-      let assert Ok(out) = snappy.raw_encode(bytes: b)
-      out
-    },
-    decode: snappy.raw_decode,
-  )
-}
-
 pub fn property_bzip2_round_trip_test() -> Nil {
   metamon.forall_round_trip(
     gen: bytes_gen(),

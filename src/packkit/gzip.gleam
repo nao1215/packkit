@@ -10,6 +10,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import packkit/codec
+import packkit/internal/bytes
 import packkit/internal/checksum
 import packkit/internal/deflate
 import packkit/limit
@@ -268,13 +269,7 @@ pub fn decode(
   bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(Decoded, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   decode_first_member_and_continue(bytes, limits)
 }
@@ -427,20 +422,12 @@ fn maybe_read_extra(
     0 -> Ok(#(bytes, []))
     _ ->
       case bytes {
-        <<xlen:size(16)-little, rest:bytes>> ->
-          case bit_array.byte_size(rest) < xlen {
-            True ->
-              Error(codec.InvalidData(message: "gzip extra field truncated"))
-            False -> {
-              let assert Ok(extra_bytes) = bit_array.slice(rest, 0, xlen)
-              let assert Ok(after) =
-                bit_array.slice(rest, xlen, bit_array.byte_size(rest) - xlen)
-              use subfields <- result.try(
-                parse_extra_subfields(extra_bytes, []),
-              )
-              Ok(#(after, list.reverse(subfields)))
-            }
-          }
+        <<xlen:size(16)-little, extra_bytes:bytes-size(xlen), after:bytes>> -> {
+          use subfields <- result.try(parse_extra_subfields(extra_bytes, []))
+          Ok(#(after, list.reverse(subfields)))
+        }
+        <<_:size(16), _:bytes>> ->
+          Error(codec.InvalidData(message: "gzip extra field truncated"))
         _ -> Error(codec.InvalidData(message: "gzip extra header truncated"))
       }
   }
@@ -454,22 +441,19 @@ fn parse_extra_subfields(
     0 -> Ok(acc)
     _ ->
       case bytes {
-        <<id_1, id_2, len:size(16)-little, rest:bytes>> ->
-          case bit_array.byte_size(rest) < len {
-            True ->
-              Error(codec.InvalidData(
-                message: "gzip extra subfield body truncated",
-              ))
-            False -> {
-              let assert Ok(data) = bit_array.slice(rest, 0, len)
-              let assert Ok(remaining) =
-                bit_array.slice(rest, len, bit_array.byte_size(rest) - len)
-              parse_extra_subfields(remaining, [
-                Subfield(id_1: id_1, id_2: id_2, data: data),
-                ..acc
-              ])
-            }
-          }
+        <<
+          id_1,
+          id_2,
+          len:size(16)-little,
+          data:bytes-size(len),
+          remaining:bytes,
+        >> ->
+          parse_extra_subfields(remaining, [
+            Subfield(id_1: id_1, id_2: id_2, data: data),
+            ..acc
+          ])
+        <<_, _, _:size(16), _:bytes>> ->
+          Error(codec.InvalidData(message: "gzip extra subfield body truncated"))
         _ ->
           Error(codec.InvalidData(
             message: "gzip extra subfield header truncated",
@@ -497,10 +481,15 @@ fn maybe_read_string(
     _ ->
       case split_at_nul(bytes, 0) {
         Ok(#(string_bits, after)) -> {
-          let decoded = case bit_array.to_string(string_bits) {
-            Ok(value) -> value
-            Error(_) -> latin1_decode(string_bits, "")
-          }
+          use decoded <- result.try(
+            bit_array.to_string(string_bits)
+            // Latin-1 maps every byte to a code point, so this always
+            // succeeds and the error below is not reached.
+            |> result.lazy_or(fn() { latin1_decode(string_bits, <<>>) })
+            |> result.replace_error(codec.InvalidData(
+              message: "gzip header string is not text",
+            )),
+          )
           Ok(#(after, Some(decoded)))
         }
         Error(err) -> Error(err)
@@ -508,29 +497,17 @@ fn maybe_read_string(
   }
 }
 
-fn latin1_decode(bytes: BitArray, acc: String) -> String {
+// RFC 1952 uses ISO 8859-1, which maps each byte to the code point with
+// the same value. Bytes from 0x80 take two bytes in UTF-8.
+fn latin1_decode(bytes: BitArray, acc: BitArray) -> Result(String, Nil) {
   case bytes {
-    <<>> -> acc
+    <<b, rest:bytes>> if b < 0x80 -> latin1_decode(rest, <<acc:bits, b>>)
     <<b, rest:bytes>> -> {
-      // RFC 1952 spec character set is ISO 8859-1, which is the
-      // identity map for the first 256 Unicode code points.  Convert
-      // each byte to its U+00xx code point and concatenate.  Bytes
-      // 0x00..0x7F encode to themselves; bytes 0x80..0xFF encode to a
-      // 2-byte UTF-8 sequence (lead `0xC2 | (b >> 6)`, continuation
-      // `0x80 | (b & 0x3F)`).  Hand-coding the encoding avoids the
-      // extra `string.utf_codepoint -> UtfCodepoint -> BitArray ->
-      // String` dance and is safe for any single byte.
-      let cp = case b < 0x80 {
-        True -> <<b>>
-        False -> <<
-          int.bitwise_or(0xC0, int.bitwise_shift_right(b, 6)),
-          int.bitwise_or(0x80, int.bitwise_and(b, 0x3F)),
-        >>
-      }
-      let assert Ok(ch) = bit_array.to_string(cp)
-      latin1_decode(rest, acc <> ch)
+      let lead = int.bitwise_or(0xC0, int.bitwise_shift_right(b, 6))
+      let continuation = int.bitwise_or(0x80, int.bitwise_and(b, 0x3F))
+      latin1_decode(rest, <<acc:bits, lead, continuation>>)
     }
-    _ -> acc
+    _ -> bit_array.to_string(acc)
   }
 }
 
@@ -538,17 +515,10 @@ fn split_at_nul(
   bytes: BitArray,
   offset: Int,
 ) -> Result(#(BitArray, BitArray), codec.CodecError) {
-  case bit_array.slice(bytes, offset, 1) {
-    Ok(<<0>>) -> {
-      let assert Ok(prefix) = bit_array.slice(bytes, 0, offset)
-      let total = bit_array.byte_size(bytes)
-      let assert Ok(rest) =
-        bit_array.slice(bytes, offset + 1, total - offset - 1)
-      Ok(#(prefix, rest))
-    }
-    Ok(_) -> split_at_nul(bytes, offset + 1)
-    Error(_) ->
-      Error(codec.InvalidData(message: "gzip header string missing NUL"))
+  case bytes {
+    <<prefix:bytes-size(offset), 0, rest:bytes>> -> Ok(#(prefix, rest))
+    <<_:bytes-size(offset), _, _:bytes>> -> split_at_nul(bytes, offset + 1)
+    _ -> Error(codec.InvalidData(message: "gzip header string missing NUL"))
   }
 }
 

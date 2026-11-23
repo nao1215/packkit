@@ -20,6 +20,7 @@ import packkit/codec
 import packkit/internal/aes
 import packkit/internal/bcj
 import packkit/internal/bcj2
+import packkit/internal/bytes
 import packkit/internal/bzip2
 import packkit/internal/checksum
 import packkit/internal/deflate
@@ -309,7 +310,7 @@ fn encode_entries(
   let bodies = list.map(entries, entry.body)
   let names = list.map(entries, fn(e) { e.path })
   let unpack_sizes = list.map(bodies, bit_array.byte_size)
-  let total_unpack = sum_list(unpack_sizes, 0)
+  let total_unpack = int.sum(unpack_sizes)
   let concatenated = bit_array.concat(bodies)
 
   use #(inner_packed, inner_coder_def) <- result.try(encode_via_method(
@@ -373,7 +374,7 @@ fn encode_entries(
     ])
 
   // -- FilesInfo ---------------------------------------------------
-  use names_block <- result.try(encode_names_block(names))
+  let names_block = encode_names_block(names)
   let num_files = list.length(entries)
   let mtimes_unix = list.map(entries, fn(e) { e.modified_at })
   // Only emit the Mtime block when at least one entry carries a
@@ -890,58 +891,26 @@ fn pack_bool_bits_loop(
   }
 }
 
-fn encode_names_block(
-  names: List(String),
-) -> Result(BitArray, archive.ArchiveError) {
+fn encode_names_block(names: List(String)) -> BitArray {
   // External-flag byte (0 = inline) followed by NUL-terminated
   // UTF-16 LE strings, one per file.
-  use bodies <- result.try(encode_names_loop(names, <<>>))
-  Ok(<<0x00, bodies:bits>>)
+  list.fold(names, <<0x00>>, fn(acc, name) {
+    string.to_utf_codepoints(name)
+    |> list.fold(acc, encode_utf16_le_codepoint)
+    |> fn(bytes) { <<bytes:bits, 0:size(16)>> }
+  })
 }
 
-fn encode_names_loop(
-  names: List(String),
-  acc: BitArray,
-) -> Result(BitArray, archive.ArchiveError) {
-  case names {
-    [] -> Ok(acc)
-    [name, ..rest] -> {
-      use encoded <- result.try(encode_utf16_le_name(name))
-      encode_names_loop(rest, bit_array.concat([acc, encoded]))
-    }
-  }
-}
-
-fn encode_utf16_le_name(
-  name: String,
-) -> Result(BitArray, archive.ArchiveError) {
-  let codepoints = string.to_utf_codepoints(name)
-  use body <- result.try(encode_utf16_le_codepoints(codepoints, <<>>, name))
-  // NUL terminator (two zero bytes for UTF-16 LE).
-  Ok(<<body:bits, 0, 0>>)
-}
-
-fn encode_utf16_le_codepoints(
-  codepoints: List(UtfCodepoint),
-  acc: BitArray,
-  full_name: String,
-) -> Result(BitArray, archive.ArchiveError) {
-  case codepoints {
-    [] -> Ok(acc)
-    [cp, ..rest] -> {
-      let value = string.utf_codepoint_to_int(cp)
-      case value < 0x10000 {
-        True -> {
-          let low = int.bitwise_and(value, 0xFF)
-          let high = int.bitwise_shift_right(value, 8)
-          encode_utf16_le_codepoints(rest, <<acc:bits, low, high>>, full_name)
-        }
-        False ->
-          Error(archive.EntryRejected(
-            path: full_name,
-            reason: "7z encoder requires BMP-only file names (no UTF-16 surrogate pairs yet)",
-          ))
-      }
+fn encode_utf16_le_codepoint(acc: BitArray, cp: UtfCodepoint) -> BitArray {
+  let value = string.utf_codepoint_to_int(cp)
+  case value < 0x10000 {
+    True -> <<acc:bits, value:size(16)-little>>
+    // Code points past U+FFFF take a surrogate pair.
+    False -> {
+      let offset = value - 0x10000
+      let high = 0xD800 + int.bitwise_shift_right(offset, 10)
+      let low = 0xDC00 + int.bitwise_and(offset, 0x3FF)
+      <<acc:bits, high:size(16)-little, low:size(16)-little>>
     }
   }
 }
@@ -1013,13 +982,7 @@ fn decode_internal(
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(archive.Archive, archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(archive.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(entry.check_input(bytes, limits))
 
   use #(next_offset, next_size, _crc) <- result.try(parse_signature_header(
     bytes,
@@ -1086,7 +1049,7 @@ fn decode_encoded_header(
       // transparently.  Archives without an AES coder in the encoded
       // header's folder ignore the password.
       let pack_offset = signature_size + pack_pos
-      let pack_size = sum_list(pack_sizes, 0)
+      let pack_size = int.sum(pack_sizes)
       use packed <- result.try(slice_required(
         full_archive,
         pack_offset,
@@ -1313,6 +1276,7 @@ fn parse_header_body(
           use #(files, rest) <- result.try(parse_files_info(
             rest,
             parser.additional_streams,
+            limits,
           ))
           parse_header_body(
             rest,
@@ -1695,7 +1659,7 @@ fn decode_additional_streams(
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
       let pack_offset = signature_size + pack_pos
-      let total_pack_size = sum_list(pack_sizes, 0)
+      let total_pack_size = int.sum(pack_sizes)
       use packed <- result.try(slice_required(
         full_archive,
         pack_offset,
@@ -1740,7 +1704,7 @@ fn decode_additional_streams_loop(
         option.None,
         limits,
       ))
-      let next_cursor = pack_cursor + sum_list(folder_pack_sizes, 0)
+      let next_cursor = pack_cursor + int.sum(folder_pack_sizes)
       decode_additional_streams_loop(
         packed,
         rest_folders,
@@ -2111,8 +2075,12 @@ fn describe_bit_array_hex(bytes: BitArray, acc: String) -> String {
 fn parse_files_info(
   bytes: BitArray,
   additional_streams: List(BitArray),
+  limits: limit.Limits,
 ) -> Result(#(HeaderFiles, BitArray), archive.ArchiveError) {
   use #(num_files, rest) <- result.try(read_number(bytes))
+  // Checked before the per-file lists are built, so a huge count does
+  // not allocate them.
+  use _ <- result.try(entry.check_member_limit(num_files, limits))
   parse_files_loop(rest, num_files, [], [], [], [], additional_streams)
 }
 
@@ -2146,18 +2114,11 @@ fn parse_files_loop(
           ))
         n if n == nid_name -> {
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z file names payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           use parsed_names <- result.try(parse_name_block(
             payload,
             num_files,
@@ -2175,18 +2136,11 @@ fn parse_files_loop(
         }
         n if n == nid_empty_stream -> {
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z empty-stream payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           let flags = bit_array_to_bool_list(payload, num_files, [])
           parse_files_loop(
             after_payload,
@@ -2207,18 +2161,11 @@ fn parse_files_loop(
           // EmptyStream block always precedes EmptyFile, so
           // `empty_streams` is populated by this point.
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z empty-file payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           let empty_count = count_true(empty_streams)
           let flags = bit_array_to_bool_list(payload, empty_count, [])
           parse_files_loop(
@@ -2244,18 +2191,11 @@ fn parse_files_loop(
           // the FILETIMEs live in AdditionalStreamsInfo, which is
           // already rejected at the section level above.
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z mtime block payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           use parsed_mtimes <- result.try(parse_mtime_block(
             payload,
             num_files,
@@ -2281,12 +2221,11 @@ fn parse_files_loop(
           || n == nid_comment
         -> {
           use #(size, after_size) <- result.try(read_number(rest))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
+          use #(_, after_payload) <- result.try(split_required(
+            after_size,
+            size,
+            "7z file property",
+          ))
           parse_files_loop(
             after_payload,
             num_files,
@@ -2361,23 +2300,10 @@ fn parse_mtime_block(
           get_additional_stream(additional_streams, data_index)
         }
       })
-      use defined_flags <- result.try(case all_defined {
-        1 -> Ok(list.repeat(True, num_files))
+      use #(defined_flags, body_after_flags) <- result.try(case all_defined {
+        1 -> Ok(#(list.repeat(True, num_files), external_bytes))
         _ -> read_mtime_defined_flags(external_bytes, num_files)
       })
-      let body_after_flags = case all_defined {
-        1 -> external_bytes
-        _ -> {
-          let bitmap_size = { num_files + 7 } / 8
-          let assert Ok(rest) =
-            bit_array.slice(
-              external_bytes,
-              bitmap_size,
-              bit_array.byte_size(external_bytes) - bitmap_size,
-            )
-          rest
-        }
-      }
       read_mtime_filetimes(body_after_flags, defined_flags, [])
     }
     _ -> Error(archive.InvalidData(message: "truncated 7z mtime block header"))
@@ -2387,15 +2313,14 @@ fn parse_mtime_block(
 fn read_mtime_defined_flags(
   payload: BitArray,
   num_files: Int,
-) -> Result(List(Bool), archive.ArchiveError) {
+) -> Result(#(List(Bool), BitArray), archive.ArchiveError) {
   let bitmap_size = { num_files + 7 } / 8
-  use bits <- result.try(slice_required(
+  use #(bits, rest) <- result.try(split_required(
     payload,
-    0,
     bitmap_size,
     "7z mtime defined bitmap",
   ))
-  Ok(bit_array_to_bool_list(bits, num_files, []))
+  Ok(#(bit_array_to_bool_list(bits, num_files, []), rest))
 }
 
 fn read_mtime_filetimes(
@@ -2473,53 +2398,33 @@ fn parse_name_block(
 fn decode_utf16_names(
   bytes: BitArray,
   remaining: Int,
-  current: List(Int),
+  current: List(UtfCodepoint),
   acc: List(String),
 ) -> Result(List(String), archive.ArchiveError) {
-  case remaining {
-    0 -> Ok(list.reverse(acc))
-    _ ->
-      case bytes {
-        <<lo, hi, rest:bytes>> -> {
-          let code = int.bitwise_or(int.bitwise_shift_left(hi, 8), lo)
-          case code {
-            0 -> {
-              let assert Ok(name) =
-                bit_array.to_string(
-                  codepoints_to_bit_array(list.reverse(current), <<>>),
-                )
-              decode_utf16_names(rest, remaining - 1, [], [name, ..acc])
-            }
-            _ -> decode_utf16_names(rest, remaining, [code, ..current], acc)
-          }
-        }
-        _ ->
-          Error(archive.InvalidData(message: "truncated 7z UTF-16 file name"))
+  let invalid = fn(message) { Error(archive.InvalidData(message:)) }
+  case remaining, bytes {
+    0, _ -> Ok(list.reverse(acc))
+    _, <<0:size(16), rest:bytes>> -> {
+      let name = string.from_utf_codepoints(list.reverse(current))
+      decode_utf16_names(rest, remaining - 1, [], [name, ..acc])
+    }
+    _, <<high:size(16)-little, low:size(16)-little, rest:bytes>>
+      if high >= 0xD800 && high <= 0xDBFF && low >= 0xDC00 && low <= 0xDFFF
+    -> {
+      let value =
+        0x10000 + int.bitwise_shift_left(high - 0xD800, 10) + { low - 0xDC00 }
+      case string.utf_codepoint(value) {
+        Ok(cp) -> decode_utf16_names(rest, remaining, [cp, ..current], acc)
+        Error(Nil) -> invalid("invalid 7z UTF-16 file name")
       }
-  }
-}
-
-fn codepoints_to_bit_array(codes: List(Int), acc: BitArray) -> BitArray {
-  case codes {
-    [] -> acc
-    [code, ..rest] -> codepoints_to_bit_array(rest, encode_utf8_code(code, acc))
-  }
-}
-
-fn encode_utf8_code(code: Int, acc: BitArray) -> BitArray {
-  case code {
-    c if c < 0x80 -> <<acc:bits, c>>
-    c if c < 0x800 -> {
-      let b1 = 0xC0 + int.bitwise_shift_right(c, 6)
-      let b2 = 0x80 + int.bitwise_and(c, 0x3F)
-      <<acc:bits, b1, b2>>
     }
-    c -> {
-      let b1 = 0xE0 + int.bitwise_shift_right(c, 12)
-      let b2 = 0x80 + int.bitwise_and(int.bitwise_shift_right(c, 6), 0x3F)
-      let b3 = 0x80 + int.bitwise_and(c, 0x3F)
-      <<acc:bits, b1, b2, b3>>
-    }
+    _, <<unit:size(16)-little, rest:bytes>> ->
+      // `utf_codepoint` rejects a surrogate that is not part of a pair.
+      case string.utf_codepoint(unit) {
+        Ok(cp) -> decode_utf16_names(rest, remaining, [cp, ..current], acc)
+        Error(Nil) -> invalid("unpaired surrogate in 7z UTF-16 file name")
+      }
+    _, _ -> invalid("truncated 7z UTF-16 file name")
   }
 }
 
@@ -2627,7 +2532,7 @@ fn parse_sub_streams_info(
     [] -> repeat_one_per_folder(num_folders, [])
     values -> values
   }
-  let total_substreams = sum_list(per_folder, 0)
+  let total_substreams = int.sum(per_folder)
   let sizes =
     derive_substream_sizes(
       per_folder,
@@ -2674,7 +2579,7 @@ fn sub_streams_loop_collect(
             [] -> repeat_one_per_folder(num_folders, [])
             values -> values
           }
-          let explicit_count = sum_list(per_folder, 0) - list.length(per_folder)
+          let explicit_count = int.sum(per_folder) - list.length(per_folder)
           let safe_count = case explicit_count > 0 {
             True -> explicit_count
             False -> 0
@@ -2689,7 +2594,7 @@ fn sub_streams_loop_collect(
         n if n == nid_crc -> {
           let total = case acc.per_folder {
             [] -> num_folders
-            values -> sum_list(values, 0)
+            values -> int.sum(values)
           }
           use rest <- result.try(skip_crc_block(rest, total))
           sub_streams_loop_collect(rest, num_folders, acc)
@@ -2727,7 +2632,7 @@ fn derive_substream_sizes(
       }
       let #(explicit, remaining) =
         list_take(remaining_explicit, explicit_for_folder, [])
-      let explicit_sum = sum_list(explicit, 0)
+      let explicit_sum = int.sum(explicit)
       let derived = folder_total - explicit_sum
       let folder_sizes = case count {
         0 -> []
@@ -2748,13 +2653,6 @@ fn list_take(values: List(a), n: Int, acc: List(a)) -> #(List(a), List(a)) {
     _, 0 -> #(list.reverse(acc), values)
     [], _ -> #(list.reverse(acc), [])
     [head, ..rest], _ -> list_take(rest, n - 1, [head, ..acc])
-  }
-}
-
-fn sum_list(values: List(Int), acc: Int) -> Int {
-  case values {
-    [] -> acc
-    [head, ..rest] -> sum_list(rest, acc + head)
   }
 }
 
@@ -2845,7 +2743,7 @@ fn decode_all_folders(
         password,
         limits,
       ))
-      let next_cursor = pack_cursor + sum_list(folder_pack_sizes, 0)
+      let next_cursor = pack_cursor + int.sum(folder_pack_sizes)
       decode_all_folders(
         packed,
         rest_folders,
@@ -2895,7 +2793,7 @@ fn enforce_max_output(
   unpack_sizes: List(Int),
   limits: limit.Limits,
 ) -> Result(Nil, archive.ArchiveError) {
-  let total = sum_list(unpack_sizes, 0)
+  let total = int.sum(unpack_sizes)
   case total > limits.max_output_bytes {
     True ->
       Error(archive.LimitExceeded(limit: "max_output_bytes", actual: total))
@@ -3151,64 +3049,8 @@ fn decode_delta_coder(
     <<d>> -> d + 1
     _ -> 1
   }
-  let decoded = delta_decode_seven_z(packed, distance)
+  let decoded = bcj.delta_decode(packed, distance)
   verify_unpack_size(decoded, target, "Delta")
-}
-
-fn delta_decode_seven_z(bytes: BitArray, distance: Int) -> BitArray {
-  let byte_list = bit_array_to_byte_list_seven_z(bytes, [])
-  let decoded = delta_decode_seven_z_loop(byte_list, distance, [], 0)
-  byte_list_to_bit_array_seven_z(decoded, <<>>)
-}
-
-fn bit_array_to_byte_list_seven_z(
-  bytes: BitArray,
-  acc: List(Int),
-) -> List(Int) {
-  case bytes {
-    <<b, rest:bytes>> -> bit_array_to_byte_list_seven_z(rest, [b, ..acc])
-    _ -> list.reverse(acc)
-  }
-}
-
-fn byte_list_to_bit_array_seven_z(bytes: List(Int), acc: BitArray) -> BitArray {
-  case bytes {
-    [] -> acc
-    [b, ..rest] -> byte_list_to_bit_array_seven_z(rest, <<acc:bits, b>>)
-  }
-}
-
-fn delta_decode_seven_z_loop(
-  input: List(Int),
-  distance: Int,
-  output: List(Int),
-  index: Int,
-) -> List(Int) {
-  case input {
-    [] -> list.reverse(output)
-    [b, ..rest] ->
-      case index < distance {
-        True ->
-          delta_decode_seven_z_loop(rest, distance, [b, ..output], index + 1)
-        False -> {
-          // `output` holds emitted bytes in reverse order (head =
-          // most recent).  The byte we emitted `distance` slots ago
-          // is always at offset `distance - 1` from the head, no
-          // matter how many bytes have been emitted overall.
-          let predecessor = nth_back(output, distance - 1)
-          let sum = int.bitwise_and(b + predecessor, 0xFF)
-          delta_decode_seven_z_loop(rest, distance, [sum, ..output], index + 1)
-        }
-      }
-  }
-}
-
-fn nth_back(values: List(Int), steps: Int) -> Int {
-  case values, steps {
-    [head, ..], 0 -> head
-    [_, ..tail], _ -> nth_back(tail, steps - 1)
-    [], _ -> 0
-  }
 }
 
 // -- 7z AES coder (id `06 F1 07 01`) ----------------------------------
@@ -3976,7 +3818,12 @@ fn consume_one_file_body(
     [s, ..rest] -> #(s, rest)
     [] -> #(bit_array.byte_size(plain) - consumed, [])
   }
-  let assert Ok(body) = bit_array.slice(plain, consumed, this_size)
+  use body <- result.try(slice_required(
+    plain,
+    consumed,
+    this_size,
+    "7z file body",
+  ))
   add_file(name, body, entry_mtime, acc, limits)
   |> result.try(fn(new_acc) {
     build_entries_loop(
@@ -4008,20 +3855,7 @@ fn add_file(
   acc: List(archive.Entry),
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  case entry.file_checked(path: name, body: body) {
-    Ok(e) -> {
-      let depth = entry.depth(e.path)
-      case depth > limits.max_entry_depth {
-        True ->
-          Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth))
-        False -> Ok([apply_mtime(e, mtime), ..acc])
-      }
-    }
-    Error(_) ->
-      Error(archive.InvalidData(
-        message: "7z file name failed path validation: " <> name,
-      ))
-  }
+  add_checked(name, entry.file_checked(path: name, body:), mtime, acc, limits)
 }
 
 fn add_directory(
@@ -4030,34 +3864,54 @@ fn add_directory(
   acc: List(archive.Entry),
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  case entry.directory_checked(path: name) {
-    Ok(e) -> {
-      let depth = entry.depth(e.path)
-      case depth > limits.max_entry_depth {
-        True ->
-          Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth))
-        False -> Ok([apply_mtime(e, mtime), ..acc])
-      }
-    }
-    Error(_) ->
-      Error(archive.InvalidData(
-        message: "7z directory name failed path validation: " <> name,
-      ))
-  }
+  add_checked(name, entry.directory_checked(path: name), mtime, acc, limits)
 }
 
-// -- byte / number helpers ---------------------------------------------
+// Checks a name against the limits before the path itself, in the same
+// order as the other readers.
+fn add_checked(
+  name: String,
+  checked: Result(archive.Entry, entry.EntryError),
+  mtime: Option(Int),
+  acc: List(archive.Entry),
+  limits: limit.Limits,
+) -> Result(List(archive.Entry), archive.ArchiveError) {
+  let name_bytes = string.byte_size(name)
+  use <- bool.guard(
+    when: name_bytes > limits.max_entry_name_bytes,
+    return: Error(archive.LimitExceeded(
+      limit: "max_entry_name_bytes",
+      actual: name_bytes,
+    )),
+  )
+  use e <- result.try(
+    checked |> result.map_error(entry.to_archive_error(_, name)),
+  )
+  let depth = entry.depth(e.path)
+  use <- bool.guard(
+    when: depth > limits.max_entry_depth,
+    return: Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth)),
+  )
+  Ok([apply_mtime(e, mtime), ..acc])
+}
 
 fn slice_required(
-  bytes: BitArray,
+  source: BitArray,
   offset: Int,
   length: Int,
   label: String,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(bytes, offset, length) {
-    Ok(value) -> Ok(value)
-    Error(_) -> Error(archive.InvalidData(message: "truncated " <> label))
-  }
+  bytes.slice(source, offset, length)
+  |> result.replace_error(archive.InvalidData(message: "truncated " <> label))
+}
+
+fn split_required(
+  source: BitArray,
+  count: Int,
+  label: String,
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
+  bytes.split(source, count)
+  |> result.replace_error(archive.InvalidData(message: "truncated " <> label))
 }
 
 fn read_number(

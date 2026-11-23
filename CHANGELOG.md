@@ -7,6 +7,19 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+### Fixed
+
+- The 7z reader checks `max_entry_name_bytes`, and the tar, cpio and ar readers and the `Identity` codec check `max_output_bytes`, like the other readers and codecs.
+- The 7z reader returns `EntryRejected` for an unsafe entry path, like the other readers, instead of `InvalidData`.
+- Reading an ar archive whose symbol table member has a negative size looped forever. A negative size, mode or name length, or a BSD long name longer than its member, is now `InvalidData`.
+- A cpio name size past the end of the input, or a body without its padding at the end of the input, panicked. Both are now `InvalidData`.
+- A tar PAX `path` or `linkpath` with non-ASCII characters kept the trailing newline, because the record length counts bytes and was applied to characters.
+- The LZ4 decoder now checks the frame header checksum, the block checksums and the content checksum, and the Snappy decoder checks the CRC-32C of each chunk. A corrupted stream returned different bytes instead of `InvalidData`.
+- A Brotli stream whose window is smaller than its output could not be decoded when it referred to the static dictionary past the window.
+- The 7z reader panicked on a file name outside the Basic Multilingual Plane, such as an emoji, and on an unpaired UTF-16 surrogate. It now reads surrogate pairs and returns `InvalidData` for an unpaired surrogate, and the 7z writer writes such names instead of returning `EntryRejected`.
+- A Brotli stream whose context map pointed past its prefix codes panicked. It is now `InvalidData`.
+- A 7z header with a huge file count made the reader build a list per file before checking `max_members`, which could run out of memory. The count is now checked first.
+
 ## [0.5.0] - 2026-11-23
 
 ### Breaking
