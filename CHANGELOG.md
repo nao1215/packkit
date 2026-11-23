@@ -18,6 +18,7 @@ The `Unreleased` section is the staging area for post-release changes
 - A Brotli stream whose window is smaller than its output could not be decoded when it referred to the static dictionary past the window.
 - The 7z reader panicked on a file name outside the Basic Multilingual Plane, such as an emoji, and on an unpaired UTF-16 surrogate. It now reads surrogate pairs and returns `InvalidData` for an unpaired surrogate, and the 7z writer writes such names instead of returning `EntryRejected`.
 - A Brotli stream whose context map pointed past its prefix codes panicked. It is now `InvalidData`.
+- A 7z header with a huge file count made the reader build a list per file before checking `max_members`, which could run out of memory. The count is now checked first.
 
 ## [0.5.0] - 2026-11-23
 

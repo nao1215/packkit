@@ -93,7 +93,7 @@ pub fn copy_back(
   let out_of_range =
     Error(codec.InvalidData(message: "back-reference distance out of range"))
   use <- bool.guard(
-    when: distance <= 0 || distance > size,
+    when: distance <= 0 || distance > size || length < 0,
     return: out_of_range,
   )
   let start = size - distance

@@ -57,6 +57,10 @@ fn ref_adler32(hex: String) -> Int
 @external(javascript, "./packkit_reference_ffi.mjs", "sha256")
 fn ref_sha256(hex: String) -> String
 
+@external(erlang, "packkit_reference_ffi", "sha1")
+@external(javascript, "./packkit_reference_ffi.mjs", "sha1")
+fn ref_sha1(hex: String) -> String
+
 @external(erlang, "packkit_reference_ffi", "hmac_sha1")
 @external(javascript, "./packkit_reference_ffi.mjs", "hmac_sha1")
 fn ref_hmac_sha1(key: String, data: String) -> String
@@ -169,6 +173,7 @@ pub fn checksums_match_reference_test() -> Nil {
     checksum.crc32(data: data) == ref_crc32(hex(data))
     && checksum.adler32(data: data) == ref_adler32(hex(data))
     && hex(checksum.sha256(data: data)) == ref_sha256(hex(data))
+    && hex(checksum.sha1(data: data)) == ref_sha1(hex(data))
   })
 }
 

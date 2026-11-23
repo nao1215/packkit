@@ -1276,6 +1276,7 @@ fn parse_header_body(
           use #(files, rest) <- result.try(parse_files_info(
             rest,
             parser.additional_streams,
+            limits,
           ))
           parse_header_body(
             rest,
@@ -2074,8 +2075,12 @@ fn describe_bit_array_hex(bytes: BitArray, acc: String) -> String {
 fn parse_files_info(
   bytes: BitArray,
   additional_streams: List(BitArray),
+  limits: limit.Limits,
 ) -> Result(#(HeaderFiles, BitArray), archive.ArchiveError) {
   use #(num_files, rest) <- result.try(read_number(bytes))
+  // Checked before the per-file lists are built, so a huge count does
+  // not allocate them.
+  use _ <- result.try(entry.check_member_limit(num_files, limits))
   parse_files_loop(rest, num_files, [], [], [], [], additional_streams)
 }
 

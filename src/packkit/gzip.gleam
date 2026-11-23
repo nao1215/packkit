@@ -483,6 +483,8 @@ fn maybe_read_string(
         Ok(#(string_bits, after)) -> {
           use decoded <- result.try(
             bit_array.to_string(string_bits)
+            // Latin-1 maps every byte to a code point, so this always
+            // succeeds and the error below is not reached.
             |> result.lazy_or(fn() { latin1_decode(string_bits, <<>>) })
             |> result.replace_error(codec.InvalidData(
               message: "gzip header string is not text",

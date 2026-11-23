@@ -1068,3 +1068,46 @@ fn replace_once(bytes: BitArray, from: BitArray, to: BitArray) -> BitArray {
     _ -> bytes
   }
 }
+
+pub fn huge_file_count_is_a_member_limit_error_test() -> Nil {
+  let assert Ok(bytes) =
+    packkit.write(archive.Archive(
+      format: archive.SevenZ,
+      entries: [archive.new_entry(path: "ab", kind: archive.File(<<"x">>))],
+      comment: option.None,
+    ))
+  let assert <<
+    signature:bytes-size(8),
+    _start_crc:size(32),
+    offset:size(32)-little,
+    0:size(32),
+    size:size(32)-little,
+    0:size(32),
+    _next_crc:size(32),
+    packed:bytes-size(offset),
+    header:bytes-size(size),
+  >> = bytes
+  // FilesInfo (0x05) with one file becomes a file count of 2^24 - 1,
+  // which a reader must not try to allocate entries for.
+  let header =
+    replace_once(header, <<0x05, 0x01>>, <<0x05, 0xE0, 0xFF, 0xFF, 0xFF>>)
+  let size = bit_array.byte_size(header)
+  let start = <<
+    offset:size(32)-little,
+    0:size(32),
+    size:size(32)-little,
+    0:size(32),
+    { checksum.crc32(data: header) }:size(32)-little,
+  >>
+  let fixed = <<
+    signature:bits,
+    { checksum.crc32(data: start) }:size(32)-little,
+    start:bits,
+    packed:bits,
+    header:bits,
+  >>
+  assert case packkit.read(fixed, format: archive.SevenZ) {
+    Error(archive.LimitExceeded(limit: "max_members", actual: _)) -> True
+    _ -> False
+  }
+}
