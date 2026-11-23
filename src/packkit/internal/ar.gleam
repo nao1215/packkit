@@ -93,7 +93,7 @@ fn decode_loop(
         StringTable ->
           decode_loop(remaining, acc, count, option.Some(payload), limits)
         RegularEntry -> {
-          use _ <- result.try(check_member_limit(count + 1, limits))
+          use _ <- result.try(entry.check_member_limit(count + 1, limits))
           use name <- result.try(resolve_entry_name(
             record,
             name_bits,
@@ -195,16 +195,6 @@ fn take_gnu_name(bytes: BitArray, acc: BitArray) -> BitArray {
     <<0x2F, _:bytes>> | <<0x00, _:bytes>> | <<0x0A, _:bytes>> -> acc
     <<byte, rest:bytes>> -> take_gnu_name(rest, <<acc:bits, byte>>)
     _ -> acc
-  }
-}
-
-fn check_member_limit(
-  count: Int,
-  limits: limit.Limits,
-) -> Result(Nil, archive.ArchiveError) {
-  case count > limits.max_members {
-    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
-    False -> Ok(Nil)
   }
 }
 
@@ -317,7 +307,7 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, archive.ArchiveError) {
             }
             False ->
               Ok(ParsedRecord(
-                header_name: strip_trailing_slash(trimmed_name),
+                header_name: entry.strip_trailing_slash(trimmed_name),
                 name_extension: 0,
                 gnu_offset: option.None,
                 special: RegularEntry,
@@ -500,11 +490,10 @@ fn slice_or_error(
   offset: Int,
   width: Int,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(block, offset, width) {
-    Ok(value) -> Ok(value)
-    Error(_) ->
-      Error(archive.InvalidData(message: "ar header field out of bounds"))
-  }
+  bytes.slice(block, offset, width)
+  |> result.replace_error(archive.InvalidData(
+    message: "ar header field out of bounds",
+  ))
 }
 
 fn bytes_to_string(bytes: BitArray) -> Result(String, archive.ArchiveError) {
@@ -512,12 +501,5 @@ fn bytes_to_string(bytes: BitArray) -> Result(String, archive.ArchiveError) {
     Ok(value) -> Ok(value)
     Error(_) ->
       Error(archive.InvalidData(message: "non-UTF-8 ar header string"))
-  }
-}
-
-fn strip_trailing_slash(value: String) -> String {
-  case string.ends_with(value, "/") {
-    True -> string.drop_end(value, 1)
-    False -> value
   }
 }

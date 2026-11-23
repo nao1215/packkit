@@ -16,6 +16,8 @@ import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import packkit/codec
+import packkit/internal/bytes
+import packkit/internal/lz77
 
 const num_bit_model_total_bits: Int = 11
 
@@ -191,7 +193,7 @@ pub fn decode_into(
   desired_output: Int,
 ) -> Result(#(BitArray, Decoder), codec.CodecError) {
   use decoder <- result.try(loop_until(decoder, desired_output))
-  let bytes = list_reverse_to_bit_array(decoder.output_rev, <<>>)
+  let bytes = bytes.from_reversed_list(decoder.output_rev)
   Ok(#(bytes, decoder))
 }
 
@@ -832,13 +834,6 @@ fn read_u32_be(bytes: BitArray) -> Result(#(Int, BitArray), codec.CodecError) {
   }
 }
 
-fn list_reverse_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> list_reverse_to_bit_array(rest, <<head, acc:bits>>)
-  }
-}
-
 // -- LZMA1 literal-only encoder ----------------------------------------
 //
 // The encoder is a mirror of the decoder's range coder and literal
@@ -1088,7 +1083,7 @@ pub fn encode_with_lz77(
   let encoder = new_encoder(props)
   let encoder = lz77_main_loop(bytes, 0, size, encoder, dict.new())
   let encoder = finish_encoder(encoder)
-  list_reverse_to_bit_array(encoder.out_bytes_rev, <<>>)
+  bytes.from_reversed_list(encoder.out_bytes_rev)
 }
 
 fn lz77_main_loop(
@@ -1105,16 +1100,16 @@ fn lz77_main_loop(
         // Too few bytes left for a 3-byte hash — emit remaining as
         // literals (or short-reps when rep0 already aligns).
         True -> {
-          let byte = byte_at_input(bytes, pos)
+          let byte = lz77.byte_at(bytes, pos)
           let encoder =
             emit_lzma_literal_or_short_rep(encoder, bytes, pos, byte)
           lz77_main_loop(bytes, pos + 1, size, encoder, hashes)
         }
         False -> {
-          let b0 = byte_at_input(bytes, pos)
-          let b1 = byte_at_input(bytes, pos + 1)
-          let b2 = byte_at_input(bytes, pos + 2)
-          let key = lzma_hash3(b0, b1, b2)
+          let b0 = lz77.byte_at(bytes, pos)
+          let b1 = lz77.byte_at(bytes, pos + 1)
+          let b2 = lz77.byte_at(bytes, pos + 2)
+          let key = lz77.hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) -> {
               let encoder =
@@ -1136,7 +1131,7 @@ fn lz77_main_loop(
                     True -> size - pos
                     False -> lzma_lz77_max_match
                   }
-                  let m_len = lzma_match_length(bytes, prev, pos, cap, 0)
+                  let m_len = lz77.match_length(bytes, prev, pos, cap, 0)
                   case m_len >= lzma_lz77_min_match {
                     True -> {
                       let pos_state =
@@ -1144,7 +1139,7 @@ fn lz77_main_loop(
                       let encoder =
                         emit_lzma_match(encoder, pos_state, m_len, distance - 1)
                       let hashes =
-                        update_hashes_in_range(
+                        lz77.insert_hashes3(
                           bytes,
                           dict.insert(hashes, key, pos),
                           pos + 1,
@@ -1169,69 +1164,6 @@ fn lz77_main_loop(
   }
 }
 
-fn byte_at_input(bytes: BitArray, pos: Int) -> Int {
-  case bit_array.slice(bytes, pos, 1) {
-    Ok(<<b>>) -> b
-    _ -> 0
-  }
-}
-
-fn lzma_hash3(b0: Int, b1: Int, b2: Int) -> Int {
-  // Same Knuth-style mix as the deflate encoder — fits a 3-byte key
-  // into a 16-bit bucket so the hash chain stays bounded.
-  int.bitwise_and(
-    int.bitwise_exclusive_or(
-      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
-      b2 * 2_246_822_519,
-    ),
-    0xFFFF,
-  )
-}
-
-fn lzma_match_length(
-  bytes: BitArray,
-  prev: Int,
-  cur: Int,
-  cap: Int,
-  acc: Int,
-) -> Int {
-  case acc >= cap {
-    True -> acc
-    False ->
-      case byte_at_input(bytes, prev + acc) == byte_at_input(bytes, cur + acc) {
-        True -> lzma_match_length(bytes, prev, cur, cap, acc + 1)
-        False -> acc
-      }
-  }
-}
-
-fn update_hashes_in_range(
-  bytes: BitArray,
-  hashes: dict.Dict(Int, Int),
-  from: Int,
-  to: Int,
-  size: Int,
-) -> dict.Dict(Int, Int) {
-  case from >= to || from + lzma_lz77_min_match > size {
-    True -> hashes
-    False -> {
-      let key =
-        lzma_hash3(
-          byte_at_input(bytes, from),
-          byte_at_input(bytes, from + 1),
-          byte_at_input(bytes, from + 2),
-        )
-      update_hashes_in_range(
-        bytes,
-        dict.insert(hashes, key, from),
-        from + 1,
-        to,
-        size,
-      )
-    }
-  }
-}
-
 // Pick between a literal and the LZMA short-rep packet (length-1
 // rep0).  Short-rep costs only the four prefix prob bits — no
 // literal-byte coding, no length encoding — so whenever the byte at
@@ -1247,7 +1179,7 @@ fn emit_lzma_literal_or_short_rep(
   byte: Int,
 ) -> Encoder {
   let back = pos - encoder.rep0 - 1
-  case back >= 0 && byte_at_input(bytes, back) == byte {
+  case back >= 0 && lz77.byte_at(bytes, back) == byte {
     True -> {
       let pos_state = int.bitwise_and(pos, mask_for(encoder.props.pb))
       emit_lzma_short_rep(encoder, pos_state)
@@ -1300,7 +1232,7 @@ fn emit_lzma_literal(
     )
   let prev_byte = case pos {
     0 -> 0
-    _ -> byte_at_input(bytes, pos - 1)
+    _ -> lz77.byte_at(bytes, pos - 1)
   }
   let lit_pos_state = int.bitwise_and(pos, mask_for(encoder.props.lp))
   let lit_high = int.bitwise_shift_right(prev_byte, 8 - encoder.props.lc)
@@ -1316,7 +1248,7 @@ fn emit_lzma_literal(
       // Matched-literal path: XOR against the byte at distance
       // `rep0 + 1` so the decoder's matched-literal state machine
       // sees the same context.
-      let match_byte = byte_at_input(bytes, pos - encoder.rep0 - 1)
+      let match_byte = lz77.byte_at(bytes, pos - encoder.rep0 - 1)
       encode_matched_literal_bits(
         encoder,
         prob_base,

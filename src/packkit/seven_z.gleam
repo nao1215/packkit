@@ -20,6 +20,7 @@ import packkit/codec
 import packkit/internal/aes
 import packkit/internal/bcj
 import packkit/internal/bcj2
+import packkit/internal/bytes
 import packkit/internal/bzip2
 import packkit/internal/checksum
 import packkit/internal/deflate
@@ -309,7 +310,7 @@ fn encode_entries(
   let bodies = list.map(entries, entry.body)
   let names = list.map(entries, fn(e) { e.path })
   let unpack_sizes = list.map(bodies, bit_array.byte_size)
-  let total_unpack = sum_list(unpack_sizes, 0)
+  let total_unpack = int.sum(unpack_sizes)
   let concatenated = bit_array.concat(bodies)
 
   use #(inner_packed, inner_coder_def) <- result.try(encode_via_method(
@@ -1054,7 +1055,7 @@ fn decode_encoded_header(
       // transparently.  Archives without an AES coder in the encoded
       // header's folder ignore the password.
       let pack_offset = signature_size + pack_pos
-      let pack_size = sum_list(pack_sizes, 0)
+      let pack_size = int.sum(pack_sizes)
       use packed <- result.try(slice_required(
         full_archive,
         pack_offset,
@@ -1663,7 +1664,7 @@ fn decode_additional_streams(
       ))
     HeaderStreamsParsed(pack_pos, pack_sizes, folders, folder_unpack_sizes, _) -> {
       let pack_offset = signature_size + pack_pos
-      let total_pack_size = sum_list(pack_sizes, 0)
+      let total_pack_size = int.sum(pack_sizes)
       use packed <- result.try(slice_required(
         full_archive,
         pack_offset,
@@ -1708,7 +1709,7 @@ fn decode_additional_streams_loop(
         option.None,
         limits,
       ))
-      let next_cursor = pack_cursor + sum_list(folder_pack_sizes, 0)
+      let next_cursor = pack_cursor + int.sum(folder_pack_sizes)
       decode_additional_streams_loop(
         packed,
         rest_folders,
@@ -2532,7 +2533,7 @@ fn parse_sub_streams_info(
     [] -> repeat_one_per_folder(num_folders, [])
     values -> values
   }
-  let total_substreams = sum_list(per_folder, 0)
+  let total_substreams = int.sum(per_folder)
   let sizes =
     derive_substream_sizes(
       per_folder,
@@ -2579,7 +2580,7 @@ fn sub_streams_loop_collect(
             [] -> repeat_one_per_folder(num_folders, [])
             values -> values
           }
-          let explicit_count = sum_list(per_folder, 0) - list.length(per_folder)
+          let explicit_count = int.sum(per_folder) - list.length(per_folder)
           let safe_count = case explicit_count > 0 {
             True -> explicit_count
             False -> 0
@@ -2594,7 +2595,7 @@ fn sub_streams_loop_collect(
         n if n == nid_crc -> {
           let total = case acc.per_folder {
             [] -> num_folders
-            values -> sum_list(values, 0)
+            values -> int.sum(values)
           }
           use rest <- result.try(skip_crc_block(rest, total))
           sub_streams_loop_collect(rest, num_folders, acc)
@@ -2632,7 +2633,7 @@ fn derive_substream_sizes(
       }
       let #(explicit, remaining) =
         list_take(remaining_explicit, explicit_for_folder, [])
-      let explicit_sum = sum_list(explicit, 0)
+      let explicit_sum = int.sum(explicit)
       let derived = folder_total - explicit_sum
       let folder_sizes = case count {
         0 -> []
@@ -2653,13 +2654,6 @@ fn list_take(values: List(a), n: Int, acc: List(a)) -> #(List(a), List(a)) {
     _, 0 -> #(list.reverse(acc), values)
     [], _ -> #(list.reverse(acc), [])
     [head, ..rest], _ -> list_take(rest, n - 1, [head, ..acc])
-  }
-}
-
-fn sum_list(values: List(Int), acc: Int) -> Int {
-  case values {
-    [] -> acc
-    [head, ..rest] -> sum_list(rest, acc + head)
   }
 }
 
@@ -2750,7 +2744,7 @@ fn decode_all_folders(
         password,
         limits,
       ))
-      let next_cursor = pack_cursor + sum_list(folder_pack_sizes, 0)
+      let next_cursor = pack_cursor + int.sum(folder_pack_sizes)
       decode_all_folders(
         packed,
         rest_folders,
@@ -2800,7 +2794,7 @@ fn enforce_max_output(
   unpack_sizes: List(Int),
   limits: limit.Limits,
 ) -> Result(Nil, archive.ArchiveError) {
-  let total = sum_list(unpack_sizes, 0)
+  let total = int.sum(unpack_sizes)
   case total > limits.max_output_bytes {
     True ->
       Error(archive.LimitExceeded(limit: "max_output_bytes", actual: total))
@@ -3056,64 +3050,8 @@ fn decode_delta_coder(
     <<d>> -> d + 1
     _ -> 1
   }
-  let decoded = delta_decode_seven_z(packed, distance)
+  let decoded = bcj.delta_decode(packed, distance)
   verify_unpack_size(decoded, target, "Delta")
-}
-
-fn delta_decode_seven_z(bytes: BitArray, distance: Int) -> BitArray {
-  let byte_list = bit_array_to_byte_list_seven_z(bytes, [])
-  let decoded = delta_decode_seven_z_loop(byte_list, distance, [], 0)
-  byte_list_to_bit_array_seven_z(decoded, <<>>)
-}
-
-fn bit_array_to_byte_list_seven_z(
-  bytes: BitArray,
-  acc: List(Int),
-) -> List(Int) {
-  case bytes {
-    <<b, rest:bytes>> -> bit_array_to_byte_list_seven_z(rest, [b, ..acc])
-    _ -> list.reverse(acc)
-  }
-}
-
-fn byte_list_to_bit_array_seven_z(bytes: List(Int), acc: BitArray) -> BitArray {
-  case bytes {
-    [] -> acc
-    [b, ..rest] -> byte_list_to_bit_array_seven_z(rest, <<acc:bits, b>>)
-  }
-}
-
-fn delta_decode_seven_z_loop(
-  input: List(Int),
-  distance: Int,
-  output: List(Int),
-  index: Int,
-) -> List(Int) {
-  case input {
-    [] -> list.reverse(output)
-    [b, ..rest] ->
-      case index < distance {
-        True ->
-          delta_decode_seven_z_loop(rest, distance, [b, ..output], index + 1)
-        False -> {
-          // `output` holds emitted bytes in reverse order (head =
-          // most recent).  The byte we emitted `distance` slots ago
-          // is always at offset `distance - 1` from the head, no
-          // matter how many bytes have been emitted overall.
-          let predecessor = nth_back(output, distance - 1)
-          let sum = int.bitwise_and(b + predecessor, 0xFF)
-          delta_decode_seven_z_loop(rest, distance, [sum, ..output], index + 1)
-        }
-      }
-  }
-}
-
-fn nth_back(values: List(Int), steps: Int) -> Int {
-  case values, steps {
-    [head, ..], 0 -> head
-    [_, ..tail], _ -> nth_back(tail, steps - 1)
-    [], _ -> 0
-  }
 }
 
 // -- 7z AES coder (id `06 F1 07 01`) ----------------------------------
@@ -3958,32 +3896,23 @@ fn add_checked(
   Ok([apply_mtime(e, mtime), ..acc])
 }
 
-// -- byte / number helpers ---------------------------------------------
-
 fn slice_required(
-  bytes: BitArray,
+  source: BitArray,
   offset: Int,
   length: Int,
   label: String,
 ) -> Result(BitArray, archive.ArchiveError) {
-  use #(_, rest) <- result.try(split_required(bytes, offset, label))
-  use #(value, _) <- result.try(split_required(rest, length, label))
-  Ok(value)
+  bytes.slice(source, offset, length)
+  |> result.replace_error(archive.InvalidData(message: "truncated " <> label))
 }
 
-// Splits `bytes` after `count` bytes, or fails when `bytes` is shorter or
-// `count` is negative.
 fn split_required(
-  bytes: BitArray,
+  source: BitArray,
   count: Int,
   label: String,
 ) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
-  let truncated = Error(archive.InvalidData(message: "truncated " <> label))
-  use <- bool.guard(when: count < 0, return: truncated)
-  case bytes {
-    <<head:bytes-size(count), rest:bytes>> -> Ok(#(head, rest))
-    _ -> truncated
-  }
+  bytes.split(source, count)
+  |> result.replace_error(archive.InvalidData(message: "truncated " <> label))
 }
 
 fn read_number(

@@ -17,6 +17,7 @@ import gleam/dict
 import gleam/int
 import gleam/result
 import packkit/codec
+import packkit/internal/bytes
 import packkit/limit
 
 const magic_byte_1: Int = 0x1F
@@ -315,7 +316,7 @@ fn decode_payload(
     )
   use #(out_rev, out_len) <- result.try(decode_loop(reader, state, limits))
   use _ <- result.try(check_output_limit(out_len, limits))
-  Ok(reverse_to_bit_array(out_rev, <<>>))
+  Ok(bytes.from_reversed_list(out_rev))
 }
 
 fn decode_loop(
@@ -509,13 +510,6 @@ fn prepend_chars(chars: List(Int), acc: List(Int)) -> List(Int) {
   }
 }
 
-fn reverse_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> reverse_to_bit_array(rest, <<head, acc:bits>>)
-  }
-}
-
 // -- LSB-first bit writer -----------------------------------------------
 
 type Writer {
@@ -578,14 +572,7 @@ fn flush_writer(writer: Writer) -> BitArray {
         bits_written: writer.bits_written,
       )
   }
-  list_reverse_to_bit_array(writer.bytes_rev, <<>>)
-}
-
-fn list_reverse_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> list_reverse_to_bit_array(rest, <<head, acc:bits>>)
-  }
+  bytes.from_reversed_list(writer.bytes_rev)
 }
 
 // -- LSB-first bit reader -----------------------------------------------

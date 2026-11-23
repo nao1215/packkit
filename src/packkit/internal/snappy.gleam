@@ -15,6 +15,7 @@ import gleam/result
 import packkit/codec
 import packkit/internal/bytes
 import packkit/internal/checksum
+import packkit/internal/lz77
 import packkit/limit
 
 const stream_identifier: BitArray = <<
@@ -398,7 +399,7 @@ fn compress_raw_body(bytes: BitArray, size: Int) -> BitArray {
   case size < snappy_min_match {
     True -> emit_literal(bytes)
     False -> {
-      let table = build_snappy_byte_table(bytes, 0, dict.new())
+      let table = lz77.table(bytes)
       snappy_compress_loop(table, size, 0, 0, dict.new(), [])
     }
   }
@@ -417,7 +418,7 @@ fn snappy_compress_loop(
       let lit_len = size - last_lit_start
       let tail = case lit_len {
         0 -> <<>>
-        _ -> emit_literal(snappy_slice(table, last_lit_start, lit_len, <<>>))
+        _ -> emit_literal(lz77.table_slice(table, last_lit_start, lit_len))
       }
       bit_array.concat(list.reverse([tail, ..acc]))
     }
@@ -434,11 +435,11 @@ fn snappy_step(
   acc: List(BitArray),
 ) -> BitArray {
   let key =
-    snappy_hash4(
-      snappy_byte_at(table, pos),
-      snappy_byte_at(table, pos + 1),
-      snappy_byte_at(table, pos + 2),
-      snappy_byte_at(table, pos + 3),
+    lz77.hash4(
+      lz77.table_at(table, pos),
+      lz77.table_at(table, pos + 1),
+      lz77.table_at(table, pos + 2),
+      lz77.table_at(table, pos + 3),
     )
   case dict.get(hashes, key) {
     Ok(prev) -> {
@@ -446,7 +447,7 @@ fn snappy_step(
       let valid =
         offset >= 1
         && offset <= snappy_max_distance
-        && snappy_bytes4_equal(table, prev, pos)
+        && lz77.same4(table, prev, pos)
       case valid {
         False ->
           snappy_compress_loop(
@@ -458,7 +459,7 @@ fn snappy_step(
             acc,
           )
         True -> {
-          let match_len = snappy_match_length(table, prev, pos, size, 0)
+          let match_len = lz77.table_match_length(table, prev, pos, size, 0)
           case match_len < snappy_min_match {
             True ->
               snappy_compress_loop(
@@ -472,20 +473,17 @@ fn snappy_step(
             False -> {
               let literals = case pos > last_lit_start {
                 True ->
-                  emit_literal(
-                    snappy_slice(
-                      table,
-                      last_lit_start,
-                      pos - last_lit_start,
-                      <<>>,
-                    ),
-                  )
+                  emit_literal(lz77.table_slice(
+                    table,
+                    last_lit_start,
+                    pos - last_lit_start,
+                  ))
                 False -> <<>>
               }
               let copy = emit_copy_for(offset, match_len, <<>>)
               let next_pos = pos + match_len
               let new_hashes =
-                snappy_insert_hashes(
+                lz77.insert_hashes4(
                   table,
                   dict.insert(hashes, key, pos),
                   pos + 1,
@@ -511,110 +509,6 @@ fn snappy_step(
         dict.insert(hashes, key, pos),
         acc,
       )
-  }
-}
-
-fn build_snappy_byte_table(
-  bytes: BitArray,
-  index: Int,
-  acc: dict.Dict(Int, Int),
-) -> dict.Dict(Int, Int) {
-  case bytes {
-    <<b, rest:bytes>> ->
-      build_snappy_byte_table(rest, index + 1, dict.insert(acc, index, b))
-    _ -> acc
-  }
-}
-
-fn snappy_byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
-  case dict.get(table, index) {
-    Ok(b) -> b
-    _ -> 0
-  }
-}
-
-fn snappy_hash4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int {
-  let combined =
-    int.bitwise_or(
-      b0,
-      int.bitwise_or(
-        int.bitwise_shift_left(b1, 8),
-        int.bitwise_or(
-          int.bitwise_shift_left(b2, 16),
-          int.bitwise_shift_left(b3, 24),
-        ),
-      ),
-    )
-  int.bitwise_and(combined * 2_654_435_761, 0xFFFF)
-}
-
-fn snappy_bytes4_equal(table: dict.Dict(Int, Int), p1: Int, p2: Int) -> Bool {
-  snappy_byte_at(table, p1) == snappy_byte_at(table, p2)
-  && snappy_byte_at(table, p1 + 1) == snappy_byte_at(table, p2 + 1)
-  && snappy_byte_at(table, p1 + 2) == snappy_byte_at(table, p2 + 2)
-  && snappy_byte_at(table, p1 + 3) == snappy_byte_at(table, p2 + 3)
-}
-
-fn snappy_match_length(
-  table: dict.Dict(Int, Int),
-  base: Int,
-  cursor: Int,
-  limit_pos: Int,
-  acc: Int,
-) -> Int {
-  case cursor + acc >= limit_pos {
-    True -> acc
-    False ->
-      case
-        snappy_byte_at(table, base + acc) == snappy_byte_at(table, cursor + acc)
-      {
-        True -> snappy_match_length(table, base, cursor, limit_pos, acc + 1)
-        False -> acc
-      }
-  }
-}
-
-fn snappy_insert_hashes(
-  table: dict.Dict(Int, Int),
-  hashes: dict.Dict(Int, Int),
-  from: Int,
-  to: Int,
-  size: Int,
-) -> dict.Dict(Int, Int) {
-  case from > to || from + snappy_min_match > size {
-    True -> hashes
-    False -> {
-      let key =
-        snappy_hash4(
-          snappy_byte_at(table, from),
-          snappy_byte_at(table, from + 1),
-          snappy_byte_at(table, from + 2),
-          snappy_byte_at(table, from + 3),
-        )
-      snappy_insert_hashes(
-        table,
-        dict.insert(hashes, key, from),
-        from + 1,
-        to,
-        size,
-      )
-    }
-  }
-}
-
-fn snappy_slice(
-  table: dict.Dict(Int, Int),
-  start: Int,
-  count: Int,
-  acc: BitArray,
-) -> BitArray {
-  case count {
-    0 -> acc
-    _ ->
-      snappy_slice(table, start + 1, count - 1, <<
-        acc:bits,
-        snappy_byte_at(table, start),
-      >>)
   }
 }
 

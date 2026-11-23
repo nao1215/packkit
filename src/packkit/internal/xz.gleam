@@ -640,7 +640,7 @@ fn apply_pre_filters_loop(
       // Delta filter property byte stores `distance - 1` so
       // distances 1..256 fit in one byte.
       let distance = props + 1
-      apply_pre_filters_loop(delta_decode(bytes, distance), rest)
+      apply_pre_filters_loop(bcj.delta_decode(bytes, distance), rest)
     }
     [#(0x04, _), ..rest] -> {
       // x86 BCJ filter — xz resets the encoder's `now_pos` to 0 at
@@ -681,64 +681,6 @@ fn apply_pre_filters_loop(
       Error(codec.Unsupported(
         feature: "xz pre-processor filter id " <> int.to_string(id),
       ))
-  }
-}
-
-/// Delta decode: output[i] = input[i] + output[i - distance] mod 256.
-/// For the first `distance` bytes there's no predecessor so they
-/// pass through unchanged.
-fn delta_decode(bytes: BitArray, distance: Int) -> BitArray {
-  let bytes_list = bit_array_to_byte_list(bytes, [])
-  let decoded = delta_decode_loop(bytes_list, distance, [], 0)
-  byte_list_to_bit_array(decoded, <<>>)
-}
-
-fn delta_decode_loop(
-  remaining: List(Int),
-  distance: Int,
-  acc_reversed: List(Int),
-  count: Int,
-) -> List(Int) {
-  case remaining {
-    [] -> list.reverse(acc_reversed)
-    [b, ..rest] -> {
-      let prev = case count >= distance {
-        True -> nth_from_end(acc_reversed, distance - 1)
-        False -> 0
-      }
-      let decoded_byte = int.bitwise_and(b + prev, 0xFF)
-      delta_decode_loop(
-        rest,
-        distance,
-        [decoded_byte, ..acc_reversed],
-        count + 1,
-      )
-    }
-  }
-}
-
-fn nth_from_end(reversed_list: List(Int), index: Int) -> Int {
-  // `reversed_list` is the output so far in newest-first order;
-  // index 0 is the latest decoded byte, index `distance-1` is the
-  // byte at offset `distance` behind the cursor.
-  case reversed_list, index {
-    [], _ -> 0
-    [head, ..], 0 -> head
-    [_, ..rest], _ -> nth_from_end(rest, index - 1)
-  }
-}
-
-fn bit_array_to_byte_list(bytes: BitArray, acc: List(Int)) -> List(Int) {
-  case bytes {
-    <<b, rest:bytes>> -> bit_array_to_byte_list(rest, [b, ..acc])
-    _ -> list.reverse(acc)
-  }
-}
-
-fn byte_list_to_bit_array(bytes: List(Int), acc: BitArray) -> BitArray {
-  case bytes {
-    [] -> acc
-    [b, ..rest] -> byte_list_to_bit_array(rest, <<acc:bits, b>>)
   }
 }
 
@@ -1122,46 +1064,29 @@ fn varint_size(value: Int) -> Int {
   }
 }
 
-// -- BitArray helpers ---------------------------------------------------
-
 fn slice_required(
-  bytes: BitArray,
+  source: BitArray,
   offset: Int,
   length: Int,
   label: String,
 ) -> Result(BitArray, codec.CodecError) {
-  use #(_, rest) <- result.try(split_required(bytes, offset, label))
-  use #(value, _) <- result.try(split_required(rest, length, label))
-  Ok(value)
+  bytes.slice(source, offset, length)
+  |> result.replace_error(codec.InvalidData(message: "truncated " <> label))
 }
 
-// Splits `bytes` after `count` bytes, or fails when `bytes` is shorter or
-// `count` is negative.
 fn split_required(
-  bytes: BitArray,
+  source: BitArray,
   count: Int,
   label: String,
 ) -> Result(#(BitArray, BitArray), codec.CodecError) {
-  let truncated = Error(codec.InvalidData(message: "truncated " <> label))
-  use <- bool.guard(when: count < 0, return: truncated)
-  case bytes {
-    <<head:bytes-size(count), rest:bytes>> -> Ok(#(head, rest))
-    _ -> truncated
-  }
+  bytes.split(source, count)
+  |> result.replace_error(codec.InvalidData(message: "truncated " <> label))
 }
 
 fn slice_is_zero(bytes: BitArray, offset: Int, length: Int) -> Bool {
   case bit_array.slice(bytes, offset, length) {
-    Ok(chunk) -> all_zero(chunk)
+    Ok(chunk) -> bytes.all_zero(chunk)
     Error(_) -> True
-  }
-}
-
-fn all_zero(bytes: BitArray) -> Bool {
-  case bytes {
-    <<>> -> True
-    <<0, rest:bytes>> -> all_zero(rest)
-    _ -> False
   }
 }
 

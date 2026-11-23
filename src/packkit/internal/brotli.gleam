@@ -54,6 +54,7 @@ import packkit/internal/brotli_context as brotli_ctx
 import packkit/internal/brotli_dictionary as brotli_dict
 import packkit/internal/brotli_transform as brotli_xfm
 import packkit/internal/bytes
+import packkit/internal/lz77
 import packkit/limit
 
 /// Encode `bytes` as a Brotli stream made up of uncompressed
@@ -162,7 +163,7 @@ fn try_emit_compressed_literals(
   // The decoder accepts code lengths up to 15 bits and requires the
   // Huffman space to be exhausted exactly (Kraft equality).  Bail to
   // the uncompressed fallback if either invariant is violated.
-  let max_len_ok = max_in_int_list(lengths, 0) <= 15
+  let max_len_ok = list.fold(lengths, 0, int.max) <= 15
   let kraft_ok = kraft_slot_total(lengths, 32_768, 15) == 32_768
   case max_len_ok && kraft_ok {
     False -> None
@@ -190,17 +191,6 @@ fn kraft_slot_loop(lengths: List(Int), acc: Int) -> Int {
     [0, ..rest] -> kraft_slot_loop(rest, acc)
     [len, ..rest] ->
       kraft_slot_loop(rest, acc + int.bitwise_shift_right(32_768, len))
-  }
-}
-
-fn max_in_int_list(values: List(Int), acc: Int) -> Int {
-  case values {
-    [] -> acc
-    [v, ..rest] ->
-      case v > acc {
-        True -> max_in_int_list(rest, v)
-        False -> max_in_int_list(rest, acc)
-      }
   }
 }
 
@@ -1275,7 +1265,7 @@ fn alphabet_valid(lengths: List(Int)) -> Bool {
   // the Kraft-equality check (decoder's
   // `validate_symbol_lengths` / `read_symbol_code_lengths` both
   // require it).
-  max_in_int_list(lengths, 0) <= 15
+  list.fold(lengths, 0, int.max) <= 15
   && kraft_slot_total(lengths, 32_768, 15) == 32_768
 }
 
@@ -1419,10 +1409,10 @@ fn lz77_match_loop(
   case pos + lz77_min_match > total {
     True -> #(commands_rev, last_emit)
     False -> {
-      let b0 = brotli_byte_at(bytes, pos)
-      let b1 = brotli_byte_at(bytes, pos + 1)
-      let b2 = brotli_byte_at(bytes, pos + 2)
-      let b3 = brotli_byte_at(bytes, pos + 3)
+      let b0 = lz77.byte_at(bytes, pos)
+      let b1 = lz77.byte_at(bytes, pos + 1)
+      let b2 = lz77.byte_at(bytes, pos + 2)
+      let b3 = lz77.byte_at(bytes, pos + 3)
       let key = brotli_hash4(b0, b1, b2, b3)
       case dict.get(hashes, key) {
         Error(_) ->
@@ -1474,7 +1464,7 @@ fn lz77_consider_match(
         True -> total - pos
         False -> lz77_max_match
       }
-      let m_len = brotli_match_len(bytes, prev, pos, cap, 0)
+      let m_len = lz77.match_length(bytes, prev, pos, cap, 0)
       case m_len >= lz77_min_match {
         True -> {
           let cmd =
@@ -1511,10 +1501,10 @@ fn lz77_consider_match(
 }
 
 fn brotli_byte_key(bytes: BitArray, pos: Int) -> Int {
-  let b0 = brotli_byte_at(bytes, pos)
-  let b1 = brotli_byte_at(bytes, pos + 1)
-  let b2 = brotli_byte_at(bytes, pos + 2)
-  let b3 = brotli_byte_at(bytes, pos + 3)
+  let b0 = lz77.byte_at(bytes, pos)
+  let b1 = lz77.byte_at(bytes, pos + 1)
+  let b2 = lz77.byte_at(bytes, pos + 2)
+  let b3 = lz77.byte_at(bytes, pos + 3)
   brotli_hash4(b0, b1, b2, b3)
 }
 
@@ -1526,32 +1516,6 @@ fn brotli_hash4(b0: Int, b1: Int, b2: Int, b3: Int) -> Int {
     ),
     0x3FFFF,
   )
-}
-
-fn brotli_byte_at(bytes: BitArray, pos: Int) -> Int {
-  case bit_array.slice(bytes, pos, 1) {
-    Ok(<<b>>) -> b
-    _ -> 0
-  }
-}
-
-fn brotli_match_len(
-  bytes: BitArray,
-  a: Int,
-  b: Int,
-  cap: Int,
-  count: Int,
-) -> Int {
-  case count >= cap {
-    True -> count
-    False ->
-      case
-        brotli_byte_at(bytes, a + count) == brotli_byte_at(bytes, b + count)
-      {
-        True -> brotli_match_len(bytes, a, b, cap, count + 1)
-        False -> count
-      }
-  }
 }
 
 fn brotli_update_hashes(
@@ -1721,7 +1685,7 @@ fn tally_literal_range(
   case count {
     0 -> acc
     _ -> {
-      let byte = brotli_byte_at(bytes, pos)
+      let byte = lz77.byte_at(bytes, pos)
       let cur = case dict.get(acc, byte) {
         Ok(v) -> v
         Error(_) -> 0
@@ -1908,7 +1872,7 @@ fn emit_literal_run(
   case remaining {
     0 -> writer
     _ -> {
-      let byte = brotli_byte_at(bytes, pos)
+      let byte = lz77.byte_at(bytes, pos)
       let writer = emit_huffman_symbol(writer, codes, byte)
       emit_literal_run(writer, bytes, pos + 1, remaining - 1, codes)
     }
@@ -2057,14 +2021,7 @@ fn bw_flush(writer: BitWriter) -> BitArray {
       BitWriter(bytes_rev: [byte, ..writer.bytes_rev], buffer: 0, bits: 0)
     }
   }
-  bw_bytes_to_bit_array(list.reverse(writer.bytes_rev), <<>>)
-}
-
-fn bw_bytes_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> bw_bytes_to_bit_array(rest, <<acc:bits, head>>)
-  }
+  bytes.from_reversed_list(writer.bytes_rev)
 }
 
 /// Decode a Brotli stream using explicit limits.

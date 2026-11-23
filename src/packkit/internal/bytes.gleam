@@ -2,6 +2,8 @@
 
 import gleam/bit_array
 import gleam/bool
+import gleam/list
+import gleam/result
 import packkit/codec
 import packkit/limit
 
@@ -110,4 +112,62 @@ fn repeat_window(window: BitArray, length: Int) -> BitArray {
     <<head:bytes-size(length), _:bytes>> -> head
     _ -> repeat_window(<<window:bits, window:bits>>, length)
   }
+}
+
+/// Builds a bit array from a list of byte values.
+pub fn from_list(values: List(Int)) -> BitArray {
+  list.fold(values, <<>>, fn(acc, byte) { <<acc:bits, byte>> })
+}
+
+/// Builds a bit array from a list of byte values in reverse order, the
+/// last byte first.
+pub fn from_reversed_list(values: List(Int)) -> BitArray {
+  from_list(list.reverse(values))
+}
+
+/// Returns the bytes of `bytes` as a list of byte values.
+pub fn to_list(bytes: BitArray) -> List(Int) {
+  to_list_loop(bytes, [])
+}
+
+fn to_list_loop(bytes: BitArray, acc: List(Int)) -> List(Int) {
+  case bytes {
+    <<byte, rest:bytes>> -> to_list_loop(rest, [byte, ..acc])
+    _ -> list.reverse(acc)
+  }
+}
+
+/// Reports whether every byte is zero. An empty bit array is all zero.
+pub fn all_zero(bytes: BitArray) -> Bool {
+  case bytes {
+    <<0, rest:bytes>> -> all_zero(rest)
+    <<>> -> True
+    _ -> False
+  }
+}
+
+/// Splits `bytes` after `count` bytes, or returns `Error(Nil)` when
+/// `bytes` is shorter or `count` is negative.
+pub fn split(
+  bytes: BitArray,
+  count: Int,
+) -> Result(#(BitArray, BitArray), Nil) {
+  use <- bool.guard(when: count < 0, return: Error(Nil))
+  case bytes {
+    <<head:bytes-size(count), rest:bytes>> -> Ok(#(head, rest))
+    _ -> Error(Nil)
+  }
+}
+
+/// Returns `length` bytes from `offset`, or `Error(Nil)` when they are
+/// not all inside `bytes`. Unlike `bit_array.slice` on Erlang, a negative
+/// length is an error and does not read backwards.
+pub fn slice(
+  bytes: BitArray,
+  offset: Int,
+  length: Int,
+) -> Result(BitArray, Nil) {
+  use #(_, rest) <- result.try(split(bytes, offset))
+  use #(value, _) <- result.try(split(rest, length))
+  Ok(value)
 }

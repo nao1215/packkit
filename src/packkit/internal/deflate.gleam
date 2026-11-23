@@ -25,6 +25,7 @@ import gleam/order
 import gleam/result
 import packkit/codec
 import packkit/internal/bytes
+import packkit/internal/lz77
 import packkit/limit
 
 const max_bits: Int = 15
@@ -936,7 +937,7 @@ fn encode_huffman(bytes: BitArray) -> BitArray {
       flush_writer(writer)
     }
     _ -> {
-      let byte_table = build_byte_table(bytes, 0, dict.new())
+      let byte_table = lz77.table(bytes)
       let writer =
         new_writer()
         |> write_bits(1, 1)
@@ -946,35 +947,6 @@ fn encode_huffman(bytes: BitArray) -> BitArray {
       flush_writer(writer)
     }
   }
-}
-
-fn build_byte_table(
-  bytes: BitArray,
-  index: Int,
-  acc: dict.Dict(Int, Int),
-) -> dict.Dict(Int, Int) {
-  case bytes {
-    <<b, rest:bytes>> ->
-      build_byte_table(rest, index + 1, dict.insert(acc, index, b))
-    _ -> acc
-  }
-}
-
-fn byte_at(table: dict.Dict(Int, Int), index: Int) -> Int {
-  case dict.get(table, index) {
-    Ok(value) -> value
-    Error(_) -> 0
-  }
-}
-
-fn hash3(b0: Int, b1: Int, b2: Int) -> Int {
-  int.bitwise_and(
-    int.bitwise_exclusive_or(
-      int.bitwise_exclusive_or(b0 * 2_654_435_761, b1 * 40_503),
-      b2 * 2_246_822_519,
-    ),
-    0xFFFF,
-  )
 }
 
 fn emit_lz77(
@@ -989,14 +961,15 @@ fn emit_lz77(
     False ->
       case pos + min_match_length > size {
         True -> {
-          let writer = write_fixed_literal_code(writer, byte_at(table, pos))
+          let writer =
+            write_fixed_literal_code(writer, lz77.table_at(table, pos))
           emit_lz77(table, size, pos + 1, hashes, writer)
         }
         False -> {
-          let b0 = byte_at(table, pos)
-          let b1 = byte_at(table, pos + 1)
-          let b2 = byte_at(table, pos + 2)
-          let key = hash3(b0, b1, b2)
+          let b0 = lz77.table_at(table, pos)
+          let b1 = lz77.table_at(table, pos + 1)
+          let b2 = lz77.table_at(table, pos + 2)
+          let key = lz77.hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) -> {
               let writer = write_fixed_literal_code(writer, b0)
@@ -1068,7 +1041,9 @@ fn match_length(
   case acc >= max || cursor + acc >= size {
     True -> acc
     False ->
-      case byte_at(table, base + acc) == byte_at(table, cursor + acc) {
+      case
+        lz77.table_at(table, base + acc) == lz77.table_at(table, cursor + acc)
+      {
         True -> match_length(table, base, cursor, size, max, acc + 1)
         False -> acc
       }
@@ -1086,10 +1061,10 @@ fn insert_hashes_in_range(
     True -> hashes
     False -> {
       let key =
-        hash3(
-          byte_at(table, from),
-          byte_at(table, from + 1),
-          byte_at(table, from + 2),
+        lz77.hash3(
+          lz77.table_at(table, from),
+          lz77.table_at(table, from + 1),
+          lz77.table_at(table, from + 2),
         )
       insert_hashes_in_range(
         table,
@@ -1263,14 +1238,7 @@ fn flush_writer(writer: Writer) -> BitArray {
         bits: 0,
       )
   }
-  list_to_bit_array(list.reverse(writer.bytes), <<>>)
-}
-
-fn list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> list_to_bit_array(rest, <<acc:bits, head>>)
-  }
+  bytes.from_reversed_list(writer.bytes)
 }
 
 // -- small list helpers --------------------------------------------------
@@ -1336,7 +1304,7 @@ fn encode_dynamic_or_fixed(bytes: BitArray) -> BitArray {
   case size {
     0 -> empty_dynamic_block()
     _ -> {
-      let table = build_byte_table(bytes, 0, dict.new())
+      let table = lz77.table(bytes)
       let tokens = collect_lz77_tokens(table, size, 0, dict.new(), [])
       case build_dynamic_block(tokens) {
         Ok(bytes) -> bytes
@@ -1374,14 +1342,14 @@ fn collect_lz77_tokens(
       case pos + min_match_length > size {
         True ->
           collect_lz77_tokens(table, size, pos + 1, hashes, [
-            TokLit(byte_at(table, pos)),
+            TokLit(lz77.table_at(table, pos)),
             ..acc
           ])
         False -> {
-          let b0 = byte_at(table, pos)
-          let b1 = byte_at(table, pos + 1)
-          let b2 = byte_at(table, pos + 2)
-          let key = hash3(b0, b1, b2)
+          let b0 = lz77.table_at(table, pos)
+          let b1 = lz77.table_at(table, pos + 1)
+          let b2 = lz77.table_at(table, pos + 2)
+          let key = lz77.hash3(b0, b1, b2)
           case dict.get(hashes, key) {
             Error(_) ->
               collect_lz77_tokens(

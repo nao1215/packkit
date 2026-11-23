@@ -96,7 +96,7 @@ fn decode_loop(
   case name == trailer_name {
     True -> Ok(acc)
     False -> {
-      use _ <- result.try(check_member_limit(count + 1, limits))
+      use _ <- result.try(entry.check_member_limit(count + 1, limits))
       use entry_value <- result.try(header_to_entry(header, name, body, limits))
       decode_loop(rest, [entry_value, ..acc], count + 1, limits)
     }
@@ -109,16 +109,6 @@ fn skip(bytes: BitArray, count: Int) -> BitArray {
   case bytes {
     <<_:bytes-size(count), rest:bytes>> -> rest
     _ -> <<>>
-  }
-}
-
-fn check_member_limit(
-  count: Int,
-  limits: limit.Limits,
-) -> Result(Nil, archive.ArchiveError) {
-  case count > limits.max_members {
-    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
-    False -> Ok(Nil)
   }
 }
 
@@ -388,10 +378,10 @@ fn slice_or_error(
   offset: Int,
   width: Int,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(block, offset, width) {
-    Ok(value) -> Ok(value)
-    Error(_) -> Error(archive.InvalidData(message: "cpio field out of bounds"))
-  }
+  bytes.slice(block, offset, width)
+  |> result.replace_error(archive.InvalidData(
+    message: "cpio field out of bounds",
+  ))
 }
 
 fn read_hex_field(

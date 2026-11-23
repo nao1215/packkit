@@ -94,7 +94,7 @@ fn decode_loop_with_pending(
   })
   // POSIX 1003.1 requires two consecutive zero blocks at end-of-archive;
   // a single zero block followed by truncation is malformed.
-  use <- bool.lazy_guard(when: is_zero_block(header_bits), return: fn() {
+  use <- bool.lazy_guard(when: bytes.all_zero(header_bits), return: fn() {
     verify_double_zero_terminator(bytes, acc)
   })
   use header <- result.try(parse_header(header_bits))
@@ -166,7 +166,7 @@ fn dispatch_typeflag(
     }
     _ -> {
       let merged_header = apply_pending(header, pending)
-      use _ <- result.try(check_member_limit(count + 1, limits))
+      use _ <- result.try(entry.check_member_limit(count + 1, limits))
       use entry_value <- result.try(header_to_entry(
         merged_header,
         bytes,
@@ -202,15 +202,14 @@ fn apply_pending(
 /// Returns the raw bytes; the caller is responsible for parsing
 /// the "<length> <key>=<value>\n" records inside.
 fn read_pax_body(
-  bytes: BitArray,
+  source: BitArray,
   start: Int,
   size: Int,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(bytes, start, size) {
-    Ok(chunk) -> Ok(chunk)
-    Error(_) ->
-      Error(archive.InvalidData(message: "truncated tar PAX extended header"))
-  }
+  bytes.slice(source, start, size)
+  |> result.replace_error(archive.InvalidData(
+    message: "truncated tar PAX extended header",
+  ))
 }
 
 /// Walk a PAX extended-header body and lift the keys we know how
@@ -292,16 +291,6 @@ fn read_string_body(
   }
 }
 
-fn check_member_limit(
-  count: Int,
-  limits: limit.Limits,
-) -> Result(Nil, archive.ArchiveError) {
-  case count > limits.max_members {
-    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
-    False -> Ok(Nil)
-  }
-}
-
 type ParsedHeader {
   ParsedHeader(
     name: String,
@@ -372,7 +361,7 @@ fn header_to_entry(
       ))
   })
 
-  let name_for_depth = trim_trailing_slash(header.name)
+  let name_for_depth = entry.strip_trailing_slash(header.name)
   case entry.check_path(name_for_depth) {
     Ok(Nil) ->
       case entry.depth(name_for_depth) > limits.max_entry_depth {
@@ -411,7 +400,7 @@ fn regular_entry(
 fn directory_entry(
   header: ParsedHeader,
 ) -> Result(archive.Entry, archive.ArchiveError) {
-  entry.directory_checked(path: trim_trailing_slash(header.name))
+  entry.directory_checked(path: entry.strip_trailing_slash(header.name))
   |> result.map_error(entry.to_archive_error(_, header.name))
 }
 
@@ -855,20 +844,13 @@ fn read_byte(
   }
 }
 
-fn trim_trailing_slash(value: String) -> String {
-  case string.ends_with(value, "/") {
-    True -> string.drop_end(value, 1)
-    False -> value
-  }
-}
-
 fn verify_double_zero_terminator(
   bytes: BitArray,
   acc: List(archive.Entry),
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
   case bit_array.slice(bytes, block_size, block_size) {
     Ok(second) ->
-      case is_zero_block(second) {
+      case bytes.all_zero(second) {
         True -> Ok(acc)
         False ->
           Error(archive.InvalidData(
@@ -879,13 +861,5 @@ fn verify_double_zero_terminator(
       Error(archive.InvalidData(
         message: "tar stream ended after a single zero block",
       ))
-  }
-}
-
-fn is_zero_block(block: BitArray) -> Bool {
-  case block {
-    <<>> -> True
-    <<0, rest:bytes>> -> is_zero_block(rest)
-    _ -> False
   }
 }

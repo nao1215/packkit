@@ -1064,7 +1064,7 @@ fn walk_bwt(
 fn rle1_decode(input: dict.Dict(Int, Int), length: Int) -> BitArray {
   rle1_decode_loop(input, 0, length, -1, 0, [])
   |> list.reverse
-  |> bytes_list_to_bit_array(<<>>)
+  |> bytes.from_list
 }
 
 fn rle1_decode_loop(
@@ -1100,13 +1100,6 @@ fn rle1_decode_loop(
         }
       }
     }
-  }
-}
-
-fn bytes_list_to_bit_array(bytes: List(Int), acc: BitArray) -> BitArray {
-  case bytes {
-    [] -> acc
-    [head, ..rest] -> bytes_list_to_bit_array(rest, <<acc:bits, head>>)
   }
 }
 
@@ -1931,12 +1924,5 @@ fn flush_writer_msb(writer: Writer) -> BitArray {
       Writer(bytes_rev: [byte, ..writer.bytes_rev], buffer: 0, bits: 0)
     }
   }
-  list_to_bit_array(list.reverse(writer.bytes_rev), <<>>)
-}
-
-fn list_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
-  case values {
-    [] -> acc
-    [head, ..rest] -> list_to_bit_array(rest, <<acc:bits, head>>)
-  }
+  bytes.from_reversed_list(writer.bytes_rev)
 }

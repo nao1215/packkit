@@ -192,3 +192,23 @@ pub fn finish(
   )
   Ok(archive.Archive(format:, entries: list.reverse(reversed), comment: None))
 }
+
+/// Returns `LimitExceeded` when a reader is about to keep its
+/// `count`-th entry and `count` is over `max_members`.
+pub fn check_member_limit(
+  count: Int,
+  limits: Limits,
+) -> Result(Nil, ArchiveError) {
+  case count > limits.max_members {
+    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
+    False -> Ok(Nil)
+  }
+}
+
+/// Drops one trailing `/`, which tar and ZIP put after directory names.
+pub fn strip_trailing_slash(path: String) -> String {
+  case string.ends_with(path, "/") {
+    True -> string.drop_end(path, 1)
+    False -> path
+  }
+}
