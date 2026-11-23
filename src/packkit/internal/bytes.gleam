@@ -171,3 +171,16 @@ pub fn slice(
   use #(value, _) <- result.try(split(rest, length))
   Ok(value)
 }
+
+/// Returns `LimitExceeded` when the compressed input is larger than
+/// `max_input_bytes`.
+pub fn check_input(
+  input: BitArray,
+  limits: limit.Limits,
+) -> Result(Nil, codec.CodecError) {
+  let size = bit_array.byte_size(input)
+  case size > limits.max_input_bytes {
+    True -> Error(codec.LimitExceeded(limit: "max_input_bytes", actual: size))
+    False -> Ok(Nil)
+  }
+}

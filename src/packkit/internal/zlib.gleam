@@ -9,6 +9,7 @@ import gleam/bool
 import gleam/int
 import gleam/result
 import packkit/codec
+import packkit/internal/bytes
 import packkit/internal/checksum
 import packkit/internal/deflate
 import packkit/limit
@@ -36,13 +37,7 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   case bytes {
     <<cmf, flg, rest:bytes>> -> {

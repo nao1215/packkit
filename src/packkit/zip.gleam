@@ -344,13 +344,7 @@ fn decode_internal(
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(archive.Archive, archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(archive.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(entry.check_input(bytes, limits))
 
   use eocd_offset <- result.try(locate_eocd(bytes))
   use eocd <- result.try(read_eocd(bytes, eocd_offset))

@@ -212,3 +212,16 @@ pub fn strip_trailing_slash(path: String) -> String {
     False -> path
   }
 }
+
+/// Returns `LimitExceeded` when the archive is larger than
+/// `max_input_bytes`.
+pub fn check_input(
+  input: BitArray,
+  limits: Limits,
+) -> Result(Nil, ArchiveError) {
+  let size = bit_array.byte_size(input)
+  case size > limits.max_input_bytes {
+    True -> Error(archive.LimitExceeded(limit: "max_input_bytes", actual: size))
+    False -> Ok(Nil)
+  }
+}

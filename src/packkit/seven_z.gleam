@@ -982,13 +982,7 @@ fn decode_internal(
   password: Option(String),
   limits: limit.Limits,
 ) -> Result(archive.Archive, archive.ArchiveError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(archive.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(entry.check_input(bytes, limits))
 
   use #(next_offset, next_size, _crc) <- result.try(parse_signature_header(
     bytes,

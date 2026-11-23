@@ -10,6 +10,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import packkit/codec
+import packkit/internal/bytes
 import packkit/internal/checksum
 import packkit/internal/deflate
 import packkit/limit
@@ -268,13 +269,7 @@ pub fn decode(
   bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(Decoded, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   decode_first_member_and_continue(bytes, limits)
 }

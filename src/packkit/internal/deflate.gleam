@@ -45,13 +45,7 @@ pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(BitArray, codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   let reader = Reader(buffer: 0, bits: 0, source: bytes, overflow: False)
   case inflate(reader, <<>>, limits) {
@@ -73,13 +67,7 @@ pub fn decode_with_remainder(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(#(BitArray, BitArray), codec.CodecError) {
-  use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_input_bytes",
-      actual: bit_array.byte_size(bytes),
-    )),
-  )
+  use _ <- result.try(bytes.check_input(bytes, limits))
 
   let reader = Reader(buffer: 0, bits: 0, source: bytes, overflow: False)
   use #(output, final_reader) <- result.try(inflate(reader, <<>>, limits))
