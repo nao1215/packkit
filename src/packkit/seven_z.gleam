@@ -4008,20 +4008,7 @@ fn add_file(
   acc: List(archive.Entry),
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  case entry.file_checked(path: name, body: body) {
-    Ok(e) -> {
-      let depth = entry.depth(e.path)
-      case depth > limits.max_entry_depth {
-        True ->
-          Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth))
-        False -> Ok([apply_mtime(e, mtime), ..acc])
-      }
-    }
-    Error(_) ->
-      Error(archive.InvalidData(
-        message: "7z file name failed path validation: " <> name,
-      ))
-  }
+  add_checked(name, entry.file_checked(path: name, body:), mtime, acc, limits)
 }
 
 fn add_directory(
@@ -4030,20 +4017,35 @@ fn add_directory(
   acc: List(archive.Entry),
   limits: limit.Limits,
 ) -> Result(List(archive.Entry), archive.ArchiveError) {
-  case entry.directory_checked(path: name) {
-    Ok(e) -> {
-      let depth = entry.depth(e.path)
-      case depth > limits.max_entry_depth {
-        True ->
-          Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth))
-        False -> Ok([apply_mtime(e, mtime), ..acc])
-      }
-    }
-    Error(_) ->
-      Error(archive.InvalidData(
-        message: "7z directory name failed path validation: " <> name,
-      ))
-  }
+  add_checked(name, entry.directory_checked(path: name), mtime, acc, limits)
+}
+
+// Checks a name against the limits before the path itself, in the same
+// order as the other readers.
+fn add_checked(
+  name: String,
+  checked: Result(archive.Entry, entry.EntryError),
+  mtime: Option(Int),
+  acc: List(archive.Entry),
+  limits: limit.Limits,
+) -> Result(List(archive.Entry), archive.ArchiveError) {
+  let name_bytes = string.byte_size(name)
+  use <- bool.guard(
+    when: name_bytes > limits.max_entry_name_bytes,
+    return: Error(archive.LimitExceeded(
+      limit: "max_entry_name_bytes",
+      actual: name_bytes,
+    )),
+  )
+  use e <- result.try(
+    checked |> result.map_error(entry.to_archive_error(_, name)),
+  )
+  let depth = entry.depth(e.path)
+  use <- bool.guard(
+    when: depth > limits.max_entry_depth,
+    return: Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth)),
+  )
+  Ok([apply_mtime(e, mtime), ..acc])
 }
 
 // -- byte / number helpers ---------------------------------------------

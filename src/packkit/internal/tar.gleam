@@ -58,12 +58,7 @@ pub fn decode_with_limits(
   )
 
   decode_loop(bytes, [], 0, limits)
-  |> result.map(list.reverse)
-  |> result.map(archive.Archive(
-    format: archive.Tar,
-    entries: _,
-    comment: option.None,
-  ))
+  |> result.try(entry.finish(_, archive.Tar, limits))
 }
 
 type PendingOverride {

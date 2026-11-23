@@ -70,12 +70,7 @@ pub fn decode_with_limits(
   let body_size = bit_array.byte_size(bytes) - magic_size
   let assert Ok(rest) = bit_array.slice(bytes, magic_size, body_size)
   decode_loop(rest, [], 0, option.None, limits)
-  |> result.map(list.reverse)
-  |> result.map(archive.Archive(
-    format: archive.Ar,
-    entries: _,
-    comment: option.None,
-  ))
+  |> result.try(entry.finish(_, archive.Ar, limits))
 }
 
 fn decode_loop(

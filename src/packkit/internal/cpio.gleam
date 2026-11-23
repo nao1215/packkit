@@ -10,7 +10,6 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
-import gleam/option
 import gleam/result
 import gleam/string
 import packkit/archive
@@ -60,12 +59,7 @@ pub fn decode_with_limits(
     )),
   )
   decode_loop(bytes, [], 0, limits)
-  |> result.map(list.reverse)
-  |> result.map(archive.Archive(
-    format: archive.Cpio,
-    entries: _,
-    comment: option.None,
-  ))
+  |> result.try(entry.finish(_, archive.Cpio, limits))
 }
 
 fn decode_loop(
