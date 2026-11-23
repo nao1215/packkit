@@ -7,6 +7,60 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+### Breaking
+
+The public API shrinks from 26 modules to 7: `packkit`, `packkit/codec`, `packkit/archive`, `packkit/limit`, `packkit/gzip`, `packkit/zip` and `packkit/seven_z`.
+
+- `Archive`, `Entry`, `ArchiveFormat`, `Codec` and `Limits` are plain records and custom types instead of opaque values, so they are built with their constructors and read by field access. Their getters and setters are removed: `archive.new`, `from_entries`, `add`, `add_file`, `add_directory`, `add_symlink`, `add_hardlink`, `with_comment`, `entries`, `entry_count`, `format`, `comment`, `kind` and `name`; `codec.with_level`, `clear_level`, `with_dictionary`, `clear_dictionary`, `dictionary`, `dictionary_bytes`, `kind`, `name`, `level`, `dictionary_of` and `has_dictionary`; and the `limit` getters, `with_max_*` setters, `new` and `new_checked`.
+- `packkit/entry` merges into `packkit/archive`. `EntryKind` carries the body or the link target (`File(body)`, `Directory`, `Symlink(target)`, `Hardlink(target)`), and `archive.new_entry(path:, kind:)` fills in the usual mode, owner 0 and time 0. Paths and metadata are checked when the archive is written: `packkit.write`, `zip.encode` and `seven_z.encode` return `EntryRejected` for an unsafe path, a NUL byte in a link target, or a negative mode, owner id or time. `Metadata`, `EntryPath`, `EntryError`, `MetadataError`, the getters, the setters and the `_checked` constructors are removed.
+- `packkit/error` is removed. `CodecError` moves to `packkit/codec` and `ArchiveError` to `packkit/archive`, and the variants lose their prefix, so `CodecInvalidData` becomes `codec.InvalidData` and `ArchiveEntryRejected` becomes `archive.EntryRejected`. `CodecNotImplemented` and `ArchiveNotImplemented` become `Unsupported`, `FormatMismatch` and `CommentUnsupported` carry `ArchiveFormat` values, and `CodecDictionaryRequired` has no field. `format_codec_error` and `format_archive_error` become `codec.error_to_string` and `archive.error_to_string`. `RecipeError`, `DetectError`, `ArchiveUnsupported`, `CodecOptionUnsupported` and `CodecDictionaryMismatch` are removed.
+- `packkit/recipe` and `packkit/detect` move into `packkit`. `Recipe(format:, codecs:)` lists codecs from the inside out; the 18 shortcut constructors, `archive_only`, `archive_with`, `wrap`, the getters and `description` are removed. Detection returns `Result(Detected, Nil)`, where `Detected` is `Compressed(codec)` or `Archived(recipe)`, from `packkit.detect_filename`, `detect_bytes` and `detect` (was `detect_path_or_bytes`).
+- `packkit/level` is removed, together with compression levels and zlib preset dictionaries. The zlib decoder only checked the dictionary id and never used the dictionary as history.
+- `packkit/stream` and the gzip `Decoder` are removed. They kept every chunk in memory and decoded once at the end; join the chunks and call `packkit.decompress` instead.
+- `packkit/checksum` and the modules for tar, cpio, ar and every codec except gzip are internal now. Use `packkit.compress`, `decompress`, `read` and `write`. Their extra functions (`deflate.encode_stored_only`, `encode_dynamic` and `decode_with_remainder`, `bzip2.encode_with_level`, `lz4.encode_with_content_size`, `lzw.encode_with_options`, the Snappy raw block functions and `zstd.frame_header_for_size`) are no longer public.
+- The first argument of `compress`, `decompress`, `read`, `unpack`, `pack` and their `_with_limits` forms has no label, and `write` takes only the archive, because the archive knows its format. `packkit.package_version` is removed.
+- `gzip.Header` is a record with `name`, `comment`, `modified_at` and `extra`. `gzip.encode(bytes, header:)` checks the header and returns `HeaderError`, whose variants lose the `Header` prefix. `gzip.decode(bytes, limits:)` returns the header and the payload. `default_header`, the setters, the getters, `encode_with_header`, `decode_payload`, `decode_payload_with_limits`, `decode_with_limits` and `codec` are removed.
+- `zip.Method` and `seven_z.Method` are plain custom types such as `zip.Deflate` and `seven_z.Lzma`. `zip.encode(archive, method:)` replaces `encode` and `encode_with_method`, and `seven_z.encode(archive, method:, encryption:)` with `Unencrypted`, `EncryptContents(password)` or `EncryptContentsAndHeaders(password)` replaces the six `encode_*` functions. `decode_with_password(bytes:, password:, limits:)` replaces the two password decoders in each module. `format`, `new`, `decode`, `decode_with_limits`, `zip.name` and `zip.inner_codec` are removed.
+- `Limits` loses `max_window_bits`. A zlib stream whose window is over 32 KiB is now `InvalidData`, as RFC 1950 requires.
+
+Before:
+
+```gleam
+import packkit
+import packkit/archive
+import packkit/recipe
+import packkit/tar
+
+let archive_value =
+  tar.new() |> tar.add_file(path: "hello.txt", body: <<"hi":utf8>>)
+let assert Ok(bytes) =
+  packkit.pack(archive_value: archive_value, using: recipe.tar_gzip())
+let assert Ok(decoded) = packkit.unpack(bytes: bytes, using: recipe.tar_gzip())
+archive.entry_count(decoded)
+```
+
+After:
+
+```gleam
+import gleam/list
+import gleam/option.{None}
+import packkit
+import packkit/archive.{Archive, File}
+import packkit/codec
+
+let hello = archive.new_entry(path: "hello.txt", kind: File(<<"hi":utf8>>))
+let backup = Archive(format: archive.Tar, entries: [hello], comment: None)
+let recipe = packkit.Recipe(format: archive.Tar, codecs: [codec.Gzip])
+let assert Ok(bytes) = packkit.pack(backup, using: recipe)
+let assert Ok(decoded) = packkit.unpack(bytes, using: recipe)
+list.length(decoded.entries)
+```
+
+### Fixed
+
+- Reading a tar or ar entry whose mode does not fit in 16 bits, such as a tar header with mode `7777777`, panicked. The mode is now kept as it is.
+- Writing a 7z archive with a comment dropped the comment silently. It now returns `CommentUnsupported`, like tar, cpio and ar.
+
 ## [0.4.0] - 2026-11-19
 
 ### Changed
