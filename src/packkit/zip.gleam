@@ -177,9 +177,6 @@ pub fn encode(
   let entries = archive_value.entries
   use #(local_blocks, central_blocks) <- result.try(encode_entries(
     entries,
-    0,
-    [],
-    [],
     method,
   ))
 
@@ -397,9 +394,6 @@ fn decode_internal(
 /// of entries (and so couldn't ever build a Zip64-sized archive).
 fn encode_entries(
   remaining: List(archive.Entry),
-  _offset: Int,
-  _local_acc: List(BitArray),
-  _central_acc: List(BitArray),
   method: Method,
 ) -> Result(#(List(BitArray), List(BitArray)), archive.ArchiveError) {
   let init = EncodeFold(offset: 0, local_acc: [], central_acc: [], error: None)
@@ -512,6 +506,9 @@ fn encode_entry(
     False -> int.bitwise_shift_left(mode, 16)
   }
   use _ <- result.try(check_u32(external_attrs, "external_attributes"))
+  use _ <- result.try(check_u32(value.modified_at, "modified_at"))
+  use _ <- result.try(check_u32(value.user_id, "uid"))
+  use _ <- result.try(check_u32(value.group_id, "gid"))
 
   // Decide whether the per-entry record needs a Zip64 extra field.
   // The local file header carries comp_size + uncomp_size; if either
@@ -856,8 +853,7 @@ fn find_unix_ts_extra_mtime(extra: BitArray) -> Option(Int) {
 // 0x7875 / "ux").  Both UID and GID are emitted as little-endian
 // uint32 (size byte = 4), which is enough headroom for every Unix
 // system in production use without paying the full uint64 cost.
-// `entry.with_owner_checked` already rejects negative values, so we
-// know the inputs fit in 32 bits unsigned.
+// `encode_entry` has already checked that both fit in 32 bits unsigned.
 fn build_unix_uid_gid_extra(uid: Int, gid: Int) -> BitArray {
   let body = <<
     unix_uid_gid_new_version,

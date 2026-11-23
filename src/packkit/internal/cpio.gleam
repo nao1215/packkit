@@ -237,7 +237,10 @@ fn encode_entry(
   let name_bytes = bit_array.from_string(path)
   let name_size = bit_array.byte_size(name_bytes) + 1
 
-  let mode = int.bitwise_or(mode_bits, value.mode)
+  // The kind decides the file type bits, so only the permission bits of
+  // the entry's mode are kept.  A mode read from ZIP still carries type
+  // bits such as 0o100000.
+  let mode = int.bitwise_or(mode_bits, int.bitwise_and(value.mode, 0o7777))
   let body_size = bit_array.byte_size(body)
   let uid = value.user_id
   let gid = value.group_id

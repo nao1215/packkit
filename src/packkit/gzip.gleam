@@ -40,8 +40,9 @@ pub type Header {
     /// Original file name.
     name: Option(String),
     comment: Option(String),
-    /// Modification time in Unix seconds. `None` is written as 0, which
-    /// gzip reads as "no time stamp".
+    /// Modification time in Unix seconds. gzip stores "no time stamp" as
+    /// 0, so both `None` and `Some(0)` are written as 0 and read back as
+    /// `None`.
     modified_at: Option(Int),
     /// Extra subfields, written in order.
     extra: List(Subfield),

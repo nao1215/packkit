@@ -941,3 +941,25 @@ pub fn decode_winzip_aes_rejects_wrong_password_test() -> Nil {
     _ -> should.fail()
   }
 }
+
+pub fn encode_rejects_owner_id_over_32_bits_test() -> Nil {
+  // The InfoZIP owner extra field stores 32-bit ids, so a larger id
+  // must not be cut down silently.
+  let wide =
+    fixture.with_owner(
+      fixture.file(path: "x.txt", body: <<>>),
+      user_id: 0x1_0000_0001,
+      group_id: 0,
+    )
+  zip.encode(
+    fixture.new(archive.Zip) |> fixture.add(entry: wide),
+    method: zip.Store,
+  )
+  |> should.equal(
+    Error(archive.FieldOverflow(
+      field: "zip uid",
+      value: 0x1_0000_0001,
+      max: 0xFFFFFFFF,
+    )),
+  )
+}

@@ -102,3 +102,20 @@ fn archive_add_file(
   let assert Ok(file_entry) = entry.file_checked(path: path, body: body)
   fixture.add(archive_value, entry: file_entry)
 }
+
+pub fn encode_keeps_only_permission_bits_of_mode_test() -> Nil {
+  // A mode read from ZIP carries file type bits (0o100644).  The cpio
+  // writer takes the type from the entry kind and keeps the
+  // permissions, so the archive still reads back.
+  let from_zip =
+    fixture.with_mode(
+      fixture.file(path: "a", body: <<"a":utf8>>),
+      mode: 0o100644,
+    )
+  let assert Ok(bytes) =
+    packkit.write(fixture.new(archive.Cpio) |> fixture.add(entry: from_zip))
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.Cpio)
+  let assert [restored] = decoded.entries
+  restored.mode
+  |> should.equal(0o644)
+}

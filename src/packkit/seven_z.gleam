@@ -525,11 +525,20 @@ fn build_encoded_next_header_for_aes(
   ])
 }
 
+// The last second a 64-bit FILETIME (100 ns ticks since 1601) can hold.
+const max_filetime_unix: Int = 1_833_029_933_770
+
 fn validate_entries_for_encode(
   entries: List(archive.Entry),
 ) -> Result(Nil, archive.ArchiveError) {
   case entries {
     [] -> Ok(Nil)
+    [head, ..] if head.modified_at > max_filetime_unix ->
+      Error(archive.FieldOverflow(
+        field: "7z mtime",
+        value: head.modified_at,
+        max: max_filetime_unix,
+      ))
     [head, ..rest] ->
       case head.kind {
         archive.File(_) -> validate_entries_for_encode(rest)

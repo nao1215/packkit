@@ -983,3 +983,21 @@ pub fn encode_rejects_archive_comment_test() -> Nil {
   |> packkit.write
   |> should.equal(Error(archive.CommentUnsupported(format: archive.SevenZ)))
 }
+
+pub fn encode_rejects_mtime_past_filetime_range_test() -> Nil {
+  let late =
+    fixture.with_modified_at(
+      fixture.file(path: "a", body: <<"a":utf8>>),
+      unix_seconds: 1_833_029_933_771,
+    )
+  fixture.new(archive.SevenZ)
+  |> fixture.add(entry: late)
+  |> packkit.write
+  |> should.equal(
+    Error(archive.FieldOverflow(
+      field: "7z mtime",
+      value: 1_833_029_933_771,
+      max: 1_833_029_933_770,
+    )),
+  )
+}

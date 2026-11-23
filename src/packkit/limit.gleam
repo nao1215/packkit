@@ -1,7 +1,8 @@
 //// Resource limits for decoding untrusted input.
 
 /// Upper bounds a decoder checks while it reads. Going over any of them
-/// returns a `LimitExceeded` error instead of using more memory.
+/// returns a `LimitExceeded` error instead of using more memory. Each
+/// field must be positive; a limit of 0 rejects every input.
 ///
 /// Change one field with the record update syntax:
 ///
