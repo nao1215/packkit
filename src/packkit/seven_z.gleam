@@ -373,7 +373,7 @@ fn encode_entries(
     ])
 
   // -- FilesInfo ---------------------------------------------------
-  use names_block <- result.try(encode_names_block(names))
+  let names_block = encode_names_block(names)
   let num_files = list.length(entries)
   let mtimes_unix = list.map(entries, fn(e) { e.modified_at })
   // Only emit the Mtime block when at least one entry carries a
@@ -890,58 +890,26 @@ fn pack_bool_bits_loop(
   }
 }
 
-fn encode_names_block(
-  names: List(String),
-) -> Result(BitArray, archive.ArchiveError) {
+fn encode_names_block(names: List(String)) -> BitArray {
   // External-flag byte (0 = inline) followed by NUL-terminated
   // UTF-16 LE strings, one per file.
-  use bodies <- result.try(encode_names_loop(names, <<>>))
-  Ok(<<0x00, bodies:bits>>)
+  list.fold(names, <<0x00>>, fn(acc, name) {
+    string.to_utf_codepoints(name)
+    |> list.fold(acc, encode_utf16_le_codepoint)
+    |> fn(bytes) { <<bytes:bits, 0:size(16)>> }
+  })
 }
 
-fn encode_names_loop(
-  names: List(String),
-  acc: BitArray,
-) -> Result(BitArray, archive.ArchiveError) {
-  case names {
-    [] -> Ok(acc)
-    [name, ..rest] -> {
-      use encoded <- result.try(encode_utf16_le_name(name))
-      encode_names_loop(rest, bit_array.concat([acc, encoded]))
-    }
-  }
-}
-
-fn encode_utf16_le_name(
-  name: String,
-) -> Result(BitArray, archive.ArchiveError) {
-  let codepoints = string.to_utf_codepoints(name)
-  use body <- result.try(encode_utf16_le_codepoints(codepoints, <<>>, name))
-  // NUL terminator (two zero bytes for UTF-16 LE).
-  Ok(<<body:bits, 0, 0>>)
-}
-
-fn encode_utf16_le_codepoints(
-  codepoints: List(UtfCodepoint),
-  acc: BitArray,
-  full_name: String,
-) -> Result(BitArray, archive.ArchiveError) {
-  case codepoints {
-    [] -> Ok(acc)
-    [cp, ..rest] -> {
-      let value = string.utf_codepoint_to_int(cp)
-      case value < 0x10000 {
-        True -> {
-          let low = int.bitwise_and(value, 0xFF)
-          let high = int.bitwise_shift_right(value, 8)
-          encode_utf16_le_codepoints(rest, <<acc:bits, low, high>>, full_name)
-        }
-        False ->
-          Error(archive.EntryRejected(
-            path: full_name,
-            reason: "7z encoder requires BMP-only file names (no UTF-16 surrogate pairs yet)",
-          ))
-      }
+fn encode_utf16_le_codepoint(acc: BitArray, cp: UtfCodepoint) -> BitArray {
+  let value = string.utf_codepoint_to_int(cp)
+  case value < 0x10000 {
+    True -> <<acc:bits, value:size(16)-little>>
+    // Code points past U+FFFF take a surrogate pair.
+    False -> {
+      let offset = value - 0x10000
+      let high = 0xD800 + int.bitwise_shift_right(offset, 10)
+      let low = 0xDC00 + int.bitwise_and(offset, 0x3FF)
+      <<acc:bits, high:size(16)-little, low:size(16)-little>>
     }
   }
 }
@@ -2146,18 +2114,11 @@ fn parse_files_loop(
           ))
         n if n == nid_name -> {
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z file names payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           use parsed_names <- result.try(parse_name_block(
             payload,
             num_files,
@@ -2175,18 +2136,11 @@ fn parse_files_loop(
         }
         n if n == nid_empty_stream -> {
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z empty-stream payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           let flags = bit_array_to_bool_list(payload, num_files, [])
           parse_files_loop(
             after_payload,
@@ -2207,18 +2161,11 @@ fn parse_files_loop(
           // EmptyStream block always precedes EmptyFile, so
           // `empty_streams` is populated by this point.
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z empty-file payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           let empty_count = count_true(empty_streams)
           let flags = bit_array_to_bool_list(payload, empty_count, [])
           parse_files_loop(
@@ -2244,18 +2191,11 @@ fn parse_files_loop(
           // the FILETIMEs live in AdditionalStreamsInfo, which is
           // already rejected at the section level above.
           use #(size, after_size) <- result.try(read_number(rest))
-          use payload <- result.try(slice_required(
+          use #(payload, after_payload) <- result.try(split_required(
             after_size,
-            0,
             size,
             "7z mtime block payload",
           ))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
           use parsed_mtimes <- result.try(parse_mtime_block(
             payload,
             num_files,
@@ -2281,12 +2221,11 @@ fn parse_files_loop(
           || n == nid_comment
         -> {
           use #(size, after_size) <- result.try(read_number(rest))
-          let assert Ok(after_payload) =
-            bit_array.slice(
-              after_size,
-              size,
-              bit_array.byte_size(after_size) - size,
-            )
+          use #(_, after_payload) <- result.try(split_required(
+            after_size,
+            size,
+            "7z file property",
+          ))
           parse_files_loop(
             after_payload,
             num_files,
@@ -2361,23 +2300,10 @@ fn parse_mtime_block(
           get_additional_stream(additional_streams, data_index)
         }
       })
-      use defined_flags <- result.try(case all_defined {
-        1 -> Ok(list.repeat(True, num_files))
+      use #(defined_flags, body_after_flags) <- result.try(case all_defined {
+        1 -> Ok(#(list.repeat(True, num_files), external_bytes))
         _ -> read_mtime_defined_flags(external_bytes, num_files)
       })
-      let body_after_flags = case all_defined {
-        1 -> external_bytes
-        _ -> {
-          let bitmap_size = { num_files + 7 } / 8
-          let assert Ok(rest) =
-            bit_array.slice(
-              external_bytes,
-              bitmap_size,
-              bit_array.byte_size(external_bytes) - bitmap_size,
-            )
-          rest
-        }
-      }
       read_mtime_filetimes(body_after_flags, defined_flags, [])
     }
     _ -> Error(archive.InvalidData(message: "truncated 7z mtime block header"))
@@ -2387,15 +2313,14 @@ fn parse_mtime_block(
 fn read_mtime_defined_flags(
   payload: BitArray,
   num_files: Int,
-) -> Result(List(Bool), archive.ArchiveError) {
+) -> Result(#(List(Bool), BitArray), archive.ArchiveError) {
   let bitmap_size = { num_files + 7 } / 8
-  use bits <- result.try(slice_required(
+  use #(bits, rest) <- result.try(split_required(
     payload,
-    0,
     bitmap_size,
     "7z mtime defined bitmap",
   ))
-  Ok(bit_array_to_bool_list(bits, num_files, []))
+  Ok(#(bit_array_to_bool_list(bits, num_files, []), rest))
 }
 
 fn read_mtime_filetimes(
@@ -2473,53 +2398,33 @@ fn parse_name_block(
 fn decode_utf16_names(
   bytes: BitArray,
   remaining: Int,
-  current: List(Int),
+  current: List(UtfCodepoint),
   acc: List(String),
 ) -> Result(List(String), archive.ArchiveError) {
-  case remaining {
-    0 -> Ok(list.reverse(acc))
-    _ ->
-      case bytes {
-        <<lo, hi, rest:bytes>> -> {
-          let code = int.bitwise_or(int.bitwise_shift_left(hi, 8), lo)
-          case code {
-            0 -> {
-              let assert Ok(name) =
-                bit_array.to_string(
-                  codepoints_to_bit_array(list.reverse(current), <<>>),
-                )
-              decode_utf16_names(rest, remaining - 1, [], [name, ..acc])
-            }
-            _ -> decode_utf16_names(rest, remaining, [code, ..current], acc)
-          }
-        }
-        _ ->
-          Error(archive.InvalidData(message: "truncated 7z UTF-16 file name"))
+  let invalid = fn(message) { Error(archive.InvalidData(message:)) }
+  case remaining, bytes {
+    0, _ -> Ok(list.reverse(acc))
+    _, <<0:size(16), rest:bytes>> -> {
+      let name = string.from_utf_codepoints(list.reverse(current))
+      decode_utf16_names(rest, remaining - 1, [], [name, ..acc])
+    }
+    _, <<high:size(16)-little, low:size(16)-little, rest:bytes>>
+      if high >= 0xD800 && high <= 0xDBFF && low >= 0xDC00 && low <= 0xDFFF
+    -> {
+      let value =
+        0x10000 + int.bitwise_shift_left(high - 0xD800, 10) + { low - 0xDC00 }
+      case string.utf_codepoint(value) {
+        Ok(cp) -> decode_utf16_names(rest, remaining, [cp, ..current], acc)
+        Error(Nil) -> invalid("invalid 7z UTF-16 file name")
       }
-  }
-}
-
-fn codepoints_to_bit_array(codes: List(Int), acc: BitArray) -> BitArray {
-  case codes {
-    [] -> acc
-    [code, ..rest] -> codepoints_to_bit_array(rest, encode_utf8_code(code, acc))
-  }
-}
-
-fn encode_utf8_code(code: Int, acc: BitArray) -> BitArray {
-  case code {
-    c if c < 0x80 -> <<acc:bits, c>>
-    c if c < 0x800 -> {
-      let b1 = 0xC0 + int.bitwise_shift_right(c, 6)
-      let b2 = 0x80 + int.bitwise_and(c, 0x3F)
-      <<acc:bits, b1, b2>>
     }
-    c -> {
-      let b1 = 0xE0 + int.bitwise_shift_right(c, 12)
-      let b2 = 0x80 + int.bitwise_and(int.bitwise_shift_right(c, 6), 0x3F)
-      let b3 = 0x80 + int.bitwise_and(c, 0x3F)
-      <<acc:bits, b1, b2, b3>>
-    }
+    _, <<unit:size(16)-little, rest:bytes>> ->
+      // `utf_codepoint` rejects a surrogate that is not part of a pair.
+      case string.utf_codepoint(unit) {
+        Ok(cp) -> decode_utf16_names(rest, remaining, [cp, ..current], acc)
+        Error(Nil) -> invalid("unpaired surrogate in 7z UTF-16 file name")
+      }
+    _, _ -> invalid("truncated 7z UTF-16 file name")
   }
 }
 
@@ -3976,7 +3881,12 @@ fn consume_one_file_body(
     [s, ..rest] -> #(s, rest)
     [] -> #(bit_array.byte_size(plain) - consumed, [])
   }
-  let assert Ok(body) = bit_array.slice(plain, consumed, this_size)
+  use body <- result.try(slice_required(
+    plain,
+    consumed,
+    this_size,
+    "7z file body",
+  ))
   add_file(name, body, entry_mtime, acc, limits)
   |> result.try(fn(new_acc) {
     build_entries_loop(
@@ -4056,9 +3966,23 @@ fn slice_required(
   length: Int,
   label: String,
 ) -> Result(BitArray, archive.ArchiveError) {
-  case bit_array.slice(bytes, offset, length) {
-    Ok(value) -> Ok(value)
-    Error(_) -> Error(archive.InvalidData(message: "truncated " <> label))
+  use #(_, rest) <- result.try(split_required(bytes, offset, label))
+  use #(value, _) <- result.try(split_required(rest, length, label))
+  Ok(value)
+}
+
+// Splits `bytes` after `count` bytes, or fails when `bytes` is shorter or
+// `count` is negative.
+fn split_required(
+  bytes: BitArray,
+  count: Int,
+  label: String,
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
+  let truncated = Error(archive.InvalidData(message: "truncated " <> label))
+  use <- bool.guard(when: count < 0, return: truncated)
+  case bytes {
+    <<head:bytes-size(count), rest:bytes>> -> Ok(#(head, rest))
+    _ -> truncated
   }
 }
 

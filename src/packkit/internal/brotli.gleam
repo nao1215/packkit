@@ -1956,7 +1956,7 @@ fn encode_chunks(
 
 fn emit_uncompressed_metablock(
   writer: BitWriter,
-  bytes: BitArray,
+  source: BitArray,
   offset: Int,
   chunk_size: Int,
 ) -> BitWriter {
@@ -1971,7 +1971,8 @@ fn emit_uncompressed_metablock(
   let writer = bw_write(writer, 1, 1)
   // Align to byte boundary before raw bytes.
   let writer = bw_align(writer)
-  let assert Ok(chunk) = bit_array.slice(bytes, offset, chunk_size)
+  let #(_, rest) = bytes.split_at(source, offset)
+  let #(chunk, _) = bytes.split_at(rest, chunk_size)
   bw_append_bytes(writer, chunk)
 }
 
@@ -2080,8 +2081,11 @@ pub fn decode_with_limits(
   )
 
   let reader = new_reader(bytes)
-  use #(_wbits, reader) <- result.try(read_wbits(reader))
-  decode_metablocks(reader, <<>>, new_ring(), limits)
+  use #(wbits, reader) <- result.try(read_wbits(reader))
+  // RFC 7932 section 9.1: the largest backward distance is the window
+  // size minus 16.
+  let window = int.bitwise_shift_left(1, wbits) - 16
+  decode_metablocks(reader, <<>>, new_ring(), limits, window)
 }
 
 // -- metablock loop -----------------------------------------------------
@@ -2091,6 +2095,7 @@ fn decode_metablocks(
   output: BitArray,
   ring: DistRing,
   limits: limit.Limits,
+  window: Int,
 ) -> Result(BitArray, codec.CodecError) {
   use #(is_last, reader) <- result.try(read_bits(reader, 1))
   case is_last {
@@ -2104,6 +2109,7 @@ fn decode_metablocks(
             output,
             ring,
             limits,
+            window,
             True,
           ))
           Ok(output)
@@ -2116,9 +2122,10 @@ fn decode_metablocks(
         output,
         ring,
         limits,
+        window,
         False,
       ))
-      decode_metablocks(reader, output, ring, limits)
+      decode_metablocks(reader, output, ring, limits, window)
     }
   }
 }
@@ -2128,6 +2135,7 @@ fn decode_one_metablock(
   output: BitArray,
   ring: DistRing,
   limits: limit.Limits,
+  window: Int,
   is_last: Bool,
 ) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(mnibbles_raw, reader) <- result.try(read_bits(reader, 2))
@@ -2139,7 +2147,16 @@ fn decode_one_metablock(
   }
   case mnibbles {
     0 -> decode_skip_metablock(reader, output, ring)
-    _ -> decode_sized_metablock(reader, output, ring, limits, is_last, mnibbles)
+    _ ->
+      decode_sized_metablock(
+        reader,
+        output,
+        ring,
+        limits,
+        window,
+        is_last,
+        mnibbles,
+      )
   }
 }
 
@@ -2148,6 +2165,7 @@ fn decode_sized_metablock(
   output: BitArray,
   ring: DistRing,
   limits: limit.Limits,
+  window: Int,
   is_last: Bool,
   mnibbles: Int,
 ) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
@@ -2159,7 +2177,7 @@ fn decode_sized_metablock(
   })
   case is_uncompressed {
     1 -> decode_uncompressed_metablock(reader, output, ring, mlen, limits)
-    _ -> decode_compressed_metablock(reader, output, ring, mlen, limits)
+    _ -> decode_compressed_metablock(reader, output, ring, mlen, limits, window)
   }
 }
 
@@ -2176,6 +2194,7 @@ fn decode_compressed_metablock(
   ring: DistRing,
   mlen: Int,
   limits: limit.Limits,
+  window: Int,
 ) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(nbl_literal, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_command, reader) <- result.try(decode_var_len_uint8(reader))
@@ -2253,6 +2272,7 @@ fn decode_compressed_metablock(
       prev1: byte_at_or_zero(output, pos - 1),
       prev2: byte_at_or_zero(output, pos - 2),
       limits: limits,
+      window: window,
     )
   use #(new_output, new_ring, reader) <- result.try(run_commands(reader, state))
   Ok(#(new_output, new_ring, reader))
@@ -2352,6 +2372,8 @@ type CommandState {
     /// Second-most-recent literal byte.
     prev2: Int,
     limits: limit.Limits,
+    /// Largest backward distance the stream's window allows.
+    window: Int,
   )
 }
 
@@ -2397,8 +2419,10 @@ fn run_commands(
         state.block_i,
       ))
       let state = CommandState(..state, block_i: block_i)
-      let command_tree =
-        pick_tree_by_index(state.command_codes, state.block_i.type_)
+      use command_tree <- result.try(pick_tree_by_index(
+        state.command_codes,
+        state.block_i.type_,
+      ))
       use #(cmd, reader) <- result.try(decode_command(reader, command_tree))
       use #(state, reader) <- result.try(emit_literals(
         reader,
@@ -2421,14 +2445,21 @@ fn execute_copy_step(
   use #(distance, push_to_ring, state, reader) <- result.try(
     decode_distance_value(reader, state, cmd),
   )
-  let pos = bit_array.byte_size(state.output)
-  let is_dict_ref = distance > pos
+  // A distance past both the window and the output so far refers to
+  // the static dictionary (RFC 7932 section 4).
+  let max_distance = int.min(state.window, bit_array.byte_size(state.output))
+  let is_dict_ref = distance > max_distance
   let ring = case push_to_ring && !is_dict_ref {
     True -> ring_push(state.ring, distance)
     False -> state.ring
   }
   let state = CommandState(..state, ring: ring)
-  use state <- result.try(perform_copy(state, distance, cmd.copy_len, pos))
+  use state <- result.try(perform_copy(
+    state,
+    distance,
+    cmd.copy_len,
+    max_distance,
+  ))
   run_commands(reader, state)
 }
 
@@ -2464,11 +2495,10 @@ fn read_distance_code(
 ) -> Result(#(Int, Bool, CommandState, Reader), codec.CodecError) {
   use #(block_d, reader) <- result.try(maybe_switch_block(reader, state.block_d))
   let state = CommandState(..state, block_d: block_d)
-  let distance_tree =
-    pick_tree_by_index(
-      state.distance_codes,
-      select_distance_tree_idx(state, cmd.distance_context),
-    )
+  use distance_tree <- result.try(pick_tree_by_index(
+    state.distance_codes,
+    select_distance_tree_idx(state, cmd.distance_context),
+  ))
   use #(code, reader) <- result.try(decode_prefix_symbol(reader, distance_tree))
   case code < 16 {
     True -> {
@@ -2554,11 +2584,11 @@ fn perform_copy(
   state: CommandState,
   distance: Int,
   copy_len: Int,
-  pos: Int,
+  max_distance: Int,
 ) -> Result(CommandState, codec.CodecError) {
-  case distance > pos {
-    True -> dictionary_copy(state, distance, copy_len, pos)
-    False -> in_window_copy(state, distance, copy_len, pos)
+  case distance > max_distance {
+    True -> dictionary_copy(state, distance, copy_len, max_distance)
+    False -> in_window_copy(state, distance, copy_len)
   }
 }
 
@@ -2566,18 +2596,14 @@ fn in_window_copy(
   state: CommandState,
   distance: Int,
   copy_len: Int,
-  pos: Int,
 ) -> Result(CommandState, codec.CodecError) {
   let actual = int.min(copy_len, state.remaining)
-  let new_output = lz77_copy(state.output, distance, actual, pos)
-  let projected = bit_array.byte_size(new_output)
-  use <- bool.guard(
-    when: projected > state.limits.max_output_bytes,
-    return: Error(codec.LimitExceeded(
-      limit: "max_output_bytes",
-      actual: projected,
-    )),
-  )
+  use new_output <- result.try(bytes.copy_back(
+    state.output,
+    distance,
+    actual,
+    state.limits,
+  ))
   Ok(refresh_prev_bytes(
     CommandState(
       ..state,
@@ -2598,7 +2624,7 @@ fn dictionary_copy(
   state: CommandState,
   distance: Int,
   copy_len: Int,
-  pos: Int,
+  max_distance: Int,
 ) -> Result(CommandState, codec.CodecError) {
   let shift = brotli_dict.size_bits(copy_len)
   use <- bool.guard(
@@ -2609,7 +2635,7 @@ fn dictionary_copy(
       <> " (valid range 4..24)",
     )),
   )
-  let address = distance - pos - 1
+  let address = distance - max_distance - 1
   let mask = int.bitwise_shift_left(1, shift) - 1
   let word_idx = int.bitwise_and(address, mask)
   let transform_idx = int.bitwise_shift_right(address, shift)
@@ -2622,17 +2648,15 @@ fn dictionary_copy(
     )),
   )
   let dict_offset = brotli_dict.offset(copy_len) + word_idx * copy_len
-  let assert Ok(word) = bit_array.slice(brotli_dict.data, dict_offset, copy_len)
+  use word <- result.try(case brotli_dict.data {
+    <<_:bytes-size(dict_offset), word:bytes-size(copy_len), _:bytes>> ->
+      Ok(word)
+    _ ->
+      Error(codec.InvalidData(message: "brotli dictionary word out of range"))
+  })
   let transformed = brotli_xfm.apply(word, transform_idx)
-  let transformed_len = bit_array.byte_size(transformed)
-  let truncated_len = int.min(transformed_len, state.remaining)
-  let actual_bytes = case truncated_len == transformed_len {
-    True -> transformed
-    False -> {
-      let assert Ok(slice) = bit_array.slice(transformed, 0, truncated_len)
-      slice
-    }
-  }
+  let truncated_len = int.min(bit_array.byte_size(transformed), state.remaining)
+  let #(actual_bytes, _) = bytes.split_at(transformed, truncated_len)
   let new_output = bit_array.concat([state.output, actual_bytes])
   let projected = bit_array.byte_size(new_output)
   use <- bool.guard(
@@ -2649,26 +2673,6 @@ fn dictionary_copy(
       remaining: state.remaining - truncated_len,
     ),
   ))
-}
-
-/// LZ77-style self-overlapping copy: emit `count` bytes by reading
-/// `output[pos - distance]` and appending it, then incrementing pos.
-/// Works correctly for `distance < count` because each emitted byte
-/// updates the source.
-fn lz77_copy(
-  output: BitArray,
-  distance: Int,
-  count: Int,
-  pos: Int,
-) -> BitArray {
-  case count {
-    0 -> output
-    _ -> {
-      let src = pos - distance
-      let assert Ok(<<byte>>) = bit_array.slice(output, src, 1)
-      lz77_copy(<<output:bits, byte>>, distance, count - 1, pos + 1)
-    }
-  }
 }
 
 /// Emit `count` literals decoded one by one from the literal prefix
@@ -2730,9 +2734,10 @@ fn decode_one_literal(
   state: CommandState,
   remaining: Int,
 ) -> LiteralStep {
-  let tree =
+  let symbol =
     pick_tree_by_index(state.literal_codes, select_literal_tree_idx(state))
-  case decode_prefix_symbol(reader, tree) {
+    |> result.try(decode_prefix_symbol(reader, _))
+  case symbol {
     Error(e) -> LiteralFailed(e)
     Ok(#(byte, reader)) -> append_one_literal(reader, state, remaining, byte)
   }
@@ -2801,14 +2806,15 @@ fn pick_int_by_index(values: List(Int), idx: Int) -> Int {
   }
 }
 
-fn pick_tree_by_index(trees: List(PrefixCode), idx: Int) -> PrefixCode {
+fn pick_tree_by_index(
+  trees: List(PrefixCode),
+  idx: Int,
+) -> Result(PrefixCode, codec.CodecError) {
   case trees, idx {
-    [head, ..], 0 -> head
+    [head, ..], 0 -> Ok(head)
     [_, ..tail], _ -> pick_tree_by_index(tail, idx - 1)
-    [], _ -> {
-      let assert [head, ..] = trees
-      head
-    }
+    [], _ ->
+      Error(codec.InvalidData(message: "brotli prefix code index out of range"))
   }
 }
 
@@ -3367,21 +3373,25 @@ fn build_simple_layout(
       // RFC 7932 §3.4: the first symbol keeps its position and gets a
       // length-1 code; the remaining two are sorted ascending and get
       // length-2 codes.
-      let assert [first, ..rest] = symbols
-      let sorted_rest = sort_asc(rest)
-      Ok(#(canonicalise([first, ..sorted_rest], [1, 2, 2]), reader))
+      Ok(#(canonicalise(first_then_sorted(symbols), [1, 2, 2]), reader))
     }
     _ -> {
       use #(tree_select, reader) <- result.try(read_bits(reader, 1))
       case tree_select {
         0 -> Ok(#(canonicalise(sort_asc(symbols), [2, 2, 2, 2]), reader))
         _ -> {
-          let assert [first, ..rest] = symbols
-          let sorted_rest = sort_asc(rest)
-          Ok(#(canonicalise([first, ..sorted_rest], [1, 2, 3, 3]), reader))
+          Ok(#(canonicalise(first_then_sorted(symbols), [1, 2, 3, 3]), reader))
         }
       }
     }
+  }
+}
+
+// Keeps the first symbol in place and sorts the others.
+fn first_then_sorted(symbols: List(Int)) -> List(Int) {
+  case symbols {
+    [first, ..rest] -> [first, ..sort_asc(rest)]
+    [] -> []
   }
 }
 
@@ -4087,20 +4097,13 @@ fn take_bytes(
     False -> {
       let buffer_chunk = bits_to_bit_array(reader.buffer, buffered_bytes, <<>>)
       let need = count - buffered_bytes
-      case bit_array.slice(reader.source, 0, need) {
-        Ok(source_chunk) -> {
-          let assert Ok(new_source) =
-            bit_array.slice(
-              reader.source,
-              need,
-              bit_array.byte_size(reader.source) - need,
-            )
+      case reader.source {
+        <<source_chunk:bytes-size(need), new_source:bytes>> ->
           Ok(#(
             bit_array.concat([buffer_chunk, source_chunk]),
             Reader(source: new_source, buffer: 0, bits: 0, overflow: False),
           ))
-        }
-        Error(_) ->
+        _ ->
           Error(codec.InvalidData(
             message: "brotli uncompressed metablock body is truncated",
           ))

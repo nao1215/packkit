@@ -1,6 +1,8 @@
 import gleam/bit_array
 import gleam/list
+import gleam/option
 import gleam/result
+import gleam/string
 import gleeunit/should
 import packkit
 import packkit/archive
@@ -1000,4 +1002,66 @@ pub fn encode_rejects_mtime_past_filetime_range_test() -> Nil {
       max: 1_833_029_933_770,
     )),
   )
+}
+
+pub fn names_outside_the_bmp_round_trip_test() -> Nil {
+  // U+1F600 takes a UTF-16 surrogate pair.
+  let name = "\u{1F600}/日本.txt"
+  let original =
+    archive.Archive(
+      format: archive.SevenZ,
+      entries: [archive.new_entry(path: name, kind: archive.File(<<"x">>))],
+      comment: option.None,
+    )
+  let assert Ok(bytes) = packkit.write(original)
+  let assert Ok(read) = packkit.read(bytes, format: archive.SevenZ)
+  assert list.map(read.entries, fn(e) { e.path }) == [name]
+}
+
+pub fn lone_surrogate_in_a_name_is_invalid_test() -> Nil {
+  let assert Ok(bytes) =
+    packkit.write(archive.Archive(
+      format: archive.SevenZ,
+      entries: [archive.new_entry(path: "ab", kind: archive.File(<<"x">>))],
+      comment: option.None,
+    ))
+  // Swap "a" for a lone high surrogate and fix the header CRCs.
+  let assert <<
+    signature:bytes-size(8),
+    _start_crc:size(32),
+    offset:size(64)-little,
+    size:size(64)-little,
+    _next_crc:size(32),
+    packed:bytes-size(offset),
+    header:bytes-size(size),
+  >> = bytes
+  let header = replace_once(header, <<"a", 0, "b", 0>>, <<0x00, 0xD8, "b", 0>>)
+  let start = <<
+    offset:size(64)-little,
+    size:size(64)-little,
+    { checksum.crc32(data: header) }:size(32)-little,
+  >>
+  let fixed = <<
+    signature:bits,
+    { checksum.crc32(data: start) }:size(32)-little,
+    start:bits,
+    packed:bits,
+    header:bits,
+  >>
+  case packkit.read(fixed, format: archive.SevenZ) {
+    Error(archive.InvalidData(_)) -> Nil
+    other -> panic as { "expected InvalidData, got " <> string.inspect(other) }
+  }
+}
+
+fn replace_once(bytes: BitArray, from: BitArray, to: BitArray) -> BitArray {
+  let size = bit_array.byte_size(from)
+  case bytes {
+    <<head:bytes-size(size), rest:bytes>> if head == from -> <<
+      to:bits,
+      rest:bits,
+    >>
+    <<byte, rest:bytes>> -> <<byte, replace_once(rest, from, to):bits>>
+    _ -> bytes
+  }
 }
