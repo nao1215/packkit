@@ -25,14 +25,6 @@ pub fn adler32(data data: BitArray) -> Int {
   adler32_loop(data, length, 1, 0)
 }
 
-/// Continue an Adler-32 computation from a previous checksum value.
-pub fn adler32_continue(previous previous: Int, data data: BitArray) -> Int {
-  let s1 = int.bitwise_and(previous, 65_535)
-  let s2 = int.bitwise_and(int.bitwise_shift_right(previous, 16), 65_535)
-  let length = bit_array.byte_size(data)
-  adler32_loop(data, length, s1, s2)
-}
-
 fn adler32_loop(data: BitArray, remaining: Int, s1: Int, s2: Int) -> Int {
   case remaining {
     0 -> combine_adler(s1, s2)
@@ -74,14 +66,6 @@ fn combine_adler(s1: Int, s2: Int) -> Int {
 /// polynomial `0xEDB88320` and the same final XOR as zlib's `crc32`.
 pub fn crc32(data data: BitArray) -> Int {
   let crc = crc32_loop(data, crc32_init)
-  int.bitwise_and(int.bitwise_exclusive_or(crc, crc32_init), u32_mask)
-}
-
-/// Continue a CRC-32 computation from a previous checksum value.
-pub fn crc32_continue(previous previous: Int, data data: BitArray) -> Int {
-  let crc =
-    int.bitwise_exclusive_or(int.bitwise_and(previous, u32_mask), crc32_init)
-  let crc = crc32_loop(data, crc)
   int.bitwise_and(int.bitwise_exclusive_or(crc, crc32_init), u32_mask)
 }
 

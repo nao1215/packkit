@@ -16,8 +16,7 @@ import gleam/bool
 import gleam/dict
 import gleam/int
 import gleam/result
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
 import packkit/limit
 
 const magic_byte_1: Int = 0x1F
@@ -32,14 +31,9 @@ const clear_code: Int = 256
 
 const default_max_bits: Int = 16
 
-/// LZW codec smart constructor (Unix `.Z` family).
-pub fn codec() -> codecs.Codec {
-  codecs.lzw()
-}
-
 /// Encode `bytes` as a `.Z` stream using the default 16-bit
 /// block-mode encoder.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   encode_with_options(
     bytes: bytes,
     max_bits: default_max_bits,
@@ -48,14 +42,14 @@ pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
 }
 
 /// Encode `bytes` as a `.Z` stream with explicit options.
-pub fn encode_with_options(
+fn encode_with_options(
   bytes bytes: BitArray,
   max_bits max_bits: Int,
   block_mode block_mode: Bool,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
     when: max_bits < init_bits || max_bits > max_bits_max,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "lzw max_bits out of range (9..16)",
     )),
   )
@@ -68,19 +62,14 @@ pub fn encode_with_options(
   Ok(bit_array.concat([header, payload]))
 }
 
-/// Decode a `.Z` stream using the shared default `Limits`.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a `.Z` stream using explicit `Limits`.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -92,14 +81,13 @@ pub fn decode_with_limits(
       let block_mode = int.bitwise_and(flag, 0x80) != 0
       use <- bool.guard(
         when: max_bits < init_bits || max_bits > max_bits_max,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "lzw header advertises invalid max_bits",
         )),
       )
       decode_payload(rest, max_bits, block_mode, limits)
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "lzw stream missing 1F 9D magic"))
+    _ -> Error(codec.InvalidData(message: "lzw stream missing 1F 9D magic"))
   }
 }
 
@@ -304,7 +292,7 @@ fn decode_payload(
   max_bits: Int,
   block_mode: Bool,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   let first_free = case block_mode {
     True -> 257
     False -> 256
@@ -334,7 +322,7 @@ fn decode_loop(
   reader: Reader,
   state: DecodeState,
   limits: limit.Limits,
-) -> Result(#(List(Int), Int), error.CodecError) {
+) -> Result(#(List(Int), Int), codec.CodecError) {
   case read_code(reader, state.n_bits) {
     Error(_) -> Ok(#(state.out_rev, state.out_len))
     Ok(#(code, reader)) -> {
@@ -440,7 +428,7 @@ fn emit_code(
   limits: limit.Limits,
 ) -> Result(
   #(List(Int), Int, dict.Dict(Int, #(Int, Int)), Int),
-  error.CodecError,
+  codec.CodecError,
 ) {
   case code == free_ent && has_prev {
     True -> {
@@ -462,10 +450,9 @@ fn emit_code(
 fn check_output_limit(
   size: Int,
   limits: limit.Limits,
-) -> Result(Nil, error.CodecError) {
-  case size > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(limit: "max_output_bytes", actual: size))
+) -> Result(Nil, codec.CodecError) {
+  case size > limits.max_output_bytes {
+    True -> Error(codec.LimitExceeded(limit: "max_output_bytes", actual: size))
     False -> Ok(Nil)
   }
 }
@@ -473,7 +460,7 @@ fn check_output_limit(
 fn expand_code(
   code: Int,
   table: dict.Dict(Int, #(Int, Int)),
-) -> Result(#(List(Int), Int), error.CodecError) {
+) -> Result(#(List(Int), Int), codec.CodecError) {
   expand_loop(code, table, [], 0)
 }
 
@@ -482,14 +469,13 @@ fn expand_loop(
   table: dict.Dict(Int, #(Int, Int)),
   acc: List(Int),
   count: Int,
-) -> Result(#(List(Int), Int), error.CodecError) {
+) -> Result(#(List(Int), Int), codec.CodecError) {
   case code < 256 {
     True -> Ok(#([code, ..acc], count + 1))
     False ->
       case dict.get(table, code) {
         Ok(#(prev, char)) -> expand_loop(prev, table, [char, ..acc], count + 1)
-        Error(_) ->
-          Error(error.CodecInvalidData(message: "lzw code lookup failed"))
+        Error(_) -> Error(codec.InvalidData(message: "lzw code lookup failed"))
       }
   }
 }
@@ -497,23 +483,22 @@ fn expand_loop(
 fn first_char(
   code: Int,
   table: dict.Dict(Int, #(Int, Int)),
-) -> Result(Int, error.CodecError) {
+) -> Result(Int, codec.CodecError) {
   case code < 256 {
     True -> Ok(code)
     False ->
       case dict.get(table, code) {
         Ok(#(prev, _)) -> first_char(prev, table)
         Error(_) ->
-          Error(error.CodecInvalidData(message: "lzw first-char lookup failed"))
+          Error(codec.InvalidData(message: "lzw first-char lookup failed"))
       }
   }
 }
 
-fn first_char_of_chars(chars: List(Int)) -> Result(Int, error.CodecError) {
+fn first_char_of_chars(chars: List(Int)) -> Result(Int, codec.CodecError) {
   case chars {
     [head, ..] -> Ok(head)
-    [] ->
-      Error(error.CodecInvalidData(message: "lzw expansion produced no bytes"))
+    [] -> Error(codec.InvalidData(message: "lzw expansion produced no bytes"))
   }
 }
 

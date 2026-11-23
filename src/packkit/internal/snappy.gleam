@@ -16,9 +16,9 @@ import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/result
-import packkit/checksum
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
+import packkit/internal/bytes
+import packkit/internal/checksum
 import packkit/limit
 
 const stream_identifier: BitArray = <<
@@ -35,31 +35,21 @@ const chunk_stream_identifier: Int = 0xFF
 
 const max_uncompressed_chunk: Int = 65_536
 
-/// Snappy framed codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.snappy()
-}
-
-/// Encode `bytes` as a framed Snappy stream that stores every chunk
-/// in the uncompressed form.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+/// Encode `bytes` as a framed Snappy stream.  Each chunk is stored
+/// compressed when that is shorter, and uncompressed otherwise.
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   let chunks = encode_uncompressed_chunks(bytes, [])
   Ok(bit_array.concat([stream_identifier, chunks]))
-}
-
-/// Decode a framed Snappy stream using the default resource limits.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
 }
 
 /// Decode a framed Snappy stream using explicit resource limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -68,29 +58,28 @@ pub fn decode_with_limits(
   case bytes {
     <<0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59, rest:bytes>> ->
       decode_chunks(rest, <<>>, limits)
-    _ ->
-      Error(error.CodecInvalidData(message: "snappy: missing stream identifier"))
+    _ -> Error(codec.InvalidData(message: "snappy: missing stream identifier"))
   }
 }
 
 /// Decode a single Snappy raw block.
-pub fn raw_decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+pub fn raw_decode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   raw_decode_with_limits(bytes: bytes, limits: limit.default())
 }
 
 /// Decode a Snappy raw block using explicit resource limits.
-pub fn raw_decode_with_limits(
+fn raw_decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use #(uncompressed_length, after_varint) <- result.try(read_varint(
     bytes,
     0,
     0,
   ))
   use <- bool.guard(
-    when: uncompressed_length > limit.max_output_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: uncompressed_length > limits.max_output_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_output_bytes",
       actual: uncompressed_length,
     )),
@@ -100,7 +89,7 @@ pub fn raw_decode_with_limits(
   case bit_array.byte_size(output) == uncompressed_length {
     True -> Ok(output)
     False ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "snappy: raw output length disagrees with declared length",
       ))
   }
@@ -111,7 +100,7 @@ pub fn raw_decode_with_limits(
 /// copy-1 / copy-2 / copy-4 sequences in the canonical block layout.
 /// Inputs of fewer than 4 bytes — where no copy can fit the 4-byte
 /// minimum match — degenerate to a single literal run.
-pub fn raw_encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+pub fn raw_encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   let length = bit_array.byte_size(bytes)
   let length_varint = write_varint(length)
   let body = compress_raw_body(bytes, length)
@@ -176,15 +165,13 @@ fn decode_chunks(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bytes {
     <<>> -> Ok(output)
     <<chunk_type, length:size(24)-little, rest:bytes>> -> {
       case bit_array.byte_size(rest) < length {
         True ->
-          Error(error.CodecInvalidData(
-            message: "snappy: chunk payload truncated",
-          ))
+          Error(codec.InvalidData(message: "snappy: chunk payload truncated"))
         False -> {
           let assert Ok(body) = bit_array.slice(rest, 0, length)
           let assert Ok(after) =
@@ -200,13 +187,13 @@ fn decode_chunks(
               case body == <<0x73, 0x4E, 0x61, 0x50, 0x70, 0x59>> {
                 True -> Ok(output)
                 False ->
-                  Error(error.CodecInvalidData(
+                  Error(codec.InvalidData(
                     message: "snappy: repeated stream identifier mismatched",
                   ))
               }
             t if t >= 0x80 -> Ok(output)
             _ ->
-              Error(error.CodecInvalidData(
+              Error(codec.InvalidData(
                 message: "snappy: unsupported reserved chunk type",
               ))
           })
@@ -215,8 +202,7 @@ fn decode_chunks(
         }
       }
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "snappy: chunk header truncated"))
+    _ -> Error(codec.InvalidData(message: "snappy: chunk header truncated"))
   }
 }
 
@@ -224,14 +210,12 @@ fn decode_uncompressed_chunk(
   body: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case body {
     <<_crc:size(32)-little, data:bytes>> ->
-      append_with_limit(output, data, limits)
+      bytes.append_with_limit(output, data, limits)
     _ ->
-      Error(error.CodecInvalidData(
-        message: "snappy: uncompressed chunk too short",
-      ))
+      Error(codec.InvalidData(message: "snappy: uncompressed chunk too short"))
   }
 }
 
@@ -239,19 +223,16 @@ fn decode_compressed_chunk(
   body: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case body {
     <<_crc:size(32)-little, payload:bytes>> -> {
       use decoded <- result.try(raw_decode_with_limits(
         bytes: payload,
         limits: limits,
       ))
-      append_with_limit(output, decoded, limits)
+      bytes.append_with_limit(output, decoded, limits)
     }
-    _ ->
-      Error(error.CodecInvalidData(
-        message: "snappy: compressed chunk too short",
-      ))
+    _ -> Error(codec.InvalidData(message: "snappy: compressed chunk too short"))
   }
 }
 
@@ -259,7 +240,7 @@ fn read_varint(
   bytes: BitArray,
   acc: Int,
   shift: Int,
-) -> Result(#(Int, BitArray), error.CodecError) {
+) -> Result(#(Int, BitArray), codec.CodecError) {
   case bytes {
     <<b, rest:bytes>> -> {
       let part = int.bitwise_and(b, 0x7F)
@@ -268,14 +249,12 @@ fn read_varint(
         0 -> Ok(#(acc, rest))
         _ ->
           case shift > 28 {
-            True ->
-              Error(error.CodecInvalidData(message: "snappy: oversize varint"))
+            True -> Error(codec.InvalidData(message: "snappy: oversize varint"))
             False -> read_varint(rest, acc, shift + 7)
           }
       }
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "snappy: truncated varint length"))
+    _ -> Error(codec.InvalidData(message: "snappy: truncated varint length"))
   }
 }
 
@@ -299,7 +278,7 @@ fn decode_raw_loop(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bytes {
     <<>> -> Ok(output)
     <<tag, rest:bytes>> -> {
@@ -311,7 +290,7 @@ fn decode_raw_loop(
         _ -> handle_copy_4(tag, rest, output, limits)
       }
     }
-    _ -> Error(error.CodecInvalidData(message: "snappy: malformed raw block"))
+    _ -> Error(codec.InvalidData(message: "snappy: malformed raw block"))
   }
 }
 
@@ -320,7 +299,7 @@ fn handle_literal(
   rest: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   let header = int.bitwise_shift_right(tag, 2)
   use #(length, after_extra) <- result.try(case header {
     h if h < 60 -> Ok(#(h + 1, rest))
@@ -331,8 +310,7 @@ fn handle_literal(
   })
 
   case bit_array.byte_size(after_extra) < length {
-    True ->
-      Error(error.CodecInvalidData(message: "snappy: literal run truncated"))
+    True -> Error(codec.InvalidData(message: "snappy: literal run truncated"))
     False -> {
       let assert Ok(chunk) = bit_array.slice(after_extra, 0, length)
       let assert Ok(after) =
@@ -341,7 +319,7 @@ fn handle_literal(
           length,
           bit_array.byte_size(after_extra) - length,
         )
-      use output <- result.try(append_with_limit(output, chunk, limits))
+      use output <- result.try(bytes.append_with_limit(output, chunk, limits))
       decode_raw_loop(after, output, limits)
     }
   }
@@ -350,10 +328,10 @@ fn handle_literal(
 fn read_literal_extra(
   rest: BitArray,
   width: Int,
-) -> Result(#(Int, BitArray), error.CodecError) {
+) -> Result(#(Int, BitArray), codec.CodecError) {
   case bit_array.byte_size(rest) < width {
     True ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "snappy: literal length extension truncated",
       ))
     False -> {
@@ -381,7 +359,7 @@ fn handle_copy_1(
   rest: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case rest {
     <<offset_low, after_offset:bytes>> -> {
       let length = int.bitwise_and(int.bitwise_shift_right(tag, 2), 0x07) + 4
@@ -390,8 +368,7 @@ fn handle_copy_1(
         int.bitwise_or(int.bitwise_shift_left(offset_high, 8), offset_low)
       apply_copy(after_offset, output, limits, offset, length)
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "snappy: copy-1 offset truncated"))
+    _ -> Error(codec.InvalidData(message: "snappy: copy-1 offset truncated"))
   }
 }
 
@@ -400,14 +377,13 @@ fn handle_copy_2(
   rest: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case rest {
     <<offset:size(16)-little, after:bytes>> -> {
       let length = int.bitwise_shift_right(tag, 2) + 1
       apply_copy(after, output, limits, offset, length)
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "snappy: copy-2 offset truncated"))
+    _ -> Error(codec.InvalidData(message: "snappy: copy-2 offset truncated"))
   }
 }
 
@@ -416,14 +392,13 @@ fn handle_copy_4(
   rest: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case rest {
     <<offset:size(32)-little, after:bytes>> -> {
       let length = int.bitwise_shift_right(tag, 2) + 1
       apply_copy(after, output, limits, offset, length)
     }
-    _ ->
-      Error(error.CodecInvalidData(message: "snappy: copy-4 offset truncated"))
+    _ -> Error(codec.InvalidData(message: "snappy: copy-4 offset truncated"))
   }
 }
 
@@ -433,11 +408,11 @@ fn apply_copy(
   limits: limit.Limits,
   offset: Int,
   length: Int,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   let size = bit_array.byte_size(output)
   use <- bool.guard(
     when: offset <= 0 || offset > size,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "snappy: copy offset out of bounds",
     )),
   )
@@ -445,7 +420,7 @@ fn apply_copy(
   use new_output <- result.try(case offset >= length {
     True -> {
       let assert Ok(chunk) = bit_array.slice(output, size - offset, length)
-      append_with_limit(output, chunk, limits)
+      bytes.append_with_limit(output, chunk, limits)
     }
     False -> copy_byte_by_byte(output, offset, length, limits)
   })
@@ -457,13 +432,17 @@ fn copy_byte_by_byte(
   offset: Int,
   length: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case length {
     0 -> Ok(output)
     _ -> {
       let size = bit_array.byte_size(output)
       let assert Ok(byte_slice) = bit_array.slice(output, size - offset, 1)
-      use new_output <- result.try(append_with_limit(output, byte_slice, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        byte_slice,
+        limits,
+      ))
       copy_byte_by_byte(new_output, offset, length - 1, limits)
     }
   }
@@ -781,21 +760,5 @@ fn literal_extension(encoded_len: Int) -> #(BitArray, Int) {
             False -> #(<<encoded_len:size(32)-little>>, 4)
           }
       }
-  }
-}
-
-fn append_with_limit(
-  output: BitArray,
-  chunk: BitArray,
-  limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
-  let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
-    False -> Ok(bit_array.concat([output, chunk]))
   }
 }

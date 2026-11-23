@@ -10,12 +10,12 @@ import gleam/bit_array
 import gleam/bool
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option
 import gleam/result
 import gleam/string
-import packkit/archive as archives
-import packkit/entry
-import packkit/error
+import packkit/archive
+import packkit/internal/bytes
+import packkit/internal/entry
 import packkit/limit
 
 const header_size: Int = 110
@@ -34,23 +34,12 @@ const s_ifdir: Int = 0o040000
 
 const s_iflnk: Int = 0o120000
 
-/// CPIO newc archive format marker.
-pub fn format() -> archives.ArchiveFormat {
-  archives.cpio_newc()
-}
-
-/// Create an empty CPIO newc archive value.
-pub fn new() -> archives.Archive {
-  archives.new(format: format())
-}
-
 /// Encode the logical archive to a newc byte stream.
 pub fn encode(
-  archive archive_value: archives.Archive,
-) -> Result(BitArray, error.ArchiveError) {
-  use _ <- result.try(reject_comment(archive_value))
-  archive_value
-  |> archives.entries
+  archive archive_value: archive.Archive,
+) -> Result(BitArray, archive.ArchiveError) {
+  use _ <- result.try(entry.reject_comment(archive_value))
+  archive_value.entries
   |> list.try_map(encode_entry)
   |> result.map(fn(blocks) {
     [bit_array.concat(blocks), trailer_record()]
@@ -58,48 +47,36 @@ pub fn encode(
   })
 }
 
-fn reject_comment(
-  archive_value: archives.Archive,
-) -> Result(Nil, error.ArchiveError) {
-  case archives.comment(archive_value) {
-    None -> Ok(Nil)
-    Some(_) -> Error(error.ArchiveCommentUnsupported(format: "cpio-newc"))
-  }
-}
-
-/// Decode a newc byte stream using default limits.
-pub fn decode(
-  bytes bytes: BitArray,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a newc byte stream using explicit limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
   )
   decode_loop(bytes, [], 0, limits)
   |> result.map(list.reverse)
-  |> result.map(archives.from_entries(format: format(), entries: _))
+  |> result.map(archive.Archive(
+    format: archive.Cpio,
+    entries: _,
+    comment: option.None,
+  ))
 }
 
 fn decode_loop(
   bytes: BitArray,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   count: Int,
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   use <- bool.guard(
     when: bit_array.byte_size(bytes) < header_size,
-    return: Error(error.ArchiveInvalid(message: "cpio header truncated")),
+    return: Error(archive.InvalidData(message: "cpio header truncated")),
   )
 
   let assert Ok(header_bits) = bit_array.slice(bytes, 0, header_size)
@@ -110,7 +87,7 @@ fn decode_loop(
   let assert Ok(name_bytes_with_nul) =
     bit_array.slice(bytes, name_offset, name_size)
   use name <- result.try(
-    bytes_to_string(strip_trailing_nul(name_bytes_with_nul)),
+    bytes_to_string(bytes.strip_trailing_nul(name_bytes_with_nul)),
   )
 
   let header_plus_name = header_size + name_size
@@ -122,7 +99,7 @@ fn decode_loop(
 
   use <- bool.guard(
     when: bit_array.byte_size(bytes) < body_offset + body_size,
-    return: Error(error.ArchiveInvalid(message: "cpio entry truncated")),
+    return: Error(archive.InvalidData(message: "cpio entry truncated")),
   )
 
   case name == trailer_name {
@@ -142,10 +119,9 @@ fn decode_loop(
 fn check_member_limit(
   count: Int,
   limits: limit.Limits,
-) -> Result(Nil, error.ArchiveError) {
-  case count > limit.max_members(limits) {
-    True ->
-      Error(error.ArchiveLimitExceeded(limit: "max_members", actual: count))
+) -> Result(Nil, archive.ArchiveError) {
+  case count > limits.max_members {
+    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
     False -> Ok(Nil)
   }
 }
@@ -161,7 +137,7 @@ type ParsedHeader {
   )
 }
 
-fn parse_header(block: BitArray) -> Result(ParsedHeader, error.ArchiveError) {
+fn parse_header(block: BitArray) -> Result(ParsedHeader, archive.ArchiveError) {
   use magic_bits <- result.try(slice_or_error(block, 0, 6))
   use magic <- result.try(bytes_to_string(magic_bits))
   // newc (070701) and crc (070702) share the same on-disk layout;
@@ -171,7 +147,7 @@ fn parse_header(block: BitArray) -> Result(ParsedHeader, error.ArchiveError) {
   // here lets `cpio -H crc` archives round-trip end-to-end.
   use <- bool.guard(
     when: magic != magic_newc && magic != magic_crc,
-    return: Error(error.ArchiveInvalid(message: "not a newc/crc cpio magic")),
+    return: Error(archive.InvalidData(message: "not a newc/crc cpio magic")),
   )
 
   use mode <- result.try(read_hex_field(block, 14))
@@ -196,10 +172,10 @@ fn header_to_entry(
   name: String,
   body: BitArray,
   limits: limit.Limits,
-) -> Result(entry.Entry, error.ArchiveError) {
+) -> Result(archive.Entry, archive.ArchiveError) {
   use <- bool.guard(
-    when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: string.byte_size(name) > limits.max_entry_name_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_entry_name_bytes",
       actual: string.byte_size(name),
     )),
@@ -211,93 +187,61 @@ fn header_to_entry(
   use base <- result.try(case file_type {
     type_ if type_ == s_ifreg ->
       entry.file_checked(path: name, body: body)
-      |> result.map_error(entry_error_to_archive_error(_, name))
+      |> result.map_error(entry.to_archive_error(_, name))
     type_ if type_ == s_ifdir ->
       entry.directory_checked(path: name)
-      |> result.map_error(entry_error_to_archive_error(_, name))
+      |> result.map_error(entry.to_archive_error(_, name))
     type_ if type_ == s_iflnk -> {
       use target <- result.try(bytes_to_string(body))
       entry.symlink_checked(path: name, target: target)
-      |> result.map_error(entry_error_to_archive_error(_, name))
+      |> result.map_error(entry.to_archive_error(_, name))
     }
     other ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "unsupported cpio mode " <> int.to_string(other),
       ))
   })
 
-  let depth = entry.depth(entry.path(base))
+  let depth = entry.depth(base.path)
   use <- bool.guard(
-    when: depth > limit.max_entry_depth(limits),
-    return: Error(error.ArchiveLimitExceeded(
-      limit: "max_entry_depth",
-      actual: depth,
-    )),
+    when: depth > limits.max_entry_depth,
+    return: Error(archive.LimitExceeded(limit: "max_entry_depth", actual: depth)),
   )
 
   Ok(
-    base
-    |> entry.with_mode(mode: perm)
-    |> entry.with_owner(user_id: header.uid, group_id: header.gid)
-    |> entry.with_modified_at(unix_seconds: header.mtime),
+    archive.Entry(
+      ..base,
+      mode: perm,
+      user_id: header.uid,
+      group_id: header.gid,
+      modified_at: header.mtime,
+    ),
   )
 }
 
-fn entry_error_to_archive_error(
-  err: entry.EntryError,
-  path: String,
-) -> error.ArchiveError {
-  case err {
-    entry.EmptyPath ->
-      error.ArchiveEntryRejected(path: path, reason: "empty path")
-    entry.AbsolutePath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "absolute path")
-    entry.PathTraversal(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "path traversal")
-    entry.WindowsPath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "windows path")
-    entry.EmptySegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "empty segment")
-    entry.DotSegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "dot segment")
-    entry.ContainsNul(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "nul byte")
-  }
-}
+fn encode_entry(
+  value: archive.Entry,
+) -> Result(BitArray, archive.ArchiveError) {
+  use #(mode_bits, body) <- result.try(case value.kind {
+    archive.File(body) -> Ok(#(s_ifreg, body))
+    archive.Directory -> Ok(#(s_ifdir, <<>>))
+    archive.Symlink(target) -> Ok(#(s_iflnk, bit_array.from_string(target)))
+    archive.Hardlink(_) ->
+      Error(archive.EntryRejected(
+        path: value.path,
+        reason: "cpio newc cannot represent hard links",
+      ))
+  })
 
-fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
-  let kind = entry.kind(value)
-  use <- bool.guard(
-    when: kind == entry.Hardlink,
-    return: Error(error.ArchiveEntryRejected(
-      path: entry.to_string(entry.path(value)),
-      reason: "cpio newc cannot represent hard links",
-    )),
-  )
-
-  let path = entry.to_string(entry.path(value))
+  let path = value.path
   let name_bytes = bit_array.from_string(path)
   let name_size = bit_array.byte_size(name_bytes) + 1
-  let metadata = entry.metadata(value)
 
-  let #(mode_bits, body) = case kind {
-    entry.File -> #(s_ifreg, entry.body(value))
-    entry.Directory -> #(s_ifdir, <<>>)
-    entry.Symlink -> {
-      let target = case entry.link_target(value) {
-        Some(t) -> t
-        None -> ""
-      }
-      #(s_iflnk, bit_array.from_string(target))
-    }
-    entry.Hardlink -> #(s_ifreg, entry.body(value))
-  }
-
-  let mode = int.bitwise_or(mode_bits, entry.mode(metadata))
+  let mode = int.bitwise_or(mode_bits, value.mode)
   let body_size = bit_array.byte_size(body)
-  let uid = entry.user_id(metadata)
-  let gid = entry.group_id(metadata)
-  let mtime = entry.modified_at_unix(metadata)
+  let uid = value.user_id
+  let gid = value.group_id
+  let mtime = value.modified_at
 
   // newc encodes every integer field as 8 ASCII hex digits, capping
   // each at 0xFFFFFFFF.  Reject larger values up-front so we never
@@ -316,7 +260,7 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
       mode: mode,
       uid: uid,
       gid: gid,
-      nlink: case kind == entry.Directory {
+      nlink: case value.kind == archive.Directory {
         True -> 2
         False -> 1
       },
@@ -343,10 +287,10 @@ const newc_field_max: Int = 0xFFFFFFFF
 fn check_hex_field(
   value: Int,
   field: String,
-) -> Result(Nil, error.ArchiveError) {
+) -> Result(Nil, archive.ArchiveError) {
   case value < 0 || value > newc_field_max {
     True ->
-      Error(error.ArchiveFieldOverflow(
+      Error(archive.FieldOverflow(
         field: "cpio-newc " <> field,
         value: value,
         max: newc_field_max,
@@ -455,29 +399,29 @@ fn slice_or_error(
   block: BitArray,
   offset: Int,
   width: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bit_array.slice(block, offset, width) {
     Ok(value) -> Ok(value)
-    Error(_) -> Error(error.ArchiveInvalid(message: "cpio field out of bounds"))
+    Error(_) -> Error(archive.InvalidData(message: "cpio field out of bounds"))
   }
 }
 
 fn read_hex_field(
   block: BitArray,
   offset: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   use slice <- result.try(slice_or_error(block, offset, 8))
   parse_hex(slice, 0)
 }
 
-fn parse_hex(bytes: BitArray, acc: Int) -> Result(Int, error.ArchiveError) {
+fn parse_hex(bytes: BitArray, acc: Int) -> Result(Int, archive.ArchiveError) {
   case bytes {
     <<>> -> Ok(acc)
     <<b, rest:bytes>> -> {
       case hex_value(b) {
         Ok(value) -> parse_hex(rest, acc * 16 + value)
         Error(_) ->
-          Error(error.ArchiveInvalid(message: "invalid hex byte in cpio header"))
+          Error(archive.InvalidData(message: "invalid hex byte in cpio header"))
       }
     }
     _ -> Ok(acc)
@@ -493,29 +437,10 @@ fn hex_value(byte: Int) -> Result(Int, Nil) {
   }
 }
 
-fn bytes_to_string(bytes: BitArray) -> Result(String, error.ArchiveError) {
+fn bytes_to_string(bytes: BitArray) -> Result(String, archive.ArchiveError) {
   case bit_array.to_string(bytes) {
     Ok(value) -> Ok(value)
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "non-UTF-8 string in cpio header"))
-  }
-}
-
-fn strip_trailing_nul(bytes: BitArray) -> BitArray {
-  let size = bit_array.byte_size(bytes)
-  strip_trailing_nul_loop(bytes, size)
-}
-
-fn strip_trailing_nul_loop(bytes: BitArray, size: Int) -> BitArray {
-  case size {
-    0 -> <<>>
-    _ ->
-      case bit_array.slice(bytes, size - 1, 1) {
-        Ok(<<0>>) -> strip_trailing_nul_loop(bytes, size - 1)
-        _ -> {
-          let assert Ok(slice) = bit_array.slice(bytes, 0, size)
-          slice
-        }
-      }
+      Error(archive.InvalidData(message: "non-UTF-8 string in cpio header"))
   }
 }

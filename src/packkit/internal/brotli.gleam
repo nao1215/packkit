@@ -49,17 +49,11 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
 import packkit/internal/brotli_context as brotli_ctx
 import packkit/internal/brotli_dictionary as brotli_dict
 import packkit/internal/brotli_transform as brotli_xfm
 import packkit/limit
-
-/// Brotli codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.brotli()
-}
 
 /// Encode `bytes` as a Brotli stream made up of uncompressed
 /// metablocks (RFC 7932 §9.2 `ISUNCOMPRESSED` form) followed by a
@@ -74,7 +68,7 @@ pub fn codec() -> codecs.Codec {
 /// uncompressed payload bytes are emitted as one or more `ISLAST=0`
 /// metablocks and the stream is terminated with a separate empty
 /// `ISLAST=1, ISLASTEMPTY=1` marker.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   let total = bit_array.byte_size(bytes)
   case total {
     // Empty payload still needs a valid stream: WBITS + ISLAST=1
@@ -2071,19 +2065,14 @@ fn bw_bytes_to_bit_array(values: List(Int), acc: BitArray) -> BitArray {
   }
 }
 
-/// Decode a Brotli stream using default limits.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a Brotli stream using explicit limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -2101,7 +2090,7 @@ fn decode_metablocks(
   output: BitArray,
   ring: DistRing,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use #(is_last, reader) <- result.try(read_bits(reader, 1))
   case is_last {
     1 -> {
@@ -2139,7 +2128,7 @@ fn decode_one_metablock(
   ring: DistRing,
   limits: limit.Limits,
   is_last: Bool,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(mnibbles_raw, reader) <- result.try(read_bits(reader, 2))
   let mnibbles = case mnibbles_raw {
     0 -> 4
@@ -2160,7 +2149,7 @@ fn decode_sized_metablock(
   limits: limit.Limits,
   is_last: Bool,
   mnibbles: Int,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(mlen_minus_1, reader) <- result.try(read_bits(reader, mnibbles * 4))
   let mlen = mlen_minus_1 + 1
   use #(is_uncompressed, reader) <- result.try(case is_last {
@@ -2186,7 +2175,7 @@ fn decode_compressed_metablock(
   ring: DistRing,
   mlen: Int,
   limits: limit.Limits,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(nbl_literal, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_command, reader) <- result.try(decode_var_len_uint8(reader))
   use #(nbl_distance, reader) <- result.try(decode_var_len_uint8(reader))
@@ -2398,7 +2387,7 @@ fn trivial_block_state() -> BlockState {
 fn run_commands(
   reader: Reader,
   state: CommandState,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   case state.remaining <= 0 {
     True -> Ok(#(state.output, state.ring, reader))
     False -> {
@@ -2427,7 +2416,7 @@ fn execute_copy_step(
   reader: Reader,
   state: CommandState,
   cmd: Command,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(distance, push_to_ring, state, reader) <- result.try(
     decode_distance_value(reader, state, cmd),
   )
@@ -2456,7 +2445,7 @@ fn decode_distance_value(
   reader: Reader,
   state: CommandState,
   cmd: Command,
-) -> Result(#(Int, Bool, CommandState, Reader), error.CodecError) {
+) -> Result(#(Int, Bool, CommandState, Reader), codec.CodecError) {
   case cmd.distance_code {
     0 -> {
       // Implicit reuse — no distance bits in the stream, no block tick.
@@ -2471,7 +2460,7 @@ fn read_distance_code(
   reader: Reader,
   state: CommandState,
   cmd: Command,
-) -> Result(#(Int, Bool, CommandState, Reader), error.CodecError) {
+) -> Result(#(Int, Bool, CommandState, Reader), codec.CodecError) {
   use #(block_d, reader) <- result.try(maybe_switch_block(reader, state.block_d))
   let state = CommandState(..state, block_d: block_d)
   let distance_tree =
@@ -2535,7 +2524,7 @@ fn apply_long_distance(
   distance_code: Int,
   npostfix: Int,
   ndirect: Int,
-) -> Result(#(Int, Bool, Reader), error.CodecError) {
+) -> Result(#(Int, Bool, Reader), codec.CodecError) {
   let #(extra_bits, base) =
     long_distance_params(distance_code, npostfix, ndirect)
   use #(extra, reader) <- result.try(read_bits(reader, extra_bits))
@@ -2565,7 +2554,7 @@ fn perform_copy(
   distance: Int,
   copy_len: Int,
   pos: Int,
-) -> Result(CommandState, error.CodecError) {
+) -> Result(CommandState, codec.CodecError) {
   case distance > pos {
     True -> dictionary_copy(state, distance, copy_len, pos)
     False -> in_window_copy(state, distance, copy_len, pos)
@@ -2577,13 +2566,13 @@ fn in_window_copy(
   distance: Int,
   copy_len: Int,
   pos: Int,
-) -> Result(CommandState, error.CodecError) {
+) -> Result(CommandState, codec.CodecError) {
   let actual = int.min(copy_len, state.remaining)
   let new_output = lz77_copy(state.output, distance, actual, pos)
   let projected = bit_array.byte_size(new_output)
   use <- bool.guard(
-    when: projected > limit.max_output_bytes(state.limits),
-    return: Error(error.CodecLimitExceeded(
+    when: projected > state.limits.max_output_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_output_bytes",
       actual: projected,
     )),
@@ -2609,11 +2598,11 @@ fn dictionary_copy(
   distance: Int,
   copy_len: Int,
   pos: Int,
-) -> Result(CommandState, error.CodecError) {
+) -> Result(CommandState, codec.CodecError) {
   let shift = brotli_dict.size_bits(copy_len)
   use <- bool.guard(
     when: shift == 0,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "brotli dictionary reference at length "
       <> int.to_string(copy_len)
       <> " (valid range 4..24)",
@@ -2625,7 +2614,7 @@ fn dictionary_copy(
   let transform_idx = int.bitwise_shift_right(address, shift)
   use <- bool.guard(
     when: transform_idx >= brotli_xfm.num_transforms,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "brotli dictionary transform index "
       <> int.to_string(transform_idx)
       <> " out of range",
@@ -2646,8 +2635,8 @@ fn dictionary_copy(
   let new_output = bit_array.concat([state.output, actual_bytes])
   let projected = bit_array.byte_size(new_output)
   use <- bool.guard(
-    when: projected > limit.max_output_bytes(state.limits),
-    return: Error(error.CodecLimitExceeded(
+    when: projected > state.limits.max_output_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_output_bytes",
       actual: projected,
     )),
@@ -2687,7 +2676,7 @@ fn emit_literals(
   reader: Reader,
   state: CommandState,
   count: Int,
-) -> Result(#(CommandState, Reader), error.CodecError) {
+) -> Result(#(CommandState, Reader), codec.CodecError) {
   let actual = int.min(count, state.remaining)
   emit_literals_loop(reader, state, actual)
 }
@@ -2700,14 +2689,14 @@ fn emit_literals(
 type LiteralStep {
   LiteralDone(state: CommandState, reader: Reader)
   LiteralContinue(state: CommandState, reader: Reader, remaining: Int)
-  LiteralFailed(error: error.CodecError)
+  LiteralFailed(error: codec.CodecError)
 }
 
 fn emit_literals_loop(
   reader: Reader,
   state: CommandState,
   remaining: Int,
-) -> Result(#(CommandState, Reader), error.CodecError) {
+) -> Result(#(CommandState, Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(state, reader))
     _ ->
@@ -2755,9 +2744,9 @@ fn append_one_literal(
   byte: Int,
 ) -> LiteralStep {
   let projected = bit_array.byte_size(state.output) + 1
-  case projected > limit.max_output_bytes(state.limits) {
+  case projected > state.limits.max_output_bytes {
     True ->
-      LiteralFailed(error.CodecLimitExceeded(
+      LiteralFailed(codec.LimitExceeded(
         limit: "max_output_bytes",
         actual: projected,
       ))
@@ -2852,7 +2841,7 @@ type Command {
 fn decode_command(
   reader: Reader,
   code: PrefixCode,
-) -> Result(#(Command, Reader), error.CodecError) {
+) -> Result(#(Command, Reader), codec.CodecError) {
   use #(symbol, reader) <- result.try(decode_prefix_symbol(reader, code))
   let lut = cmd_lut_entry(symbol)
   use #(ins_extra, reader) <- result.try(read_bits(reader, lut.ins_extra_bits))
@@ -3006,7 +2995,7 @@ fn cumulative_offset_loop(
 fn read_block_state(
   reader: Reader,
   nbltypes: Int,
-) -> Result(#(BlockState, Reader), error.CodecError) {
+) -> Result(#(BlockState, Reader), codec.CodecError) {
   case nbltypes <= 1 {
     True -> Ok(#(trivial_block_state(), reader))
     False -> read_active_block_state(reader, nbltypes)
@@ -3016,7 +3005,7 @@ fn read_block_state(
 fn read_active_block_state(
   reader: Reader,
   nbltypes: Int,
-) -> Result(#(BlockState, Reader), error.CodecError) {
+) -> Result(#(BlockState, Reader), codec.CodecError) {
   use #(type_code, reader) <- result.try(decode_prefix_code(
     reader,
     nbltypes + 2,
@@ -3045,7 +3034,7 @@ fn read_active_block_state(
 fn read_block_length(
   reader: Reader,
   code: PrefixCode,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(symbol, reader) <- result.try(decode_prefix_symbol(reader, code))
   let #(offset, nbits) = block_length_range(symbol)
   use #(extra, reader) <- result.try(read_bits(reader, nbits))
@@ -3092,7 +3081,7 @@ fn block_length_range(symbol: Int) -> #(Int, Int) {
 fn maybe_switch_block(
   reader: Reader,
   block: BlockState,
-) -> Result(#(BlockState, Reader), error.CodecError) {
+) -> Result(#(BlockState, Reader), codec.CodecError) {
   case block.length > 1 {
     True -> Ok(#(BlockState(..block, length: block.length - 1), reader))
     False -> {
@@ -3110,7 +3099,7 @@ fn perform_block_switch(
   block: BlockState,
   type_code: PrefixCode,
   length_code: PrefixCode,
-) -> Result(#(BlockState, Reader), error.CodecError) {
+) -> Result(#(BlockState, Reader), codec.CodecError) {
   use #(type_symbol, reader) <- result.try(decode_prefix_symbol(
     reader,
     type_code,
@@ -3157,7 +3146,7 @@ fn decode_context_map(
   reader: Reader,
   ntrees: Int,
   size: Int,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   case ntrees <= 1 {
     True -> Ok(#(byte_repeat(0, size), reader))
     False -> decode_nontrivial_context_map(reader, ntrees, size)
@@ -3168,7 +3157,7 @@ fn decode_nontrivial_context_map(
   reader: Reader,
   ntrees: Int,
   size: Int,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   use #(use_rle, reader) <- result.try(read_bits(reader, 1))
   use #(rlemax, reader) <- result.try(case use_rle {
     0 -> Ok(#(0, reader))
@@ -3200,7 +3189,7 @@ fn decode_context_map_entries(
   rlemax: Int,
   remaining: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case remaining {
     n if n <= 0 -> Ok(#(list.reverse(acc), reader))
     _ -> step_context_map_entry(reader, code, rlemax, remaining, acc)
@@ -3213,7 +3202,7 @@ fn step_context_map_entry(
   rlemax: Int,
   remaining: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   use #(symbol, reader) <- result.try(decode_prefix_symbol(reader, code))
   case symbol == 0 || symbol > rlemax {
     True -> {
@@ -3229,7 +3218,7 @@ fn step_context_map_entry(
       let reps = extra + int.bitwise_shift_left(1, symbol)
       use <- bool.guard(
         when: reps > remaining,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "brotli context-map zero run overruns map size",
         )),
       )
@@ -3331,7 +3320,7 @@ fn decode_prefix_codes(
   alphabet_size: Int,
   kind: String,
   acc: List(PrefixCode),
-) -> Result(#(List(PrefixCode), Reader), error.CodecError) {
+) -> Result(#(List(PrefixCode), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), reader))
     _ -> {
@@ -3352,7 +3341,7 @@ fn decode_prefix_code(
   reader: Reader,
   alphabet_size: Int,
   _kind: String,
-) -> Result(#(PrefixCode, Reader), error.CodecError) {
+) -> Result(#(PrefixCode, Reader), codec.CodecError) {
   use #(descriptor, reader) <- result.try(read_bits(reader, 2))
   case descriptor {
     1 -> decode_simple_prefix_code(reader, alphabet_size)
@@ -3364,7 +3353,7 @@ fn decode_prefix_code(
 fn decode_simple_prefix_code(
   reader: Reader,
   alphabet_size: Int,
-) -> Result(#(PrefixCode, Reader), error.CodecError) {
+) -> Result(#(PrefixCode, Reader), codec.CodecError) {
   use #(nsym_minus_1, reader) <- result.try(read_bits(reader, 2))
   let nsym = nsym_minus_1 + 1
   let alphabet_bits = ceil_log2(alphabet_size)
@@ -3380,7 +3369,7 @@ fn build_simple_layout(
   reader: Reader,
   nsym: Int,
   symbols: List(Int),
-) -> Result(#(PrefixCode, Reader), error.CodecError) {
+) -> Result(#(PrefixCode, Reader), codec.CodecError) {
   case nsym {
     1 -> Ok(#(canonicalise(symbols, [0]), reader))
     2 -> Ok(#(canonicalise(sort_asc(symbols), [1, 1]), reader))
@@ -3517,7 +3506,7 @@ fn decode_complex_prefix_code(
   reader: Reader,
   alphabet_size: Int,
   hskip: Int,
-) -> Result(#(PrefixCode, Reader), error.CodecError) {
+) -> Result(#(PrefixCode, Reader), codec.CodecError) {
   let order = list.drop(cl_code_order(), hskip)
   use #(cl_pairs, reader) <- result.try(
     read_cl_code_lengths(reader, order, 32, 0, []),
@@ -3541,7 +3530,7 @@ fn read_cl_code_lengths(
   space: Int,
   num_codes: Int,
   accum: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   case remaining_order {
     [] -> validate_cl_space(num_codes, space, accum, reader)
     [cl_sym, ..rest] ->
@@ -3556,7 +3545,7 @@ fn read_one_cl(
   space: Int,
   num_codes: Int,
   accum: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   use reader <- result.try(ensure_bits(reader, 4))
   let ix = peek_bits_value(reader, 4)
   let #(consume, value) = cl_prefix_lookup(ix)
@@ -3581,10 +3570,10 @@ fn validate_cl_space(
   space: Int,
   accum: List(#(Int, Int)),
   reader: Reader,
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   use <- bool.guard(
     when: space < 0,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "brotli code-length codes oversubscribe Huffman space",
     )),
   )
@@ -3593,7 +3582,7 @@ fn validate_cl_space(
       Ok(#(accum, reader))
     }
     False ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "brotli code-length codes underfill Huffman space",
       ))
   }
@@ -3609,7 +3598,7 @@ fn read_symbol_code_lengths(
   alphabet_size: Int,
   state: SymLenState,
   accum: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   case state.symbol >= alphabet_size || state.space <= 0 {
     True -> finalize_symbol_lengths(reader, state, accum)
     False -> step_symbol_length(reader, cl_code, alphabet_size, state, accum)
@@ -3620,10 +3609,10 @@ fn finalize_symbol_lengths(
   reader: Reader,
   state: SymLenState,
   accum: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   use <- bool.guard(
     when: state.space != 0,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "brotli symbol code lengths do not fully consume Huffman space",
     )),
   )
@@ -3636,7 +3625,7 @@ fn step_symbol_length(
   alphabet_size: Int,
   state: SymLenState,
   accum: List(#(Int, Int)),
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   use #(code_len, reader) <- result.try(decode_prefix_symbol(reader, cl_code))
   case code_len < 16 {
     True ->
@@ -3667,7 +3656,7 @@ fn apply_single_code_length(
   state: SymLenState,
   accum: List(#(Int, Int)),
   code_len: Int,
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   let new_accum = case code_len {
     0 -> accum
     _ -> [#(state.symbol, code_len), ..accum]
@@ -3698,7 +3687,7 @@ fn apply_repeat_code_length(
   state: SymLenState,
   accum: List(#(Int, Int)),
   code_len: Int,
-) -> Result(#(List(#(Int, Int)), Reader), error.CodecError) {
+) -> Result(#(List(#(Int, Int)), Reader), codec.CodecError) {
   let #(new_len, extra_bits) = case code_len {
     16 -> #(state.prev, 2)
     _ -> #(0, 3)
@@ -3716,7 +3705,7 @@ fn apply_repeat_code_length(
   let delta = new_repeat - prior_repeat
   use <- bool.guard(
     when: state.symbol + delta > alphabet_size,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "brotli repeat code overruns alphabet",
     )),
   )
@@ -3754,7 +3743,7 @@ fn prepend_repeated(
 fn decode_prefix_symbol(
   reader: Reader,
   code: PrefixCode,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   decode_prefix_walk(reader, code.entries, 0, 0)
 }
 
@@ -3763,7 +3752,7 @@ fn decode_prefix_walk(
   entries: List(PrefixEntry),
   accumulated: Int,
   bit_count: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   // `use <- result.try(...)` breaks TCO on the JS target — inline the
   // case match so the recursive call stays in tail position.  Without
   // this, a compressed metablock with thousands of literal symbols
@@ -3813,7 +3802,7 @@ fn read_simple_symbols(
   remaining: Int,
   bits_per: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), reader))
     _ -> {
@@ -3827,10 +3816,10 @@ fn sort_asc(symbols: List(Int)) -> List(Int) {
   list.sort(symbols, int.compare)
 }
 
-fn check_no_duplicates(symbols: List(Int)) -> Result(Nil, error.CodecError) {
+fn check_no_duplicates(symbols: List(Int)) -> Result(Nil, codec.CodecError) {
   case has_consecutive_dup(sort_asc(symbols)) {
     True ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "brotli simple-form prefix code has duplicate symbols",
       ))
     False -> Ok(Nil)
@@ -3849,10 +3838,10 @@ fn has_consecutive_dup(sorted: List(Int)) -> Bool {
 fn check_alphabet_bounds(
   symbols: List(Int),
   alphabet_size: Int,
-) -> Result(Nil, error.CodecError) {
+) -> Result(Nil, codec.CodecError) {
   case list.any(symbols, fn(s) { s >= alphabet_size }) {
     True ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "brotli simple-form prefix code symbol exceeds alphabet size",
       ))
     False -> Ok(Nil)
@@ -3863,7 +3852,7 @@ fn read_context_modes(
   reader: Reader,
   remaining: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(list.reverse(acc), reader))
     _ -> {
@@ -3879,7 +3868,7 @@ fn read_context_modes(
 // NTREES, and other small population counts.
 fn decode_var_len_uint8(
   reader: Reader,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(first, reader) <- result.try(read_bits(reader, 1))
   case first {
     0 -> Ok(#(1, reader))
@@ -3901,11 +3890,11 @@ fn decode_skip_metablock(
   reader: Reader,
   output: BitArray,
   ring: DistRing,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   use #(reserved, reader) <- result.try(read_bits(reader, 1))
   use <- bool.guard(
     when: reserved != 0,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "brotli skip metablock reserved bit must be zero",
     )),
   )
@@ -3926,16 +3915,13 @@ fn decode_uncompressed_metablock(
   ring: DistRing,
   mlen: Int,
   limits: limit.Limits,
-) -> Result(#(BitArray, DistRing, Reader), error.CodecError) {
+) -> Result(#(BitArray, DistRing, Reader), codec.CodecError) {
   let reader = align_to_byte(reader)
   use #(chunk, reader) <- result.try(take_bytes(reader, mlen))
   let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
+  case projected > limits.max_output_bytes {
     True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
+      Error(codec.LimitExceeded(limit: "max_output_bytes", actual: projected))
     False -> Ok(#(bit_array.concat([output, chunk]), ring, reader))
   }
 }
@@ -3949,7 +3935,7 @@ fn decode_uncompressed_metablock(
 /// * `1000 nnn` where `nnn ≠ 000` and `nnn ≠ 001` → 8 + nnn (range 10..15)
 /// * `1000 000` → 17
 /// * `1000 001` → reserved / large-window indicator (not supported)
-fn read_wbits(reader: Reader) -> Result(#(Int, Reader), error.CodecError) {
+fn read_wbits(reader: Reader) -> Result(#(Int, Reader), codec.CodecError) {
   use #(first, reader) <- result.try(read_bits(reader, 1))
   case first {
     0 -> Ok(#(16, reader))
@@ -3959,7 +3945,7 @@ fn read_wbits(reader: Reader) -> Result(#(Int, Reader), error.CodecError) {
 
 fn read_wbits_after_lead(
   reader: Reader,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(triple, reader) <- result.try(read_bits(reader, 3))
   case triple {
     0 -> read_wbits_short_range(reader)
@@ -3969,12 +3955,12 @@ fn read_wbits_after_lead(
 
 fn read_wbits_short_range(
   reader: Reader,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   use #(extra, reader) <- result.try(read_bits(reader, 3))
   case extra {
     0 -> Ok(#(17, reader))
     1 ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "brotli large-window WBITS prefix is not supported",
       ))
     n -> Ok(#(8 + n, reader))
@@ -4023,7 +4009,7 @@ fn refill(reader: Reader, needed: Int) -> Reader {
 fn read_bits(
   reader: Reader,
   count: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   case count {
     0 -> Ok(#(0, reader))
     _ -> {
@@ -4038,12 +4024,11 @@ fn read_bits(
 /// out if the source stream is shorter than that.  Used by both
 /// `read_bits` and the peek/drop API the complex-form prefix code
 /// reader needs (to look up a variable-length CL code by 4-bit peek).
-fn ensure_bits(reader: Reader, count: Int) -> Result(Reader, error.CodecError) {
+fn ensure_bits(reader: Reader, count: Int) -> Result(Reader, codec.CodecError) {
   let reader = refill(reader, count)
   case reader.bits >= count {
     True -> Ok(reader)
-    False ->
-      Error(error.CodecInvalidData(message: "truncated brotli bit stream"))
+    False -> Error(codec.InvalidData(message: "truncated brotli bit stream"))
   }
 }
 
@@ -4088,7 +4073,7 @@ fn align_to_byte(reader: Reader) -> Reader {
 fn take_bytes(
   reader: Reader,
   count: Int,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   // After align_to_byte, reader.bits is a multiple of 8.  Pull entire
   // bytes from the buffer first, then from source.
   let buffered_bytes = reader.bits / 8
@@ -4126,7 +4111,7 @@ fn take_bytes(
           ))
         }
         Error(_) ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "brotli uncompressed metablock body is truncated",
           ))
       }

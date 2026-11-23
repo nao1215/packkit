@@ -1,6 +1,8 @@
 import gleam/bit_array
 import gleeunit/should
-import packkit/snappy
+import packkit
+import packkit/codec
+import packkit/internal/snappy
 
 pub fn raw_decode_hello_test() -> Nil {
   // `snappyjs.compress(Buffer.from("hello"))` from npm.
@@ -41,14 +43,14 @@ pub fn raw_decode_repeated_abc_test() -> Nil {
 pub fn framed_roundtrip_short_test() -> Nil {
   let payload = <<"packkit snappy framing":utf8>>
   let assert Ok(framed) = snappy.encode(bytes: payload)
-  let assert Ok(restored) = snappy.decode(bytes: framed)
+  let assert Ok(restored) = packkit.decompress(framed, with: codec.Snappy)
   restored
   |> should.equal(payload)
 }
 
 pub fn framed_roundtrip_empty_test() -> Nil {
   let assert Ok(framed) = snappy.encode(bytes: <<>>)
-  let assert Ok(restored) = snappy.decode(bytes: framed)
+  let assert Ok(restored) = packkit.decompress(framed, with: codec.Snappy)
   restored
   |> should.equal(<<>>)
 }
@@ -95,7 +97,7 @@ pub fn framed_encode_compresses_run_test() -> Nil {
   // than the raw chunk.
   let payload = repeat_byte(0x61, 1024, <<>>)
   let assert Ok(framed) = snappy.encode(bytes: payload)
-  let assert Ok(restored) = snappy.decode(bytes: framed)
+  let assert Ok(restored) = packkit.decompress(framed, with: codec.Snappy)
   restored
   |> should.equal(payload)
   // Framed overhead is the 10-byte stream identifier + 8-byte chunk

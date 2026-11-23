@@ -10,8 +10,8 @@
 
 import gleam/bit_array
 import gleeunit/should
-import packkit/brotli
-import packkit/error
+import packkit
+import packkit/codec
 
 /// Bug #1 — `printf 'users":[{"name":"alice","age":30,"email":"alice@example.com","active":true,"score":99.5},{"name":"bob","age":25,"email":"bob@example.com","active":false,"s' | brotli -c`
 /// triggers a context-map zero-run overrun in `decode_context_map`.
@@ -25,9 +25,9 @@ pub fn bug1_context_map_zero_run_overrun_test() -> Nil {
     bit_array.base16_decode(
       "1F9A00208CD315F3A384710FA29DD37EB324FAE137CB6E7A424A198C522C3A3A39A103D25BD2A2E2204C2409C0F21C5E5CBB152D983E2C0FAB17B1BD5A07363B5370FCAC9AE70D70EC8990605D46998BAA5E3ECFAAA7125144B95C0FDB17",
     )
-  brotli.decode(bytes: input)
+  packkit.decompress(input, with: codec.Brotli)
   |> should.equal(
-    Error(error.CodecInvalidData(
+    Error(codec.InvalidData(
       message: "brotli context-map zero run overruns map size",
     )),
   )

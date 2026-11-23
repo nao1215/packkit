@@ -39,20 +39,16 @@ unused_exports = "off"
   "unused_exports",
 ]
 "test/packkit/*_fuzz_test.gleam" = ["discarded_result"]
-"src/packkit/detect.gleam" = ["deep_nesting"]
-"src/packkit/entry.gleam" = ["avoid_panic", "thrown_away_error"]
-"src/packkit/level.gleam" = ["avoid_panic"]
-"src/packkit/limit.gleam" = ["avoid_panic"]
-"src/packkit/ar.gleam" = [
+"src/packkit/internal/ar.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
 ]
-"src/packkit/cpio.gleam" = [
+"src/packkit/internal/cpio.gleam" = [
   "assert_ok_pattern",
   "prefer_guard_clause",
 ]
-"src/packkit/bzip2.gleam" = [
+"src/packkit/internal/bzip2.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
@@ -60,13 +56,13 @@ unused_exports = "off"
   "short_variable_name",
   "thrown_away_error",
 ]
-"src/packkit/brotli.gleam" = [
+"src/packkit/internal/brotli.gleam" = [
   "assert_ok_pattern",
   "prefer_guard_clause",
   "thrown_away_error",
 ]
-"src/packkit/checksum.gleam" = ["short_variable_name"]
-"src/packkit/deflate.gleam" = [
+"src/packkit/internal/checksum.gleam" = ["short_variable_name"]
+"src/packkit/internal/deflate.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
@@ -76,27 +72,26 @@ unused_exports = "off"
 ]
 "src/packkit/gzip.gleam" = [
   "assert_ok_pattern",
-  "avoid_panic",
   "discarded_result",
   "thrown_away_error",
 ]
-"src/packkit/lz4.gleam" = [
+"src/packkit/internal/lz4.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
 ]
-"src/packkit/lzw.gleam" = [
+"src/packkit/internal/lzw.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
   "thrown_away_error",
 ]
-"src/packkit/snappy.gleam" = [
+"src/packkit/internal/snappy.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",
 ]
-"src/packkit/tar.gleam" = [
+"src/packkit/internal/tar.gleam" = [
   "assert_ok_pattern",
   "prefer_guard_clause",
   "thrown_away_error",
@@ -123,16 +118,16 @@ unused_exports = "off"
   "discarded_result",
   "prefer_guard_clause",
 ]
-"src/packkit/xz.gleam" = [
+"src/packkit/internal/xz.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "discarded_result",
   "thrown_away_error",
 ]
-"src/packkit/zlib.gleam" = [
+"src/packkit/internal/zlib.gleam" = [
   "assert_ok_pattern",
 ]
-"src/packkit/zstd.gleam" = [
+"src/packkit/internal/zstd.gleam" = [
   "assert_ok_pattern",
   "deep_nesting",
   "prefer_guard_clause",

@@ -15,8 +15,8 @@ import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/result
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
+import packkit/internal/bytes
 import packkit/internal/xxh32
 import packkit/limit
 
@@ -54,44 +54,13 @@ const u32_mask: Int = 0xFFFFFFFF
 
 const default_block_max: Int = 4_194_304
 
-/// LZ4 frame codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.lz4()
-}
-
 /// Encode `bytes` as an LZ4 frame.  The frame descriptor uses
 /// independent blocks, the v1 frame version, and a 4 MiB block
 /// maximum; no content size, block checksum, content checksum, or
 /// dictionary id is written.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  encode_internal(bytes, content_size_present: False)
-}
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
+  let descriptor = <<0x60, 0x70>>
 
-/// Encode `bytes` as an LZ4 frame and store the uncompressed
-/// content size in the frame descriptor.  Strict LZ4 decoders use
-/// the value to pre-allocate the output buffer and reject any
-/// frame whose payload disagrees with the declared length; our own
-/// decoder simply skips the field today, so encoding it does not
-/// change `encode -> decode` round trips.
-pub fn encode_with_content_size(
-  bytes bytes: BitArray,
-) -> Result(BitArray, error.CodecError) {
-  encode_internal(bytes, content_size_present: True)
-}
-
-fn encode_internal(
-  bytes: BitArray,
-  content_size_present content_size_present: Bool,
-) -> Result(BitArray, error.CodecError) {
-  let flg = case content_size_present {
-    True -> 0x60 + flg_content_size
-    False -> 0x60
-  }
-  let bd = 0x70
-  let descriptor = case content_size_present {
-    True -> <<flg, bd, bit_array.byte_size(bytes):size(64)-little>>
-    False -> <<flg, bd>>
-  }
   let hc =
     int.bitwise_and(
       int.bitwise_shift_right(xxh32.digest(bytes: descriptor, seed: 0), 8),
@@ -103,19 +72,14 @@ fn encode_internal(
   Ok(bit_array.concat([header, blocks, end_mark]))
 }
 
-/// Decode an LZ4 frame using the default resource limits.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode an LZ4 frame using explicit resource limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -130,12 +94,12 @@ pub fn decode_with_limits(
     <<m:size(32)-little, flg, bd, rest:bytes>> -> {
       use <- bool.guard(
         when: m != magic,
-        return: Error(error.CodecInvalidData(message: "lz4: bad frame magic")),
+        return: Error(codec.InvalidData(message: "lz4: bad frame magic")),
       )
 
       use <- bool.guard(
         when: int.bitwise_and(flg, flg_version_mask) != flg_version_v1,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "lz4: unsupported frame version",
         )),
       )
@@ -176,7 +140,7 @@ pub fn decode_with_limits(
         limits,
       )
     }
-    _ -> Error(error.CodecInvalidData(message: "lz4: frame header truncated"))
+    _ -> Error(codec.InvalidData(message: "lz4: frame header truncated"))
   }
 }
 
@@ -525,7 +489,7 @@ fn decode_legacy_blocks(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case decode_legacy_blocks_step(bytes, output, limits) {
     Error(err) -> Error(err)
     Ok(LegacyBlocksDone(out)) -> Ok(out)
@@ -543,7 +507,7 @@ fn decode_legacy_blocks_step(
   bytes: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(LegacyBlocksStep, error.CodecError) {
+) -> Result(LegacyBlocksStep, codec.CodecError) {
   case bytes {
     // Stream ends at EOF — there is no terminator block in the
     // legacy format.
@@ -562,7 +526,7 @@ fn decode_legacy_blocks_step(
     <<block_size:size(32)-little, rest:bytes>> -> {
       case bit_array.byte_size(rest) < block_size {
         True ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "lz4 legacy: block payload truncated",
           ))
         False -> {
@@ -578,10 +542,7 @@ fn decode_legacy_blocks_step(
         }
       }
     }
-    _ ->
-      Error(error.CodecInvalidData(
-        message: "lz4 legacy: block header truncated",
-      ))
+    _ -> Error(codec.InvalidData(message: "lz4 legacy: block header truncated"))
   }
 }
 
@@ -597,7 +558,7 @@ fn decode_blocks(
   content_checksum: Bool,
   block_max: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case
     decode_blocks_step(
       bytes,
@@ -634,7 +595,7 @@ fn decode_blocks_step(
   content_checksum: Bool,
   block_max: Int,
   limits: limit.Limits,
-) -> Result(BlocksStep, error.CodecError) {
+) -> Result(BlocksStep, codec.CodecError) {
   case bytes {
     <<0:size(32)-little, rest:bytes>> ->
       case finalize(rest, output, content_checksum) {
@@ -650,14 +611,14 @@ fn decode_blocks_step(
         )
       use <- bool.guard(
         when: block_size > block_max,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "lz4: block size exceeds frame max block size",
         )),
       )
 
       case bit_array.byte_size(rest) < block_size {
         True ->
-          Error(error.CodecInvalidData(message: "lz4: block payload truncated"))
+          Error(codec.InvalidData(message: "lz4: block payload truncated"))
         False -> {
           let assert Ok(block) = bit_array.slice(rest, 0, block_size)
           let assert Ok(after_block) =
@@ -671,7 +632,7 @@ fn decode_blocks_step(
             True ->
               case bit_array.byte_size(after_block) < 4 {
                 True ->
-                  Error(error.CodecInvalidData(
+                  Error(codec.InvalidData(
                     message: "lz4: block checksum missing",
                   ))
                 False -> {
@@ -688,7 +649,7 @@ fn decode_blocks_step(
           })
 
           use new_output <- result.try(case uncompressed {
-            True -> append_with_limit(output, block, limits)
+            True -> bytes.append_with_limit(output, block, limits)
             False -> decode_block(block, output, limits)
           })
 
@@ -696,7 +657,7 @@ fn decode_blocks_step(
         }
       }
     }
-    _ -> Error(error.CodecInvalidData(message: "lz4: block header truncated"))
+    _ -> Error(codec.InvalidData(message: "lz4: block header truncated"))
   }
 }
 
@@ -704,14 +665,14 @@ fn finalize(
   after_end: BitArray,
   output: BitArray,
   content_checksum: Bool,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case content_checksum {
     False -> Ok(output)
     True ->
       case bit_array.byte_size(after_end) >= 4 {
         True -> Ok(output)
         False ->
-          Error(error.CodecInvalidData(message: "lz4: content checksum missing"))
+          Error(codec.InvalidData(message: "lz4: content checksum missing"))
       }
   }
 }
@@ -720,7 +681,7 @@ fn decode_block(
   block: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case bit_array.byte_size(block) {
     0 -> Ok(output)
     _ -> decode_block_loop(block, output, limits)
@@ -739,7 +700,7 @@ fn decode_block_loop(
   block: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case decode_block_step(block, output, limits) {
     Error(err) -> Error(err)
     Ok(BlockDone(out)) -> Ok(out)
@@ -757,7 +718,7 @@ fn decode_block_step(
   block: BitArray,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(BlockStep, error.CodecError) {
+) -> Result(BlockStep, codec.CodecError) {
   case block {
     <<token, rest:bytes>> -> {
       let lit_len_base = int.bitwise_shift_right(token, 4)
@@ -770,7 +731,7 @@ fn decode_block_step(
 
       case bit_array.byte_size(rest) < lit_len {
         True ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "lz4: literal length exceeds block payload",
           ))
         False -> {
@@ -778,7 +739,11 @@ fn decode_block_step(
           let assert Ok(after_literals) =
             bit_array.slice(rest, lit_len, bit_array.byte_size(rest) - lit_len)
 
-          use output <- result.try(append_with_limit(output, literals, limits))
+          use output <- result.try(bytes.append_with_limit(
+            output,
+            literals,
+            limits,
+          ))
 
           case bit_array.byte_size(after_literals) {
             0 -> Ok(BlockDone(output))
@@ -787,7 +752,7 @@ fn decode_block_step(
                 <<offset:size(16)-little, after_offset:bytes>> -> {
                   use <- bool.guard(
                     when: offset == 0,
-                    return: Error(error.CodecInvalidData(
+                    return: Error(codec.InvalidData(
                       message: "lz4: zero match offset",
                     )),
                   )
@@ -803,7 +768,7 @@ fn decode_block_step(
 
                   use <- bool.guard(
                     when: offset > bit_array.byte_size(output),
-                    return: Error(error.CodecInvalidData(
+                    return: Error(codec.InvalidData(
                       message: "lz4: match offset exceeds output",
                     )),
                   )
@@ -818,7 +783,7 @@ fn decode_block_step(
                   Ok(BlockContinue(after_offset, output))
                 }
                 _ ->
-                  Error(error.CodecInvalidData(
+                  Error(codec.InvalidData(
                     message: "lz4: match offset truncated",
                   ))
               }
@@ -827,22 +792,21 @@ fn decode_block_step(
       }
     }
     <<>> -> Ok(BlockDone(output))
-    _ -> Error(error.CodecInvalidData(message: "lz4: malformed block"))
+    _ -> Error(codec.InvalidData(message: "lz4: malformed block"))
   }
 }
 
 fn read_extension(
   bytes: BitArray,
   acc: Int,
-) -> Result(#(Int, BitArray), error.CodecError) {
+) -> Result(#(Int, BitArray), codec.CodecError) {
   case bytes {
     <<b, rest:bytes>> ->
       case b {
         0xFF -> read_extension(rest, acc + 0xFF)
         _ -> Ok(#(acc + b, rest))
       }
-    _ ->
-      Error(error.CodecInvalidData(message: "lz4: length extension truncated"))
+    _ -> Error(codec.InvalidData(message: "lz4: length extension truncated"))
   }
 }
 
@@ -851,7 +815,7 @@ fn copy_match(
   offset: Int,
   length: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case length {
     0 -> Ok(output)
     _ -> {
@@ -859,7 +823,7 @@ fn copy_match(
       case offset >= length {
         True -> {
           let assert Ok(chunk) = bit_array.slice(output, size - offset, length)
-          append_with_limit(output, chunk, limits)
+          bytes.append_with_limit(output, chunk, limits)
         }
         False -> copy_match_byte_by_byte(output, offset, length, limits)
       }
@@ -877,7 +841,7 @@ fn copy_match_byte_by_byte(
   offset: Int,
   length: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case copy_match_byte_step(output, offset, length, limits) {
     Error(err) -> Error(err)
     Ok(CopyDone(out)) -> Ok(out)
@@ -896,31 +860,19 @@ fn copy_match_byte_step(
   offset: Int,
   length: Int,
   limits: limit.Limits,
-) -> Result(CopyStep, error.CodecError) {
+) -> Result(CopyStep, codec.CodecError) {
   case length {
     0 -> Ok(CopyDone(output))
     _ -> {
       let size = bit_array.byte_size(output)
       let assert Ok(byte_slice) = bit_array.slice(output, size - offset, 1)
-      use new_output <- result.try(append_with_limit(output, byte_slice, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        byte_slice,
+        limits,
+      ))
       Ok(CopyContinue(new_output, length - 1))
     }
-  }
-}
-
-fn append_with_limit(
-  output: BitArray,
-  chunk: BitArray,
-  limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
-  let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
-    False -> Ok(bit_array.concat([output, chunk]))
   }
 }
 
@@ -929,12 +881,12 @@ fn maybe_skip(
   active: Bool,
   count: Int,
   message: String,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case active {
     False -> Ok(bytes)
     True ->
       case bit_array.byte_size(bytes) < count {
-        True -> Error(error.CodecInvalidData(message: message))
+        True -> Error(codec.InvalidData(message: message))
         False -> {
           let assert Ok(after) =
             bit_array.slice(bytes, count, bit_array.byte_size(bytes) - count)

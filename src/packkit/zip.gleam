@@ -1,31 +1,10 @@
-//// ZIP archive encoder and decoder.
+//// Writing ZIP with a compression method, and reading ZIP archives
+//// encrypted with ZipCrypto or WinZip AES. `packkit.write` stores ZIP
+//// entries without compression, and `packkit.read` reads any
+//// unencrypted ZIP archive.
 ////
-//// This module implements the PKZIP local-file-header / central
-//// directory layout for the "stored" (uncompressed) and "deflate"
-//// methods, plus the Zip64 extensions (APPNOTE.TXT §4.4) needed to
-//// carry archives with > 65535 entries, central-directory regions
-//// > 4 GiB, individual entries > 4 GiB, or local-header offsets
-//// > 4 GiB.  ZIP is modelled as an archive family, not a recipe:
-//// per-entry compression is selected through `Method` values rather
-//// than through `packkit/recipe`.
-////
-//// On the decoder side: when the standard EOCD record has any
-//// sentinel field (`0xFFFF` for the 16-bit slots, `0xFFFFFFFF` for
-//// the 32-bit slots), the decoder follows the Zip64 EOCD locator at
-//// `eocd_offset - 20` to the Zip64 EOCD record and reads the real
-//// 64-bit values from there.  Per-entry Zip64 extra fields
-//// (`header_id = 0x0001`) are parsed in both the central-directory
-//// entry and the local file header so that compressed / uncompressed
-//// sizes and local-header offsets above the 4 GiB boundary decode
-//// correctly.
-////
-//// On the encoder side: each entry transparently switches to the
-//// Zip64 extra field when any of its `uncompressed_size`,
-//// `compressed_size`, or `local_header_offset` would not fit in 32
-//// bits.  Archives whose total entry count or central-directory
-//// region overflow the legacy 16-/32-bit EOCD slots also emit a
-//// Zip64 EOCD record + locator so the resulting bytes round-trip
-//// through any conforming Zip64 reader.
+//// The reader and writer support Zip64, so an archive can hold more than
+//// 65,535 entries and entries over 4 GiB. File names are written as UTF-8.
 
 import gleam/bit_array
 import gleam/bool
@@ -34,19 +13,17 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import packkit/archive as archives
-import packkit/bzip2
-import packkit/checksum
-import packkit/codec as codecs
-import packkit/deflate
-import packkit/entry
-import packkit/error
+import packkit/archive
+import packkit/codec
 import packkit/internal/aes
+import packkit/internal/bzip2
+import packkit/internal/checksum
+import packkit/internal/deflate
+import packkit/internal/entry
 import packkit/internal/lzma
-import packkit/level
+import packkit/internal/xz
+import packkit/internal/zstd
 import packkit/limit
-import packkit/xz
-import packkit/zstd
 
 const local_file_signature: Int = 0x04034b50
 
@@ -163,89 +140,41 @@ const dos_epoch_unix: Int = 315_532_800
 // than the clamp window — so future cleanup may relax this).
 const dos_epoch_ceiling_unix: Int = 4_354_819_200
 
-/// ZIP-specific entry method marker. This stays distinct from the
-/// top-level recipe model because ZIP is an archive family, not a
-/// recipe.
-pub opaque type Method {
-  Method(name: String, inner_codec: Option(codecs.Codec))
+/// How the body of each file entry is compressed. Directories are always
+/// stored.
+pub type Method {
+  /// No compression (method 0).
+  Store
+  /// DEFLATE (method 8), readable by every ZIP tool.
+  Deflate
+  /// bzip2 (method 12).
+  Bzip2
+  /// LZMA (method 14).
+  Lzma
+  /// Zstandard (method 93).
+  Zstd
+  /// xz (method 95).
+  Xz
 }
 
-/// ZIP archive format marker.
-pub fn format() -> archives.ArchiveFormat {
-  archives.zip()
-}
-
-/// Create an empty logical ZIP archive value.
-pub fn new() -> archives.Archive {
-  archives.new(format: format())
-}
-
-/// Stored (uncompressed) ZIP member method.
-pub fn store() -> Method {
-  Method(name: "store", inner_codec: None)
-}
-
-/// Deflate-compressed ZIP member method.
-pub fn deflate(level level: level.Level) -> Method {
-  Method(
-    name: "deflate",
-    inner_codec: Some(codecs.deflate() |> codecs.with_level(level: level)),
-  )
-}
-
-/// Bzip2-compressed ZIP member method (PKZIP method 12).
-pub fn bzip2() -> Method {
-  Method(name: "bzip2", inner_codec: Some(codecs.bzip2()))
-}
-
-/// Zstd-compressed ZIP member method (PKZIP method 93).
-pub fn zstd() -> Method {
-  Method(name: "zstd", inner_codec: Some(codecs.zstd()))
-}
-
-/// xz-compressed ZIP member method (PKZIP method 95).
-pub fn xz() -> Method {
-  Method(name: "xz", inner_codec: Some(codecs.xz()))
-}
-
-/// PKWARE LZMA ZIP member method (PKZIP method 14).  Wraps a raw
-/// LZMA1 range-coded stream in the 4-byte SDK preamble + 5-byte
-/// property block (`lc=3 / lp=0 / pb=2`, dict size 64 KiB).  The
-/// encoder emits the stream with general-purpose flag bit 1 set so
-/// the decoder relies on the central-directory uncompressed size
-/// instead of an in-stream EOS marker.
-pub fn lzma() -> Method {
-  // No public packkit codec for LZMA1 yet — keep inner_codec as None
-  // so the accessor stays accurate.
-  Method(name: "lzma", inner_codec: None)
-}
-
-/// Stable method name.
-pub fn name(method: Method) -> String {
-  method.name
-}
-
-/// Optional inner codec corresponding to the method.
-pub fn inner_codec(method: Method) -> Option(codecs.Codec) {
-  method.inner_codec
-}
-
-/// Encode a logical archive into a ZIP byte stream using the stored
-/// (uncompressed) method for every entry.
+/// Writes `archive` as ZIP, compressing every file entry with `method`.
+///
+/// Returns `EntryRejected` for symbolic and hard links, which this writer
+/// does not store, and for the unsafe paths `packkit.write` rejects.
+///
+/// ## Examples
+///
+/// ```gleam
+/// let report = archive.new_entry(path: "report.csv", kind: File(<<"a,b\n":utf8>>))
+/// encode(Archive(format: Zip, entries: [report], comment: None), method: Deflate)
+/// ```
+///
 pub fn encode(
-  archive archive_value: archives.Archive,
-) -> Result(BitArray, error.ArchiveError) {
-  encode_with_method(archive: archive_value, method: store())
-}
-
-/// Encode a logical archive into a ZIP byte stream using a chosen
-/// per-entry method.  Supports `store`, `deflate`, `bzip2`, `zstd`,
-/// and `xz`.
-pub fn encode_with_method(
-  archive archive_value: archives.Archive,
+  archive_value: archive.Archive,
   method method: Method,
-) -> Result(BitArray, error.ArchiveError) {
-  let entries = archives.entries(archive_value)
+) -> Result(BitArray, archive.ArchiveError) {
+  use _ <- result.try(entry.validate_all(archive_value.entries))
+  let entries = archive_value.entries
   use #(local_blocks, central_blocks) <- result.try(encode_entries(
     entries,
     0,
@@ -260,7 +189,7 @@ pub fn encode_with_method(
   let central_size = bit_array.byte_size(central_bytes)
   let count = list.length(entries)
 
-  let comment_bytes = case archives.comment(archive_value) {
+  let comment_bytes = case archive_value.comment {
     Some(c) -> bit_array.from_string(c)
     None -> <<>>
   }
@@ -361,47 +290,14 @@ fn build_zip64_eocd_and_locator(
   bit_array.concat([zip64_eocd, zip64_locator])
 }
 
-/// Run the deflate encoder honoring the requested level on the inner
-/// codec attached to the method.  Level 0 → stored deflate blocks;
-/// the implicit default level → fixed-Huffman LZ77; any other level
-/// is rejected with a typed `CodecOptionUnsupported`.  Previously this
-/// step silently fell back to the default encoder regardless of the
-/// caller's level request.
-fn deflate_with_level(
-  bytes: BitArray,
-  inner: Option(codecs.Codec),
-) -> Result(BitArray, error.CodecError) {
-  let level_value = case inner {
-    None -> None
-    Some(c) ->
-      case codecs.level(c) {
-        Some(l) -> Some(level.value(l))
-        None -> None
-      }
-  }
-  case level_value {
-    None -> deflate.encode(bytes: bytes)
-    Some(0) -> deflate.encode_stored_only(bytes: bytes)
-    Some(n) ->
-      case n == level.value(level.default()) {
-        True -> deflate.encode(bytes: bytes)
-        False ->
-          Error(error.CodecOptionUnsupported(
-            option: "level",
-            codec_name: "zip-deflate",
-          ))
-      }
-  }
-}
-
 const u16_max: Int = 0xFFFF
 
 const u32_max: Int = 0xFFFFFFFF
 
-fn check_u16(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
+fn check_u16(value: Int, field: String) -> Result(Nil, archive.ArchiveError) {
   case value < 0 || value > u16_max {
     True ->
-      Error(error.ArchiveFieldOverflow(
+      Error(archive.FieldOverflow(
         field: "zip " <> field,
         value: value,
         max: u16_max,
@@ -410,10 +306,10 @@ fn check_u16(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
   }
 }
 
-fn check_u32(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
+fn check_u32(value: Int, field: String) -> Result(Nil, archive.ArchiveError) {
   case value < 0 || value > u32_max {
     True ->
-      Error(error.ArchiveFieldOverflow(
+      Error(archive.FieldOverflow(
         field: "zip " <> field,
         value: value,
         max: u32_max,
@@ -422,41 +318,26 @@ fn check_u32(value: Int, field: String) -> Result(Nil, error.ArchiveError) {
   }
 }
 
-/// Decode a ZIP archive using default limits.
+@internal
 pub fn decode(
   bytes bytes: BitArray,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_internal(bytes, None, limit.default())
-}
-
-/// Decode a ZIP archive using explicit limits.
-pub fn decode_with_limits(
-  bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   decode_internal(bytes, None, limits)
 }
 
-/// Decode a ZIP archive whose entries may be protected by the
-/// PKWARE traditional ("ZipCrypto") encryption scheme.  The
-/// password is applied to every encrypted entry; entries without
-/// the gp-flag encryption bit decode unchanged.  Wrong-password
-/// detection relies on the 12-byte encryption header check byte
-/// (the high byte of the entry's CRC-32), so a wrong password
-/// surfaces as `ArchiveInvalid`.
+/// Reads a ZIP archive whose entries may be encrypted with ZipCrypto or
+/// WinZip AES (AE-1 and AE-2). Entries that are not encrypted are read as
+/// usual.
+///
+/// A wrong password returns `InvalidData`. Use `packkit.read` for
+/// archives without a password.
+///
 pub fn decode_with_password(
   bytes bytes: BitArray,
   password password: String,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_internal(bytes, Some(password), limit.default())
-}
-
-/// Same as `decode_with_password` but with explicit limits.
-pub fn decode_with_password_and_limits(
-  bytes bytes: BitArray,
-  password password: String,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   decode_internal(bytes, Some(password), limits)
 }
 
@@ -464,10 +345,10 @@ fn decode_internal(
   bytes: BitArray,
   password: Option(String),
   limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -477,8 +358,8 @@ fn decode_internal(
   use eocd <- result.try(read_eocd(bytes, eocd_offset))
 
   use <- bool.guard(
-    when: eocd.total_entries > limit.max_members(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: eocd.total_entries > limits.max_members,
+    return: Error(archive.LimitExceeded(
       limit: "max_members",
       actual: eocd.total_entries,
     )),
@@ -500,12 +381,11 @@ fn decode_internal(
     password,
   ))
 
-  let base =
-    archives.from_entries(format: format(), entries: list.reverse(entries))
-  case eocd.comment {
-    Some(c) -> Ok(archives.with_comment(base, comment: c))
-    None -> Ok(base)
-  }
+  Ok(archive.Archive(
+    format: archive.Zip,
+    entries: list.reverse(entries),
+    comment: eocd.comment,
+  ))
 }
 
 /// Walk every entry once with `list.fold`, accumulating the running
@@ -516,12 +396,12 @@ fn decode_internal(
 /// otherwise blow its call stack on archives with tens of thousands
 /// of entries (and so couldn't ever build a Zip64-sized archive).
 fn encode_entries(
-  remaining: List(entry.Entry),
+  remaining: List(archive.Entry),
   _offset: Int,
   _local_acc: List(BitArray),
   _central_acc: List(BitArray),
   method: Method,
-) -> Result(#(List(BitArray), List(BitArray)), error.ArchiveError) {
+) -> Result(#(List(BitArray), List(BitArray)), archive.ArchiveError) {
   let init = EncodeFold(offset: 0, local_acc: [], central_acc: [], error: None)
   let folded =
     list.fold(remaining, init, fn(state, entry_value) {
@@ -552,29 +432,29 @@ type EncodeFold {
     offset: Int,
     local_acc: List(BitArray),
     central_acc: List(BitArray),
-    error: Option(error.ArchiveError),
+    error: Option(archive.ArchiveError),
   )
 }
 
 fn encode_entry(
-  value: entry.Entry,
+  value: archive.Entry,
   offset: Int,
   method: Method,
-) -> Result(#(BitArray, BitArray, Int), error.ArchiveError) {
-  let kind = entry.kind(value)
-  let raw_path = entry.to_string(entry.path(value))
+) -> Result(#(BitArray, BitArray, Int), archive.ArchiveError) {
+  let raw_path = value.path
+  use #(is_directory, raw_body) <- result.try(case value.kind {
+    archive.File(body) -> Ok(#(False, body))
+    archive.Directory -> Ok(#(True, <<>>))
+    archive.Symlink(_) | archive.Hardlink(_) ->
+      Error(archive.EntryRejected(
+        path: raw_path,
+        reason: "ZIP encode currently supports files and directories only",
+      ))
+  })
 
-  use <- bool.guard(
-    when: kind == entry.Symlink || kind == entry.Hardlink,
-    return: Error(error.ArchiveEntryRejected(
-      path: raw_path,
-      reason: "ZIP encode currently supports files and directories only",
-    )),
-  )
-
-  let canonical_path = case kind {
-    entry.Directory -> ensure_trailing_slash(raw_path)
-    _ -> raw_path
+  let canonical_path = case is_directory {
+    True -> ensure_trailing_slash(raw_path)
+    False -> raw_path
   }
 
   let name_bytes = bit_array.from_string(canonical_path)
@@ -582,48 +462,42 @@ fn encode_entry(
 
   use <- bool.guard(
     when: name_length > 65_535,
-    return: Error(error.ArchiveEntryRejected(
+    return: Error(archive.EntryRejected(
       path: canonical_path,
       reason: "ZIP entry name longer than 65535 bytes",
     )),
   )
 
-  let raw_body = case kind {
-    entry.Directory -> <<>>
-    _ -> entry.body(value)
-  }
-
   let uncomp_size = bit_array.byte_size(raw_body)
-  let crc = case kind {
-    entry.Directory -> 0
-    _ -> checksum.crc32(raw_body)
+  let crc = case is_directory {
+    True -> 0
+    False -> checksum.crc32(raw_body)
   }
 
-  let entry_method = case kind {
-    entry.Directory -> store()
-    _ -> method
+  let entry_method = case is_directory {
+    True -> Store
+    False -> method
   }
 
-  use #(method_code, compressed_body) <- result.try(case entry_method.name {
-    "store" -> Ok(#(method_store, raw_body))
-    "deflate" ->
-      deflate_with_level(raw_body, entry_method.inner_codec)
+  use #(method_code, compressed_body) <- result.try(case entry_method {
+    Store -> Ok(#(method_store, raw_body))
+    Deflate ->
+      deflate.encode(bytes: raw_body)
       |> result.map(fn(b) { #(method_deflate, b) })
       |> result.map_error(codec_to_archive_error(_, canonical_path))
-    "bzip2" ->
+    Bzip2 ->
       bzip2.encode(bytes: raw_body)
       |> result.map(fn(b) { #(method_bzip2, b) })
       |> result.map_error(codec_to_archive_error(_, canonical_path))
-    "lzma" -> Ok(#(method_lzma, encode_pkware_lzma(raw_body)))
-    "zstd" ->
+    Lzma -> Ok(#(method_lzma, encode_pkware_lzma(raw_body)))
+    Zstd ->
       zstd.encode(bytes: raw_body)
       |> result.map(fn(b) { #(method_zstd, b) })
       |> result.map_error(codec_to_archive_error(_, canonical_path))
-    "xz" ->
+    Xz ->
       xz.encode(bytes: raw_body)
       |> result.map(fn(b) { #(method_xz, b) })
       |> result.map_error(codec_to_archive_error(_, canonical_path))
-    other -> Error(error.ArchiveNotImplemented(feature: "ZIP method " <> other))
   })
 
   let comp_size = bit_array.byte_size(compressed_body)
@@ -632,12 +506,10 @@ fn encode_entry(
   // values per spec.
   use _ <- result.try(check_u32(crc, "crc32"))
 
-  let metadata = entry.metadata(value)
-  let mode = entry.mode(metadata)
-  let external_attrs = case kind {
-    entry.Directory ->
-      int.bitwise_or(external_attr_dir, int.bitwise_shift_left(mode, 16))
-    _ -> int.bitwise_shift_left(mode, 16)
+  let mode = value.mode
+  let external_attrs = case is_directory {
+    True -> int.bitwise_or(external_attr_dir, int.bitwise_shift_left(mode, 16))
+    False -> int.bitwise_shift_left(mode, 16)
   }
   use _ <- result.try(check_u32(external_attrs, "external_attributes"))
 
@@ -663,13 +535,13 @@ fn encode_entry(
     False -> offset
   }
 
-  // Derive per-entry timestamp fields from `entry.modified_at_unix`.
+  // Derive per-entry timestamp fields from `Entry.modified_at`.
   // The DOS pair is written into the fixed-width header slots; when
   // the entry has a usable mtime we additionally emit an InfoZIP
   // Extended Timestamp extra (header_id 0x5455) so the original
   // 1-second-resolution Unix value survives the 2-second DOS rounding
   // and the pre-1980 / post-2107 clamping.
-  let mtime_unix = entry.modified_at_unix(metadata)
+  let mtime_unix = value.modified_at
   let #(dos_time, dos_date) = unix_to_dos_pair(mtime_unix)
   let unix_ts_extra = case mtime_unix > 0 {
     True -> build_unix_ts_extra_mtime(mtime_unix)
@@ -681,8 +553,8 @@ fn encode_entry(
   // gid=0) stay bit-stable against the pre-UID/GID encoder so the
   // overwhelmingly common "no ownership info" archive doesn't pay
   // an extra 15 bytes per entry.
-  let uid = entry.user_id(metadata)
-  let gid = entry.group_id(metadata)
+  let uid = value.user_id
+  let gid = value.group_id
   let unix_uid_gid_extra = case uid > 0 || gid > 0 {
     True -> build_unix_uid_gid_extra(uid, gid)
     False -> <<>>
@@ -1159,10 +1031,10 @@ type EocdRecord {
   )
 }
 
-fn locate_eocd(bytes: BitArray) -> Result(Int, error.ArchiveError) {
+fn locate_eocd(bytes: BitArray) -> Result(Int, archive.ArchiveError) {
   let size = bit_array.byte_size(bytes)
   case size < 22 {
-    True -> Error(error.ArchiveInvalid(message: "ZIP stream too short"))
+    True -> Error(archive.InvalidData(message: "ZIP stream too short"))
     False -> {
       let start = case size - 22 - 65_535 < 0 {
         True -> 0
@@ -1177,9 +1049,9 @@ fn scan_eocd(
   bytes: BitArray,
   position: Int,
   floor: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case position < floor {
-    True -> Error(error.ArchiveInvalid(message: "missing ZIP EOCD signature"))
+    True -> Error(archive.InvalidData(message: "missing ZIP EOCD signature"))
     False ->
       case bit_array.slice(bytes, position, 4) {
         Ok(slice) ->
@@ -1195,7 +1067,7 @@ fn scan_eocd(
 fn read_eocd(
   bytes: BitArray,
   position: Int,
-) -> Result(EocdRecord, error.ArchiveError) {
+) -> Result(EocdRecord, archive.ArchiveError) {
   use total_entries <- result.try(read_le16_at(bytes, position + 10))
   use central_size <- result.try(read_le32_at(bytes, position + 12))
   use central_offset <- result.try(read_le32_at(bytes, position + 16))
@@ -1207,7 +1079,7 @@ fn read_eocd(
       case bit_array.to_string(comment_bits) {
         Ok(text) -> Ok(Some(text))
         Error(_) ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "non-UTF-8 archive comment in ZIP EOCD",
           ))
       }
@@ -1265,10 +1137,10 @@ fn read_eocd(
 fn read_zip64_eocd_from_locator(
   bytes: BitArray,
   eocd_position: Int,
-) -> Result(#(Int, Int, Int), error.ArchiveError) {
+) -> Result(#(Int, Int, Int), archive.ArchiveError) {
   case eocd_position < 20 {
     True ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ZIP EOCD sentinel without Zip64 locator (archive too short)",
       ))
     False -> {
@@ -1276,7 +1148,7 @@ fn read_zip64_eocd_from_locator(
       use locator_sig <- result.try(read_le32_at(bytes, locator_position))
       use <- bool.guard(
         when: locator_sig != zip64_eocd_locator_signature,
-        return: Error(error.ArchiveInvalid(
+        return: Error(archive.InvalidData(
           message: "ZIP EOCD sentinel but no Zip64 EOCD locator present",
         )),
       )
@@ -1292,11 +1164,11 @@ fn read_zip64_eocd_from_locator(
 fn read_zip64_eocd_record(
   bytes: BitArray,
   offset: Int,
-) -> Result(#(Int, Int, Int), error.ArchiveError) {
+) -> Result(#(Int, Int, Int), archive.ArchiveError) {
   use signature <- result.try(read_le32_at(bytes, offset))
   use <- bool.guard(
     when: signature != zip64_eocd_signature,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "Zip64 EOCD signature missing at locator-pointed offset",
     )),
   )
@@ -1318,20 +1190,20 @@ fn read_zip64_eocd_record(
 
 fn parse_central_directory(
   bytes: BitArray,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   remaining: Int,
   full: BitArray,
   accumulated_body_bytes: Int,
   limits: limit.Limits,
   password: Option(String),
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   case remaining {
     0 -> Ok(acc)
     _ -> {
       use signature <- result.try(read_le32_at(bytes, 0))
       use <- bool.guard(
         when: signature != central_directory_signature,
-        return: Error(error.ArchiveInvalid(
+        return: Error(archive.InvalidData(
           message: "missing ZIP central directory signature",
         )),
       )
@@ -1421,8 +1293,8 @@ fn parse_central_directory(
       }
 
       use <- bool.guard(
-        when: string.byte_size(name) > limit.max_entry_name_bytes(limits),
-        return: Error(error.ArchiveLimitExceeded(
+        when: string.byte_size(name) > limits.max_entry_name_bytes,
+        return: Error(archive.LimitExceeded(
           limit: "max_entry_name_bytes",
           actual: string.byte_size(name),
         )),
@@ -1431,8 +1303,8 @@ fn parse_central_directory(
       let cleaned_name = strip_trailing_slash(name)
       let depth = path_depth(cleaned_name)
       use <- bool.guard(
-        when: depth > limit.max_entry_depth(limits),
-        return: Error(error.ArchiveLimitExceeded(
+        when: depth > limits.max_entry_depth,
+        return: Error(archive.LimitExceeded(
           limit: "max_entry_depth",
           actual: depth,
         )),
@@ -1440,7 +1312,7 @@ fn parse_central_directory(
 
       use <- bool.guard(
         when: !is_supported_method(method),
-        return: Error(error.ArchiveNotImplemented(
+        return: Error(archive.Unsupported(
           feature: "ZIP method " <> int.to_string(method),
         )),
       )
@@ -1472,8 +1344,8 @@ fn parse_central_directory(
       let next_total =
         accumulated_body_bytes + bit_array.byte_size(entry.body(entry_value))
       use <- bool.guard(
-        when: next_total > limit.max_output_bytes(limits),
-        return: Error(error.ArchiveLimitExceeded(
+        when: next_total > limits.max_output_bytes,
+        return: Error(archive.LimitExceeded(
           limit: "max_output_bytes",
           actual: next_total,
         )),
@@ -1518,11 +1390,11 @@ fn read_local_entry(
   mtime_unix: Int,
   owner_uid: Int,
   owner_gid: Int,
-) -> Result(entry.Entry, error.ArchiveError) {
+) -> Result(archive.Entry, archive.ArchiveError) {
   use signature <- result.try(read_le32_at(full, local_offset))
   use <- bool.guard(
     when: signature != local_file_signature,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "missing local file header signature",
     )),
   )
@@ -1531,7 +1403,7 @@ fn read_local_entry(
   let strong_encrypted = int.bitwise_and(gp_flag, 0x40) != 0
   use <- bool.guard(
     when: strong_encrypted,
-    return: Error(error.ArchiveNotImplemented(
+    return: Error(archive.Unsupported(
       feature: "ZIP strong-encryption (gp flag bit 6)",
     )),
   )
@@ -1539,7 +1411,7 @@ fn read_local_entry(
   use method <- result.try(read_le16_at(full, local_offset + 8))
   use <- bool.guard(
     when: !is_supported_method(method),
-    return: Error(error.ArchiveNotImplemented(
+    return: Error(archive.Unsupported(
       feature: "ZIP method " <> int.to_string(method),
     )),
   )
@@ -1665,9 +1537,7 @@ fn read_local_entry(
       |> result.map_error(codec_to_archive_error(_, name))
     }
     other ->
-      Error(error.ArchiveNotImplemented(
-        feature: "ZIP method " <> int.to_string(other),
-      ))
+      Error(archive.Unsupported(feature: "ZIP method " <> int.to_string(other)))
   })
 
   // AE-2 archives zero the CRC32 because HMAC-SHA1 has already
@@ -1680,37 +1550,39 @@ fn read_local_entry(
   let skip_crc = is_aex && expected_crc == 0
   use <- bool.guard(
     when: !skip_crc && checksum.crc32(body) != expected_crc,
-    return: Error(error.ArchiveInvalid(message: "ZIP CRC32 mismatch")),
+    return: Error(archive.InvalidData(message: "ZIP CRC32 mismatch")),
   )
 
   let is_directory = string.ends_with(name, "/")
   let mode =
     int.bitwise_and(int.bitwise_shift_right(external_attrs, 16), 0xFFFF)
 
-  let apply_metadata = fn(e: entry.Entry) -> entry.Entry {
-    let with_mode = case mode {
-      0 -> e
-      _ -> entry.with_mode(e, mode: mode)
+  let apply_metadata = fn(e: archive.Entry) -> archive.Entry {
+    let mode = case mode {
+      0 -> e.mode
+      _ -> mode
     }
-    let with_mtime = case mtime_unix > 0 {
-      True -> entry.with_modified_at(with_mode, unix_seconds: mtime_unix)
-      False -> with_mode
+    let modified_at = case mtime_unix > 0 {
+      True -> mtime_unix
+      False -> e.modified_at
     }
-    case owner_uid > 0 || owner_gid > 0 {
-      True ->
-        entry.with_owner(with_mtime, user_id: owner_uid, group_id: owner_gid)
-      False -> with_mtime
-    }
+    archive.Entry(
+      ..e,
+      mode:,
+      modified_at:,
+      user_id: owner_uid,
+      group_id: owner_gid,
+    )
   }
 
   case is_directory {
     True ->
       entry.directory_checked(path: strip_trailing_slash(name))
-      |> result.map_error(entry_error_to_archive_error(_, name))
+      |> result.map_error(entry.to_archive_error(_, name))
       |> result.map(apply_metadata)
     False ->
       entry.file_checked(path: name, body: body)
-      |> result.map_error(entry_error_to_archive_error(_, name))
+      |> result.map_error(entry.to_archive_error(_, name))
       |> result.map(apply_metadata)
   }
 }
@@ -1827,11 +1699,11 @@ fn resolve_pkware_decryption(
   expected_crc: Int,
   password: Option(String),
   name: String,
-) -> Result(#(Int, Int, BitArray), error.ArchiveError) {
+) -> Result(#(Int, Int, BitArray), archive.ArchiveError) {
   case encrypted, password {
     False, _ -> Ok(#(data_offset, total_size, full))
     True, None ->
-      Error(error.ArchiveNotImplemented(
+      Error(archive.Unsupported(
         feature: "encrypted ZIP entry \""
         <> name
         <> "\" (use decode_with_password)",
@@ -1850,7 +1722,7 @@ fn resolve_pkware_decryption(
         int.bitwise_and(int.bitwise_shift_right(expected_crc, 24), 0xFF)
       use <- bool.guard(
         when: check != expected_check,
-        return: Error(error.ArchiveInvalid(
+        return: Error(archive.InvalidData(
           message: "ZIP wrong password or corrupt encryption header for \""
           <> name
           <> "\"",
@@ -1870,15 +1742,15 @@ fn resolve_pkware_decryption(
 fn split_enc_header(
   raw: BitArray,
   total_size: Int,
-) -> Result(#(BitArray, BitArray), error.ArchiveError) {
+) -> Result(#(BitArray, BitArray), archive.ArchiveError) {
   case bit_array.slice(raw, 0, 12), bit_array.slice(raw, 12, total_size - 12) {
     Ok(h), Ok(p) -> Ok(#(h, p))
     Error(_), _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ZIP encryption header truncated (need ≥ 12 bytes)",
       ))
     _, Error(_) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ZIP encrypted entry payload truncated",
       ))
   }
@@ -1934,14 +1806,14 @@ fn resolve_aex_decryption(
   extras: BitArray,
   password: Option(String),
   name: String,
-) -> Result(#(Int, Int, BitArray, Int), error.ArchiveError) {
+) -> Result(#(Int, Int, BitArray, Int), archive.ArchiveError) {
   use params <- result.try(parse_aex_extra(extras, name))
   use key_len <- result.try(aex_key_length(params.strength, name))
   let salt_len = key_len / 2
   use pwd <- result.try(case password {
     Some(value) -> Ok(value)
     None ->
-      Error(error.ArchiveNotImplemented(
+      Error(archive.Unsupported(
         feature: "encrypted ZIP entry \""
         <> name
         <> "\" (use decode_with_password)",
@@ -1951,7 +1823,7 @@ fn resolve_aex_decryption(
   let ciphertext_len = total_size - salt_len - 2 - 10
   use <- bool.guard(
     when: ciphertext_len < 0,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "ZIP AE-x entry \""
       <> name
       <> "\" is too short for salt + verifier + HMAC",
@@ -1977,7 +1849,7 @@ fn resolve_aex_decryption(
   use expected_verifier <- result.try(slice_or_error(derived, key_len * 2, 2))
   use <- bool.guard(
     when: verifier != expected_verifier,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "ZIP AE-x wrong password for entry \"" <> name <> "\"",
     )),
   )
@@ -1985,14 +1857,14 @@ fn resolve_aex_decryption(
   use computed_tag <- result.try(slice_or_error(computed_full, 0, 10))
   use <- bool.guard(
     when: computed_tag != hmac_tag,
-    return: Error(error.ArchiveInvalid(
+    return: Error(archive.InvalidData(
       message: "ZIP AE-x HMAC mismatch for entry \"" <> name <> "\"",
     )),
   )
   use expanded <- result.try(case aes.expand_key(aes_key) {
     Ok(value) -> Ok(value)
     Error(_) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ZIP AE-x AES key expansion failed for \"" <> name <> "\"",
       ))
   })
@@ -2003,10 +1875,10 @@ fn resolve_aex_decryption(
 fn parse_aex_extra(
   extras: BitArray,
   name: String,
-) -> Result(AexParams, error.ArchiveError) {
+) -> Result(AexParams, archive.ArchiveError) {
   case find_extra_field(extras, aex_extra_id) {
     Error(_) ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ZIP AE-x marker entry \""
         <> name
         <> "\" missing the 0x9901 extra field",
@@ -2026,7 +1898,7 @@ fn parse_aex_extra(
             real_method: real_method,
           ))
         _ ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "ZIP AE-x 0x9901 extra is malformed for \"" <> name <> "\"",
           ))
       }
@@ -2036,13 +1908,13 @@ fn parse_aex_extra(
 fn aex_key_length(
   strength: Int,
   name: String,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case strength {
     0x01 -> Ok(16)
     0x02 -> Ok(24)
     0x03 -> Ok(32)
     _ ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ZIP AE-x unknown AES strength byte "
         <> int.to_string(strength)
         <> " for \""
@@ -2062,7 +1934,7 @@ fn aes_ctr_xor(
   key: aes.ExpandedKey,
   ciphertext: BitArray,
   name: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   aes_ctr_loop(key, ciphertext, 1, <<>>, name)
 }
 
@@ -2072,7 +1944,7 @@ fn aes_ctr_loop(
   counter: Int,
   acc: BitArray,
   name: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case ciphertext {
     <<>> -> Ok(acc)
     _ -> {
@@ -2080,7 +1952,7 @@ fn aes_ctr_loop(
       use keystream <- result.try(case aes.encrypt_block(key, counter_block) {
         Ok(value) -> Ok(value)
         Error(_) ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "ZIP AE-x CTR block encrypt failed for \"" <> name <> "\"",
           ))
       })
@@ -2137,42 +2009,38 @@ fn decode_pkware_lzma(
   compressed: BitArray,
   uncomp_size: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use #(prop_size, prop_block, payload) <- result.try(parse_pkware_lzma_header(
     compressed,
   ))
   use <- bool.guard(
     when: prop_size != 5,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "PKWARE LZMA wrapper property size must be 5",
     )),
   )
   use props <- result.try(parse_pkware_lzma_props(prop_block))
   use <- bool.guard(
-    when: uncomp_size > limit.max_output_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: uncomp_size > limits.max_output_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_output_bytes",
       actual: uncomp_size,
     )),
   )
-  use decoder <- result.try(lzma.new(
-    payload,
-    props,
-    limit.max_output_bytes(limits),
-  ))
+  use decoder <- result.try(lzma.new(payload, props, limits.max_output_bytes))
   use #(decoded, _state) <- result.try(lzma.decode_into(decoder, uncomp_size))
   Ok(decoded)
 }
 
 fn parse_pkware_lzma_header(
   compressed: BitArray,
-) -> Result(#(Int, BitArray, BitArray), error.CodecError) {
+) -> Result(#(Int, BitArray, BitArray), codec.CodecError) {
   case compressed {
     <<_major, _minor, prop_size:little-unsigned-size(16), rest:bytes>> -> {
       let rest_size = bit_array.byte_size(rest)
       use <- bool.guard(
         when: rest_size < prop_size,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "PKWARE LZMA wrapper truncated property block",
         )),
       )
@@ -2182,26 +2050,23 @@ fn parse_pkware_lzma_header(
       case prop_slice, payload_slice {
         Ok(prop_block), Ok(payload) -> Ok(#(prop_size, prop_block, payload))
         _, _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "PKWARE LZMA wrapper slice out of range",
           ))
       }
     }
-    _ ->
-      Error(error.CodecInvalidData(
-        message: "PKWARE LZMA wrapper missing header",
-      ))
+    _ -> Error(codec.InvalidData(message: "PKWARE LZMA wrapper missing header"))
   }
 }
 
 fn parse_pkware_lzma_props(
   prop_block: BitArray,
-) -> Result(lzma.Properties, error.CodecError) {
+) -> Result(lzma.Properties, codec.CodecError) {
   case prop_block {
     <<prop_byte, _dict_size:little-unsigned-size(32)>> ->
       lzma.properties_of_byte(prop_byte)
     _ ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "PKWARE LZMA wrapper property block has wrong length",
       ))
   }
@@ -2248,59 +2113,23 @@ fn path_depth(name: String) -> Int {
 }
 
 fn codec_to_archive_error(
-  err: error.CodecError,
+  err: codec.CodecError,
   path: String,
-) -> error.ArchiveError {
+) -> archive.ArchiveError {
   case err {
-    error.CodecInvalidData(message) ->
-      error.ArchiveEntryRejected(
+    codec.InvalidData(message) ->
+      archive.EntryRejected(
         path: path,
         reason: "deflate decode failed: " <> message,
       )
-    error.CodecLimitExceeded(limit, actual) ->
-      error.ArchiveLimitExceeded(limit: limit, actual: actual)
-    error.CodecDictionaryRequired(_) ->
-      error.ArchiveEntryRejected(
+    codec.LimitExceeded(limit, actual) ->
+      archive.LimitExceeded(limit: limit, actual: actual)
+    codec.DictionaryRequired ->
+      archive.EntryRejected(
         path: path,
         reason: "deflate decode requires preset dictionary (not supported)",
       )
-    error.CodecDictionaryMismatch(_) ->
-      error.ArchiveEntryRejected(
-        path: path,
-        reason: "deflate decode preset dictionary mismatch",
-      )
-    error.CodecOptionUnsupported(option, codec_name) ->
-      error.ArchiveEntryRejected(
-        path: path,
-        reason: "codec "
-          <> codec_name
-          <> " does not support the requested option: "
-          <> option,
-      )
-    error.CodecNotImplemented(feature) ->
-      error.ArchiveNotImplemented(feature: feature)
-  }
-}
-
-fn entry_error_to_archive_error(
-  err: entry.EntryError,
-  path: String,
-) -> error.ArchiveError {
-  case err {
-    entry.EmptyPath ->
-      error.ArchiveEntryRejected(path: path, reason: "empty path")
-    entry.AbsolutePath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "absolute path")
-    entry.PathTraversal(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "path traversal")
-    entry.WindowsPath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "windows path")
-    entry.EmptySegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "empty segment")
-    entry.DotSegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "dot segment")
-    entry.ContainsNul(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "nul byte")
+    codec.Unsupported(feature) -> archive.Unsupported(feature: feature)
   }
 }
 
@@ -2308,18 +2137,18 @@ fn slice_or_error(
   bytes: BitArray,
   offset: Int,
   width: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bit_array.slice(bytes, offset, width) {
     Ok(value) -> Ok(value)
-    Error(_) -> Error(error.ArchiveInvalid(message: "ZIP slice out of bounds"))
+    Error(_) -> Error(archive.InvalidData(message: "ZIP slice out of bounds"))
   }
 }
 
-fn bytes_to_string(bytes: BitArray) -> Result(String, error.ArchiveError) {
+fn bytes_to_string(bytes: BitArray) -> Result(String, archive.ArchiveError) {
   case bit_array.to_string(bytes) {
     Ok(value) -> Ok(value)
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "non-UTF-8 ZIP name (set EFS flag)"))
+      Error(archive.InvalidData(message: "non-UTF-8 ZIP name (set EFS flag)"))
   }
 }
 
@@ -2352,38 +2181,38 @@ fn le32(value: Int) -> BitArray {
 fn read_le16_at(
   bytes: BitArray,
   offset: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case bit_array.slice(bytes, offset, 2) {
     Ok(<<value:size(16)-little>>) -> Ok(value)
-    _ -> Error(error.ArchiveInvalid(message: "short read for 16-bit value"))
+    _ -> Error(archive.InvalidData(message: "short read for 16-bit value"))
   }
 }
 
 fn read_le32_at(
   bytes: BitArray,
   offset: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case bit_array.slice(bytes, offset, 4) {
     Ok(<<value:size(32)-little>>) -> Ok(value)
-    _ -> Error(error.ArchiveInvalid(message: "short read for 32-bit value"))
+    _ -> Error(archive.InvalidData(message: "short read for 32-bit value"))
   }
 }
 
-fn read_le32(bytes: BitArray) -> Result(Int, error.ArchiveError) {
+fn read_le32(bytes: BitArray) -> Result(Int, archive.ArchiveError) {
   case bytes {
     <<value:size(32)-little>> -> Ok(value)
-    _ -> Error(error.ArchiveInvalid(message: "short read for 32-bit value"))
+    _ -> Error(archive.InvalidData(message: "short read for 32-bit value"))
   }
 }
 
 fn read_le64_at(
   bytes: BitArray,
   offset: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   case bit_array.slice(bytes, offset, 8) {
     Ok(<<low:size(32)-little, high:size(32)-little>>) ->
       Ok(join_le64(low:, high:))
-    _ -> Error(error.ArchiveInvalid(message: "short read for 64-bit value"))
+    _ -> Error(archive.InvalidData(message: "short read for 64-bit value"))
   }
 }
 
@@ -2410,7 +2239,7 @@ fn parse_zip64_extra(
   uncomp_at_sentinel: Bool,
   comp_at_sentinel: Bool,
   offset_at_sentinel: Bool,
-) -> Result(#(Option(Int), Option(Int), Option(Int)), error.ArchiveError) {
+) -> Result(#(Option(Int), Option(Int), Option(Int)), archive.ArchiveError) {
   case find_extra_field(extra, zip64_extra_id) {
     Ok(payload) ->
       decode_zip64_extra_payload(
@@ -2456,7 +2285,7 @@ fn decode_zip64_extra_payload(
   uncomp_at_sentinel: Bool,
   comp_at_sentinel: Bool,
   offset_at_sentinel: Bool,
-) -> Result(#(Option(Int), Option(Int), Option(Int)), error.ArchiveError) {
+) -> Result(#(Option(Int), Option(Int), Option(Int)), archive.ArchiveError) {
   use #(uncomp, payload) <- result.try(maybe_read_le64(
     payload,
     uncomp_at_sentinel,
@@ -2472,14 +2301,14 @@ fn decode_zip64_extra_payload(
 fn maybe_read_le64(
   payload: BitArray,
   needed: Bool,
-) -> Result(#(Option(Int), BitArray), error.ArchiveError) {
+) -> Result(#(Option(Int), BitArray), archive.ArchiveError) {
   case needed {
     False -> Ok(#(None, payload))
     True ->
       case payload {
         <<low:size(32)-little, high:size(32)-little, rest:bytes>> ->
           Ok(#(Some(join_le64(low:, high:)), rest))
-        _ -> Error(error.ArchiveInvalid(message: "Zip64 extra field truncated"))
+        _ -> Error(archive.InvalidData(message: "Zip64 extra field truncated"))
       }
   }
 }

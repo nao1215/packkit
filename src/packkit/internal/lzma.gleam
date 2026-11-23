@@ -1,5 +1,5 @@
 //// Pure Gleam LZMA decoder used by the `xz` (LZMA2) and `seven_z`
-//// codecs.  The implementation follows Igor Pavlov's reference
+//// codec.  The implementation follows Igor Pavlov's reference
 //// decoder: range coder + 12-state machine + sliding dictionary.
 ////
 //// Probabilities are stored in a `dict.Dict(Int, Int)` keyed by a
@@ -15,7 +15,7 @@ import gleam/dict
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import packkit/error
+import packkit/codec
 
 const num_bit_model_total_bits: Int = 11
 
@@ -103,12 +103,10 @@ pub type Properties {
 }
 
 /// Decode an LZMA properties byte into typed properties.
-pub fn properties_of_byte(byte: Int) -> Result(Properties, error.CodecError) {
+pub fn properties_of_byte(byte: Int) -> Result(Properties, codec.CodecError) {
   use <- bool.guard(
     when: byte > 224,
-    return: Error(error.CodecInvalidData(
-      message: "invalid LZMA properties byte",
-    )),
+    return: Error(codec.InvalidData(message: "invalid LZMA properties byte")),
   )
   let pb = byte / 45
   let remainder = byte - pb * 45
@@ -116,11 +114,11 @@ pub fn properties_of_byte(byte: Int) -> Result(Properties, error.CodecError) {
   let lc = remainder - lp * 9
   use <- bool.guard(
     when: lc + lp > 4,
-    return: Error(error.CodecInvalidData(message: "LZMA lc + lp must be <= 4")),
+    return: Error(codec.InvalidData(message: "LZMA lc + lp must be <= 4")),
   )
   use <- bool.guard(
     when: pb > num_pos_bits_max,
-    return: Error(error.CodecInvalidData(message: "LZMA pb out of range")),
+    return: Error(codec.InvalidData(message: "LZMA pb out of range")),
   )
   Ok(Properties(lc: lc, lp: lp, pb: pb))
 }
@@ -152,12 +150,12 @@ pub fn new(
   input: BitArray,
   props: Properties,
   output_limit: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   case input {
     <<first, rest:bytes>> -> {
       use <- bool.guard(
         when: first != 0,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "LZMA range coder must start with a zero byte",
         )),
       )
@@ -179,7 +177,7 @@ pub fn new(
       ))
     }
     _ ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "LZMA range coder needs at least 5 priming bytes",
       ))
   }
@@ -191,7 +189,7 @@ pub fn new(
 pub fn decode_into(
   decoder: Decoder,
   desired_output: Int,
-) -> Result(#(BitArray, Decoder), error.CodecError) {
+) -> Result(#(BitArray, Decoder), codec.CodecError) {
   use decoder <- result.try(loop_until(decoder, desired_output))
   let bytes = list_reverse_to_bit_array(decoder.output_rev, <<>>)
   Ok(#(bytes, decoder))
@@ -212,7 +210,7 @@ pub fn decode_into(
 fn loop_until(
   decoder: Decoder,
   desired_output: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   case decoder.output_len >= desired_output {
     True -> Ok(decoder)
     False -> {
@@ -251,7 +249,7 @@ fn loop_until(
 
 // -- literal ------------------------------------------------------------
 
-fn decode_literal(decoder: Decoder) -> Result(Decoder, error.CodecError) {
+fn decode_literal(decoder: Decoder) -> Result(Decoder, codec.CodecError) {
   let prev_byte = previous_output_byte(decoder)
   let lit_pos_state =
     int.bitwise_and(decoder.output_len, mask_for(decoder.props.lp))
@@ -272,7 +270,7 @@ fn decode_literal_normal(
   decoder: Decoder,
   base: Int,
   symbol: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   case symbol >= 0x100 {
     True -> {
       let byte = int.bitwise_and(symbol, 0xFF)
@@ -294,7 +292,7 @@ fn decode_literal_matched(
   base: Int,
   symbol: Int,
   match_b: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   case symbol >= 0x100 {
     True -> {
       let byte = int.bitwise_and(symbol, 0xFF)
@@ -376,7 +374,7 @@ fn advance_state_literal(decoder: Decoder) -> Decoder {
 fn decode_match(
   decoder: Decoder,
   pos_state: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   let decoder =
     Decoder(
       ..decoder,
@@ -411,7 +409,7 @@ fn match_next(state: Int) -> Int {
 fn decode_rep(
   decoder: Decoder,
   pos_state: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   use #(g0, decoder) <- result.try(decode_bit(
     decoder,
     prob_key(t_is_rep_g0, decoder.state),
@@ -456,7 +454,7 @@ fn apply_rep_match(
   decoder: Decoder,
   selected: Int,
   pos_state: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   let #(rep1, rep2, rep3) = case True {
     _ if selected == decoder.rep0 -> #(decoder.rep1, decoder.rep2, decoder.rep3)
     _ if selected == decoder.rep1 -> #(decoder.rep0, decoder.rep2, decoder.rep3)
@@ -501,7 +499,7 @@ fn rep_next(state: Int) -> Int {
 fn apply_copy(
   decoder: Decoder,
   length: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   copy_loop(decoder, decoder.rep0, length)
 }
 
@@ -509,14 +507,14 @@ fn copy_loop(
   decoder: Decoder,
   distance: Int,
   remaining: Int,
-) -> Result(Decoder, error.CodecError) {
+) -> Result(Decoder, codec.CodecError) {
   case remaining {
     0 -> Ok(decoder)
     _ -> {
       use <- bool.guard(
         when: distance >= decoder.output_len
           && decoder.output_len < decoder.output_limit,
-        return: Error(error.CodecInvalidData(
+        return: Error(codec.InvalidData(
           message: "LZMA back-reference exceeds dictionary",
         )),
       )
@@ -537,7 +535,7 @@ fn decode_length(
   t_low: Int,
   t_mid: Int,
   t_high: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   use #(choice, decoder) <- result.try(decode_bit(
     decoder,
     prob_key(t_choice, 0),
@@ -586,7 +584,7 @@ fn decode_length(
 fn decode_distance(
   decoder: Decoder,
   length: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   let len_state = case length - match_min_len < num_len_to_pos_states {
     True -> length - match_min_len
     False -> num_len_to_pos_states - 1
@@ -642,7 +640,7 @@ fn decode_distance(
 fn decode_bit(
   decoder: Decoder,
   key: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   let prob = case dict.get(decoder.probs, key) {
     Ok(value) -> value
     Error(_) -> bit_model_init
@@ -680,7 +678,7 @@ fn decode_bit(
 fn decode_direct_bits(
   decoder: Decoder,
   count: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   decode_direct_bits_loop(decoder, count, 0)
 }
 
@@ -688,7 +686,7 @@ fn decode_direct_bits_loop(
   decoder: Decoder,
   remaining: Int,
   acc: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   case remaining {
     0 -> Ok(#(acc, decoder))
     _ -> {
@@ -715,7 +713,7 @@ fn decode_bit_tree(
   table: Int,
   base: Int,
   num_bits: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   decode_bit_tree_loop(decoder, table, base, num_bits, 1, num_bits)
 }
 
@@ -726,7 +724,7 @@ fn decode_bit_tree_loop(
   remaining: Int,
   symbol: Int,
   total_bits: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   case remaining {
     0 -> Ok(#(symbol - int.bitwise_shift_left(1, total_bits), decoder))
     _ -> {
@@ -751,7 +749,7 @@ fn decode_reverse_bit_tree(
   table: Int,
   base: Int,
   num_bits: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   decode_reverse_bit_tree_loop(decoder, table, base, num_bits, 1, 0, 0)
 }
 
@@ -763,7 +761,7 @@ fn decode_reverse_bit_tree_loop(
   symbol: Int,
   result_acc: Int,
   bit_index: Int,
-) -> Result(#(Int, Decoder), error.CodecError) {
+) -> Result(#(Int, Decoder), codec.CodecError) {
   case remaining {
     0 -> Ok(#(result_acc, decoder))
     _ -> {
@@ -784,7 +782,7 @@ fn decode_reverse_bit_tree_loop(
   }
 }
 
-fn normalize(decoder: Decoder) -> Result(Decoder, error.CodecError) {
+fn normalize(decoder: Decoder) -> Result(Decoder, codec.CodecError) {
   case decoder.range < top_value {
     False -> Ok(decoder)
     True ->
@@ -799,7 +797,7 @@ fn normalize(decoder: Decoder) -> Result(Decoder, error.CodecError) {
             ),
           )
         _ ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "LZMA range coder ran out of input bytes",
           ))
       }
@@ -824,11 +822,11 @@ fn mask_for(bits: Int) -> Int {
   int.bitwise_shift_left(1, bits) - 1
 }
 
-fn read_u32_be(bytes: BitArray) -> Result(#(Int, BitArray), error.CodecError) {
+fn read_u32_be(bytes: BitArray) -> Result(#(Int, BitArray), codec.CodecError) {
   case bytes {
     <<value:big-unsigned-size(32), rest:bytes>> -> Ok(#(value, rest))
     _ ->
-      Error(error.CodecInvalidData(
+      Error(codec.InvalidData(
         message: "LZMA range coder priming requires 4 bytes",
       ))
   }

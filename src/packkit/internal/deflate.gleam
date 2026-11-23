@@ -23,8 +23,8 @@ import gleam/int
 import gleam/list
 import gleam/order
 import gleam/result
-import packkit/codec as codecs
-import packkit/error
+import packkit/codec
+import packkit/internal/bytes
 import packkit/limit
 
 const max_bits: Int = 15
@@ -33,32 +33,20 @@ const max_length_code: Int = 285
 
 const max_distance_code: Int = 29
 
-const stored_block_max: Int = 65_535
-
 const max_match_length: Int = 258
 
 const min_match_length: Int = 3
 
 const max_window: Int = 32_768
 
-/// Raw deflate codec smart constructor.
-pub fn codec() -> codecs.Codec {
-  codecs.deflate()
-}
-
-/// Decode a raw DEFLATE byte stream using default limits.
-pub fn decode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a raw DEFLATE byte stream using explicit limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -83,10 +71,10 @@ pub fn decode_with_limits(
 pub fn decode_with_remainder(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(#(BitArray, BitArray), error.CodecError) {
+) -> Result(#(BitArray, BitArray), codec.CodecError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.CodecLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(codec.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -133,17 +121,8 @@ fn bytes_from_low_int(value: Int, count: Int, acc: BitArray) -> BitArray {
 /// chain and a 32 KiB sliding window, then emits the resulting
 /// literal/length/distance tokens through the RFC 1951 fixed
 /// Huffman table.
-pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
+pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
   Ok(encode_huffman(bytes))
-}
-
-/// Encode a byte stream as a sequence of stored (uncompressed)
-/// DEFLATE blocks.  Useful when the caller wants to bypass the
-/// match-finder, for instance to test the framing in isolation.
-pub fn encode_stored_only(
-  bytes bytes: BitArray,
-) -> Result(BitArray, error.CodecError) {
-  Ok(encode_stored(bytes))
 }
 
 /// Encode a byte stream as a dynamic-Huffman DEFLATE block (BTYPE=10).
@@ -160,10 +139,8 @@ pub fn encode_stored_only(
 /// (which happens only on pathologically skewed inputs), the encoder
 /// transparently falls back to the fixed-Huffman path so the call
 /// still returns a valid stream.
-pub fn encode_dynamic(
-  bytes bytes: BitArray,
-) -> Result(BitArray, error.CodecError) {
-  Ok(encode_dynamic_or_fixed(bytes))
+pub fn encode_dynamic(bytes bytes: BitArray) -> BitArray {
+  encode_dynamic_or_fixed(bytes)
 }
 
 // -- bit reader ----------------------------------------------------------
@@ -204,11 +181,10 @@ fn refill(reader: Reader, needed: Int) -> Reader {
 fn read_bits(
   reader: Reader,
   count: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   let r = refill(reader, count)
   case r.overflow && r.bits < count {
-    True ->
-      Error(error.CodecInvalidData(message: "truncated deflate bit stream"))
+    True -> Error(codec.InvalidData(message: "truncated deflate bit stream"))
     False -> {
       let mask = int.bitwise_shift_left(1, count) - 1
       let value = int.bitwise_and(r.buffer, mask)
@@ -234,7 +210,7 @@ type Tree {
   Tree(counts: List(Int), symbols: List(Int), max_sym: Int)
 }
 
-fn build_tree(lengths: List(Int)) -> Result(Tree, error.CodecError) {
+fn build_tree(lengths: List(Int)) -> Result(Tree, codec.CodecError) {
   let max_sym = find_max_symbol(lengths, 0, -1, 0)
   let counts = count_lengths(lengths)
   use _ <- result.try(validate_counts(counts, 0, 1, 0))
@@ -302,14 +278,12 @@ fn validate_counts(
   index: Int,
   available: Int,
   total: Int,
-) -> Result(Int, error.CodecError) {
+) -> Result(Int, codec.CodecError) {
   case index > max_bits {
     True -> {
       case total > 1 && available > 0 {
         True ->
-          Error(error.CodecInvalidData(
-            message: "incomplete Huffman code lengths",
-          ))
+          Error(codec.InvalidData(message: "incomplete Huffman code lengths"))
         False -> Ok(total)
       }
     }
@@ -317,7 +291,7 @@ fn validate_counts(
       let used = list_get(counts, index, 0)
       case used > available {
         True ->
-          Error(error.CodecInvalidData(
+          Error(codec.InvalidData(
             message: "over-subscribed Huffman code lengths",
           ))
         False ->
@@ -382,7 +356,7 @@ fn prepend_reversed(values: List(Int), acc: List(Int)) -> List(Int) {
 fn decode_symbol(
   reader: Reader,
   tree: Tree,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   decode_symbol_loop(reader, tree, 1, 0, 0)
 }
 
@@ -392,10 +366,9 @@ fn decode_symbol_loop(
   length: Int,
   base: Int,
   offset: Int,
-) -> Result(#(Int, Reader), error.CodecError) {
+) -> Result(#(Int, Reader), codec.CodecError) {
   case length > max_bits {
-    True ->
-      Error(error.CodecInvalidData(message: "invalid Huffman code (overlong)"))
+    True -> Error(codec.InvalidData(message: "invalid Huffman code (overlong)"))
     False -> {
       use #(bit, reader) <- result.try(read_bits(reader, 1))
       let offset = 2 * offset + bit
@@ -430,7 +403,7 @@ fn inflate(
   reader: Reader,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   case inflate_one_block(reader, output, limits) {
     Error(err) -> Error(err)
     Ok(InflateDone(out, rdr)) -> Ok(#(out, rdr))
@@ -447,7 +420,7 @@ fn inflate_one_block(
   reader: Reader,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(InflateStep, error.CodecError) {
+) -> Result(InflateStep, codec.CodecError) {
   use #(bfinal, reader) <- result.try(read_bits(reader, 1))
   use #(btype, reader) <- result.try(read_bits(reader, 2))
 
@@ -455,7 +428,7 @@ fn inflate_one_block(
     0 -> inflate_stored(reader, output, limits)
     1 -> inflate_fixed(reader, output, limits)
     2 -> inflate_dynamic(reader, output, limits)
-    _ -> Error(error.CodecInvalidData(message: "reserved DEFLATE block type"))
+    _ -> Error(codec.InvalidData(message: "reserved DEFLATE block type"))
   })
 
   case bfinal {
@@ -468,34 +441,32 @@ fn inflate_stored(
   reader: Reader,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   let reader = skip_to_byte_boundary(reader)
   use #(length, reader) <- result.try(read_bits(reader, 16))
   use #(invlength, reader) <- result.try(read_bits(reader, 16))
   use <- bool.guard(
     when: int.bitwise_and(int.bitwise_exclusive_or(length, invlength), 0xFFFF)
       != 0xFFFF,
-    return: Error(error.CodecInvalidData(
-      message: "stored block length mismatch",
-    )),
+    return: Error(codec.InvalidData(message: "stored block length mismatch")),
   )
 
   use #(bytes, reader) <- result.try(read_raw_bytes(reader, length))
-  use new_output <- result.try(append_with_limit(output, bytes, limits))
+  use new_output <- result.try(bytes.append_with_limit(output, bytes, limits))
   Ok(#(new_output, reader))
 }
 
 fn read_raw_bytes(
   reader: Reader,
   length: Int,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   case length {
     0 -> Ok(#(<<>>, reader))
     _ ->
       case reader.source {
         <<chunk:bytes-size(length), rest:bytes>> ->
           Ok(#(chunk, Reader(buffer: 0, bits: 0, source: rest, overflow: False)))
-        _ -> Error(error.CodecInvalidData(message: "truncated stored block"))
+        _ -> Error(codec.InvalidData(message: "truncated stored block"))
       }
   }
 }
@@ -504,7 +475,7 @@ fn inflate_fixed(
   reader: Reader,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   inflate_huffman_block(
     reader,
     output,
@@ -518,7 +489,7 @@ fn inflate_dynamic(
   reader: Reader,
   output: BitArray,
   limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   use #(hlit_raw, reader) <- result.try(read_bits(reader, 5))
   let hlit = hlit_raw + 257
   use #(hdist_raw, reader) <- result.try(read_bits(reader, 5))
@@ -528,7 +499,7 @@ fn inflate_dynamic(
 
   use <- bool.guard(
     when: hlit > 286 || hdist > 30,
-    return: Error(error.CodecInvalidData(message: "dynamic header out of range")),
+    return: Error(codec.InvalidData(message: "dynamic header out of range")),
   )
 
   use #(clcl_table, reader) <- result.try(read_code_length_table(reader, hclen))
@@ -543,7 +514,7 @@ fn inflate_dynamic(
 
   use <- bool.guard(
     when: list_get(lit_lengths, 256, 0) == 0,
-    return: Error(error.CodecInvalidData(
+    return: Error(codec.InvalidData(
       message: "dynamic header missing end-of-block symbol",
     )),
   )
@@ -556,7 +527,7 @@ fn inflate_dynamic(
 fn read_code_length_table(
   reader: Reader,
   count: Int,
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   read_code_lengths_loop(reader, count, 0, empty_clcl_table())
 }
 
@@ -573,7 +544,7 @@ fn read_code_lengths_loop(
   remaining: Int,
   index: Int,
   acc: List(Int),
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case remaining {
     0 -> Ok(#(acc, reader))
     _ -> {
@@ -594,7 +565,7 @@ fn decode_dynamic_lengths(
   tree: Tree,
   hlit: Int,
   hdist: Int,
-) -> Result(#(List(Int), List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), List(Int), Reader), codec.CodecError) {
   let total = hlit + hdist
   use #(combined, reader) <- result.try(decode_length_run(
     reader,
@@ -616,16 +587,14 @@ fn decode_length_run(
   produced: Int,
   acc: List(Int),
   previous: Int,
-) -> Result(#(List(Int), Reader), error.CodecError) {
+) -> Result(#(List(Int), Reader), codec.CodecError) {
   case produced >= total {
     True -> Ok(#(list.reverse(acc), reader))
     False -> {
       use #(symbol, reader) <- result.try(decode_symbol(reader, tree))
       use <- bool.guard(
         when: symbol > 18 || symbol < 0,
-        return: Error(error.CodecInvalidData(
-          message: "invalid code-length symbol",
-        )),
+        return: Error(codec.InvalidData(message: "invalid code-length symbol")),
       )
 
       case symbol {
@@ -636,13 +605,13 @@ fn decode_length_run(
           let count = 3 + extra
           use <- bool.guard(
             when: produced == 0,
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "repeat-previous symbol at start of run",
             )),
           )
           use <- bool.guard(
             when: produced + count > total,
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "code-length run exceeds declared total",
             )),
           )
@@ -661,7 +630,7 @@ fn decode_length_run(
           let count = 3 + extra
           use <- bool.guard(
             when: produced + count > total,
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "zero-run symbol exceeds declared total",
             )),
           )
@@ -673,7 +642,7 @@ fn decode_length_run(
           let count = 11 + extra
           use <- bool.guard(
             when: produced + count > total,
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "long zero-run exceeds declared total",
             )),
           )
@@ -715,7 +684,7 @@ fn inflate_huffman_block(
   ltree: Tree,
   dtree: Tree,
   limits: limit.Limits,
-) -> Result(#(BitArray, Reader), error.CodecError) {
+) -> Result(#(BitArray, Reader), codec.CodecError) {
   case inflate_huffman_step(reader, output, ltree, dtree, limits) {
     Error(err) -> Error(err)
     Ok(HuffmanDone(out, rdr)) -> Ok(#(out, rdr))
@@ -735,21 +704,23 @@ fn inflate_huffman_step(
   ltree: Tree,
   dtree: Tree,
   limits: limit.Limits,
-) -> Result(HuffmanStep, error.CodecError) {
+) -> Result(HuffmanStep, codec.CodecError) {
   use #(symbol, reader) <- result.try(decode_symbol(reader, ltree))
 
   case symbol {
     s if s < 256 -> {
-      use new_output <- result.try(append_with_limit(output, <<s>>, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        <<s>>,
+        limits,
+      ))
       Ok(HuffmanContinue(new_output, reader))
     }
     256 -> Ok(HuffmanDone(output, reader))
     s ->
       case s > max_length_code {
         True ->
-          Error(error.CodecInvalidData(
-            message: "literal/length code out of range",
-          ))
+          Error(codec.InvalidData(message: "literal/length code out of range"))
         False -> {
           let length_index = s - 257
           let extra_bits = list_get(length_extra_bits(), length_index, 0)
@@ -760,7 +731,7 @@ fn inflate_huffman_step(
           use #(dist_symbol, reader) <- result.try(decode_symbol(reader, dtree))
           use <- bool.guard(
             when: dist_symbol > max_distance_code,
-            return: Error(error.CodecInvalidData(
+            return: Error(codec.InvalidData(
               message: "distance code out of range",
             )),
           )
@@ -789,17 +760,17 @@ fn apply_backref(
   distance: Int,
   length: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   let size = bit_array.byte_size(output)
   use <- bool.guard(
     when: distance <= 0 || distance > size,
-    return: Error(error.CodecInvalidData(message: "back-reference out of range")),
+    return: Error(codec.InvalidData(message: "back-reference out of range")),
   )
 
   case distance >= length {
     True -> {
       let assert Ok(chunk) = bit_array.slice(output, size - distance, length)
-      append_with_limit(output, chunk, limits)
+      bytes.append_with_limit(output, chunk, limits)
     }
     False -> apply_backref_byte_by_byte(output, distance, length, limits)
   }
@@ -810,31 +781,19 @@ fn apply_backref_byte_by_byte(
   distance: Int,
   length: Int,
   limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
+) -> Result(BitArray, codec.CodecError) {
   case length {
     0 -> Ok(output)
     _ -> {
       let size = bit_array.byte_size(output)
       let assert Ok(byte_slice) = bit_array.slice(output, size - distance, 1)
-      use new_output <- result.try(append_with_limit(output, byte_slice, limits))
+      use new_output <- result.try(bytes.append_with_limit(
+        output,
+        byte_slice,
+        limits,
+      ))
       apply_backref_byte_by_byte(new_output, distance, length - 1, limits)
     }
-  }
-}
-
-fn append_with_limit(
-  output: BitArray,
-  chunk: BitArray,
-  limits: limit.Limits,
-) -> Result(BitArray, error.CodecError) {
-  let projected = bit_array.byte_size(output) + bit_array.byte_size(chunk)
-  case projected > limit.max_output_bytes(limits) {
-    True ->
-      Error(error.CodecLimitExceeded(
-        limit: "max_output_bytes",
-        actual: projected,
-      ))
-    False -> Ok(bit_array.concat([output, chunk]))
   }
 }
 
@@ -1008,51 +967,6 @@ fn distance_base() -> List(Int) {
 }
 
 // -- encoder -------------------------------------------------------------
-
-fn encode_stored(bytes: BitArray) -> BitArray {
-  let size = bit_array.byte_size(bytes)
-  case size {
-    0 -> empty_stored_block()
-    _ -> encode_stored_blocks(bytes, size, 0, [])
-  }
-}
-
-fn empty_stored_block() -> BitArray {
-  <<1, 0, 0, 0xFF, 0xFF>>
-}
-
-fn encode_stored_blocks(
-  source: BitArray,
-  remaining: Int,
-  written: Int,
-  acc: List(BitArray),
-) -> BitArray {
-  case remaining {
-    0 -> bit_array.concat(list.reverse(acc))
-    _ -> {
-      let chunk_size = case remaining > stored_block_max {
-        True -> stored_block_max
-        False -> remaining
-      }
-      let final_flag = case chunk_size == remaining {
-        True -> 1
-        False -> 0
-      }
-      let assert Ok(chunk) = bit_array.slice(source, written, chunk_size)
-      let header = <<
-        final_flag,
-        chunk_size:size(16)-little,
-        int.bitwise_exclusive_or(chunk_size, 0xFFFF):size(16)-little,
-      >>
-      encode_stored_blocks(
-        source,
-        remaining - chunk_size,
-        written + chunk_size,
-        [bit_array.concat([header, chunk]), ..acc],
-      )
-    }
-  }
-}
 
 // -- fixed-Huffman encoder ----------------------------------------------
 

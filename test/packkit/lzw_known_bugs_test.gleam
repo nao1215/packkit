@@ -5,7 +5,9 @@
 
 import gleam/bool
 import gleeunit/should
-import packkit/lzw
+import packkit
+import packkit/codec
+import packkit/internal/lzw
 
 /// Encoding then decoding `[0, 1, …, 255]` used to inject an extra `0`
 /// byte between positions 254 and 255 (round trip produced
@@ -20,7 +22,7 @@ import packkit/lzw
 pub fn bug4_lzw_byte_range_inserts_extra_zero_test() -> Nil {
   let payload = byte_range(0, 256, <<>>)
   let assert Ok(encoded) = lzw.encode(bytes: payload)
-  lzw.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Lzw)
   |> should.equal(Ok(payload))
 }
 
@@ -32,7 +34,7 @@ pub fn lzw_byte_range_plus_one_test() -> Nil {
   let payload = byte_range(0, 256, <<>>)
   let payload = <<payload:bits, 0>>
   let assert Ok(encoded) = lzw.encode(bytes: payload)
-  lzw.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Lzw)
   |> should.equal(Ok(payload))
 }
 
@@ -42,7 +44,7 @@ pub fn lzw_byte_range_plus_one_test() -> Nil {
 pub fn lzw_byte_range_minus_one_test() -> Nil {
   let payload = byte_range(0, 255, <<>>)
   let assert Ok(encoded) = lzw.encode(bytes: payload)
-  lzw.decode(bytes: encoded)
+  packkit.decompress(encoded, with: codec.Lzw)
   |> should.equal(Ok(payload))
 }
 

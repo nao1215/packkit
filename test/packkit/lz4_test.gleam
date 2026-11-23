@@ -1,7 +1,10 @@
 import gleam/bit_array
 import gleam/int
 import gleeunit/should
-import packkit/lz4
+import packkit
+import packkit/codec
+import packkit/internal/lz4
+import packkit/internal/xxh32
 
 pub fn decode_hello_golden_test() -> Nil {
   // Generated with the `lz4` npm package: lz4.encode(Buffer.from("hello")).
@@ -9,7 +12,7 @@ pub fn decode_hello_golden_test() -> Nil {
     0x04, 0x22, 0x4d, 0x18, 0x64, 0x70, 0xb9, 0x06, 0x00, 0x00, 0x00, 0x50, 0x68,
     0x65, 0x6c, 0x6c, 0x6f, 0x00, 0x00, 0x00, 0x00, 0xf9, 0x77, 0x00, 0xfb,
   >>
-  let assert Ok(plain) = lz4.decode(bytes: compressed)
+  let assert Ok(plain) = packkit.decompress(compressed, with: codec.Lz4)
   plain
   |> should.equal(<<"hello":utf8>>)
 }
@@ -23,7 +26,7 @@ pub fn decode_match_run_golden_test() -> Nil {
     0x62, 0x63, 0x03, 0x00, 0x99, 0x50, 0x62, 0x63, 0x61, 0x62, 0x63, 0x00, 0x00,
     0x00, 0x00, 0x99, 0x5b, 0x93, 0x15,
   >>
-  let assert Ok(plain) = lz4.decode(bytes: compressed)
+  let assert Ok(plain) = packkit.decompress(compressed, with: codec.Lz4)
   bit_array.byte_size(plain)
   |> should.equal(180)
   let expected =
@@ -41,7 +44,7 @@ pub fn decode_repeat_offset1_golden_test() -> Nil {
     0x01, 0x00, 0x4b, 0x50, 0x78, 0x78, 0x78, 0x78, 0x78, 0x00, 0x00, 0x00, 0x00,
     0x3a, 0x0d, 0xd3, 0x4b,
   >>
-  let assert Ok(plain) = lz4.decode(bytes: compressed)
+  let assert Ok(plain) = packkit.decompress(compressed, with: codec.Lz4)
   bit_array.byte_size(plain)
   |> should.equal(100)
 }
@@ -49,14 +52,14 @@ pub fn decode_repeat_offset1_golden_test() -> Nil {
 pub fn roundtrip_uncompressed_encoder_test() -> Nil {
   let payload = <<"packkit lz4 frame round-trip":utf8>>
   let assert Ok(frame) = lz4.encode(bytes: payload)
-  let assert Ok(restored) = lz4.decode(bytes: frame)
+  let assert Ok(restored) = packkit.decompress(frame, with: codec.Lz4)
   restored
   |> should.equal(payload)
 }
 
 pub fn roundtrip_empty_payload_test() -> Nil {
   let assert Ok(frame) = lz4.encode(bytes: <<>>)
-  let assert Ok(restored) = lz4.decode(bytes: frame)
+  let assert Ok(restored) = packkit.decompress(frame, with: codec.Lz4)
   restored
   |> should.equal(<<>>)
 }
@@ -67,7 +70,7 @@ pub fn encoder_compresses_repeating_payload_test() -> Nil {
   // uncompressed-only encoder added ~12 bytes of framing).
   let payload = repeat_byte(0x61, 1024, <<>>)
   let assert Ok(frame) = lz4.encode(bytes: payload)
-  let assert Ok(restored) = lz4.decode(bytes: frame)
+  let assert Ok(restored) = packkit.decompress(frame, with: codec.Lz4)
   restored
   |> should.equal(payload)
   { bit_array.byte_size(frame) < 100 }
@@ -81,7 +84,7 @@ pub fn encoder_compresses_repeating_pattern_test() -> Nil {
       20,
     ))
   let assert Ok(frame) = lz4.encode(bytes: payload)
-  let assert Ok(restored) = lz4.decode(bytes: frame)
+  let assert Ok(restored) = packkit.decompress(frame, with: codec.Lz4)
   restored
   |> should.equal(payload)
   { bit_array.byte_size(frame) < bit_array.byte_size(payload) }
@@ -94,54 +97,27 @@ pub fn roundtrip_random_short_test() -> Nil {
       "DE7374EF0634215A02948D5CBADC072B286F8175B5FE2FA00B1FCCB187702CF8",
     )
   let assert Ok(frame) = lz4.encode(bytes: payload)
-  let assert Ok(restored) = lz4.decode(bytes: frame)
+  let assert Ok(restored) = packkit.decompress(frame, with: codec.Lz4)
   restored
   |> should.equal(payload)
 }
 
-pub fn encoder_with_content_size_sets_flag_and_field_test() -> Nil {
-  // `encode_with_content_size` must set the FLG content-size bit
-  // (0x08) and emit the 8-byte little-endian uncompressed size in
-  // the frame descriptor.  The HC byte that follows is the
-  // (XXH32 >> 8) of FLG..BD..CSIZE rather than the canned 0x73
-  // from the no-flags encoder.
+pub fn decodes_frame_with_content_size_test() -> Nil {
+  // Rewrite the descriptor of an encoded frame so it carries the
+  // content-size flag (0x08) and the 8-byte size, as `lz4 --content-size`
+  // writes it.  The decoder must skip the field.
   let payload = <<"hello":utf8>>
-  let assert Ok(frame) = lz4.encode_with_content_size(bytes: payload)
-
-  // Frame magic is at offset 0..4, FLG at offset 4, content size
-  // begins at offset 6, HC byte at offset 14.
-  // The 64-bit content size is read as two 32-bit halves so the
-  // pattern also compiles without truncation on JavaScript.
-  let assert <<
-    _magic:size(32)-little,
-    flg,
-    _bd,
-    csize_low:size(32)-little,
-    csize_high:size(32)-little,
-    _hc,
-    _rest:bytes,
-  >> = frame
-  let csize = csize_high * 4_294_967_296 + csize_low
-
-  // FLG must have version v1 and content_size flag set.
-  case int.bitwise_and(flg, 0x08) {
-    0 -> should.fail()
-    _ -> Nil
-  }
-  csize
-  |> should.equal(5)
-
-  // Round trip must agree with the original payload.
-  let assert Ok(restored) = lz4.decode(bytes: frame)
-  restored
-  |> should.equal(payload)
-}
-
-pub fn encoder_with_content_size_zero_payload_test() -> Nil {
-  let assert Ok(frame) = lz4.encode_with_content_size(bytes: <<>>)
-  let assert Ok(restored) = lz4.decode(bytes: frame)
-  restored
-  |> should.equal(<<>>)
+  let assert Ok(<<magic:bytes-size(4), _flg, _bd, _hc, blocks:bytes>>) =
+    lz4.encode(bytes: payload)
+  let descriptor = <<0x68, 0x70, 5:size(32)-little, 0:size(32)>>
+  let hc =
+    int.bitwise_and(
+      int.bitwise_shift_right(xxh32.digest(bytes: descriptor, seed: 0), 8),
+      0xFF,
+    )
+  let frame = bit_array.concat([magic, descriptor, <<hc>>, blocks])
+  packkit.decompress(frame, with: codec.Lz4)
+  |> should.equal(Ok(payload))
 }
 
 fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
@@ -173,7 +149,7 @@ pub fn legacy_frame_decode_hello_test() -> Nil {
     // 5 literals "hello"
     0x68, 0x65, 0x6C, 0x6C, 0x6F,
   >>
-  let assert Ok(plain) = lz4.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Lz4)
   plain
   |> should.equal(<<"hello":utf8>>)
 }
@@ -190,7 +166,7 @@ pub fn legacy_frame_decode_two_blocks_test() -> Nil {
     // block 2: size=4 (token + 3 literals "xyz")
     0x04, 0x00, 0x00, 0x00, 0x30, 0x78, 0x79, 0x7A,
   >>
-  let assert Ok(plain) = lz4.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Lz4)
   plain
   |> should.equal(<<"abcxyz":utf8>>)
 }

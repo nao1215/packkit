@@ -11,9 +11,11 @@
 import gleam/list
 import gleam/string
 import gleeunit/should
-import packkit/archive as archives
-import packkit/entry
-import packkit/error
+import packkit
+import packkit/archive
+import packkit/fixture
+import packkit/internal/entry
+import packkit/limit
 import packkit/seven_z
 
 const secret_password: String = "hunter2"
@@ -32,13 +34,14 @@ pub fn decode_with_password_round_trip_test() -> Nil {
     seven_z.decode_with_password(
       bytes: archive_bytes,
       password: secret_password,
+      limits: limit.default(),
     )
 
-  let members = archives.entries(archive)
+  let members = archive.entries
   list.length(members) |> should.equal(1)
 
   let assert [member] = members
-  member |> entry.path |> entry.to_string |> should.equal(expected_member_name)
+  member.path |> should.equal(expected_member_name)
   member |> entry.body |> should.equal(<<expected_member_contents:utf8>>)
 }
 
@@ -48,8 +51,8 @@ pub fn decode_without_password_rejects_aes_folder_test() -> Nil {
   // password is required.
   let archive_bytes = fixture_bytes()
 
-  case seven_z.decode(bytes: archive_bytes) {
-    Error(error.ArchiveInvalid(message: message)) ->
+  case packkit.read(archive_bytes, format: archive.SevenZ) {
+    Error(archive.InvalidData(message: message)) ->
       // The exact wording is not contractual, but the message MUST
       // mention `decode_with_password` so callers know how to fix it.
       message
@@ -72,13 +75,14 @@ pub fn decode_with_password_header_encryption_round_trip_test() -> Nil {
     seven_z.decode_with_password(
       bytes: archive_bytes,
       password: secret_password,
+      limits: limit.default(),
     )
 
-  let members = archives.entries(archive)
+  let members = archive.entries
   list.length(members) |> should.equal(1)
 
   let assert [member] = members
-  member |> entry.path |> entry.to_string |> should.equal(expected_member_name)
+  member.path |> should.equal(expected_member_name)
   member
   |> entry.body
   |> should.equal(<<"secret payload behind encrypted header\n":utf8>>)
@@ -90,7 +94,7 @@ pub fn decode_without_password_rejects_header_encryption_test() -> Nil {
   // encrypted next-header bytes.
   let archive_bytes = fixture_bytes_header_encrypted()
 
-  case seven_z.decode(bytes: archive_bytes) {
+  case packkit.read(archive_bytes, format: archive.SevenZ) {
     Ok(_) -> should.fail()
     _ -> Nil
   }
@@ -104,24 +108,32 @@ pub fn decode_without_password_rejects_header_encryption_test() -> Nil {
 
 pub fn encode_with_password_round_trip_test() -> Nil {
   let archive =
-    archives.new(format: seven_z.format())
-    |> archives.add(
-      entry: entry.file(path: "hello.txt", body: <<
+    fixture.new(archive.SevenZ)
+    |> fixture.add(
+      entry: fixture.file(path: "hello.txt", body: <<
         "hello, encrypted seven_z\n":utf8,
       >>),
     )
 
   let assert Ok(encoded) =
-    seven_z.encode_with_password(archive: archive, password: secret_password)
+    seven_z.encode(
+      archive,
+      method: seven_z.Lzma,
+      encryption: seven_z.EncryptContents(secret_password),
+    )
 
   let assert Ok(decoded) =
-    seven_z.decode_with_password(bytes: encoded, password: secret_password)
+    seven_z.decode_with_password(
+      bytes: encoded,
+      password: secret_password,
+      limits: limit.default(),
+    )
 
-  let members = archives.entries(decoded)
+  let members = decoded.entries
   list.length(members) |> should.equal(1)
 
   let assert [member] = members
-  member |> entry.path |> entry.to_string |> should.equal("hello.txt")
+  member.path |> should.equal("hello.txt")
   member |> entry.body |> should.equal(<<"hello, encrypted seven_z\n":utf8>>)
 }
 
@@ -130,9 +142,9 @@ pub fn encode_with_password_and_method_copy_round_trip_test() -> Nil {
   // [AES, Copy] should still round-trip, exercising the case where
   // AES output IS the final bodies (no compression in between).
   let archive =
-    archives.new(format: seven_z.format())
-    |> archives.add(
-      entry: entry.file(path: "raw.bin", body: <<
+    fixture.new(archive.SevenZ)
+    |> fixture.add(
+      entry: fixture.file(path: "raw.bin", body: <<
         1,
         2,
         3,
@@ -155,16 +167,20 @@ pub fn encode_with_password_and_method_copy_round_trip_test() -> Nil {
     )
 
   let assert Ok(encoded) =
-    seven_z.encode_with_password_and_method(
-      archive: archive,
-      password: secret_password,
-      method: seven_z.copy(),
+    seven_z.encode(
+      archive,
+      method: seven_z.Copy,
+      encryption: seven_z.EncryptContents(secret_password),
     )
 
   let assert Ok(decoded) =
-    seven_z.decode_with_password(bytes: encoded, password: secret_password)
+    seven_z.decode_with_password(
+      bytes: encoded,
+      password: secret_password,
+      limits: limit.default(),
+    )
 
-  let assert [member] = archives.entries(decoded)
+  let assert [member] = decoded.entries
   member
   |> entry.body
   |> should.equal(<<
@@ -174,20 +190,28 @@ pub fn encode_with_password_and_method_copy_round_trip_test() -> Nil {
 
 pub fn encode_with_password_is_deterministic_test() -> Nil {
   // With empty salt + zero IV + a fixed numCyclesPower, two encodes
-  // of the same archive must produce byte-identical archives.  This
+  // of the same archive must produce byte-identical archive.  This
   // pins the "no hidden randomness" property the docstring promises.
   let archive =
-    archives.new(format: seven_z.format())
-    |> archives.add(
-      entry: entry.file(path: "a.txt", body: <<
+    fixture.new(archive.SevenZ)
+    |> fixture.add(
+      entry: fixture.file(path: "a.txt", body: <<
         "deterministic encoder body\n":utf8,
       >>),
     )
 
   let assert Ok(first) =
-    seven_z.encode_with_password(archive: archive, password: secret_password)
+    seven_z.encode(
+      archive,
+      method: seven_z.Lzma,
+      encryption: seven_z.EncryptContents(secret_password),
+    )
   let assert Ok(second) =
-    seven_z.encode_with_password(archive: archive, password: secret_password)
+    seven_z.encode(
+      archive,
+      method: seven_z.Lzma,
+      encryption: seven_z.EncryptContents(secret_password),
+    )
 
   first |> should.equal(second)
 }
@@ -198,24 +222,29 @@ pub fn encode_with_header_encryption_round_trip_test() -> Nil {
   // forwards the password into `decode_encoded_header`) must recover
   // the original entries.
   let archive =
-    archives.new(format: seven_z.format())
-    |> archives.add(
-      entry: entry.file(path: "ledger.txt", body: <<
+    fixture.new(archive.SevenZ)
+    |> fixture.add(
+      entry: fixture.file(path: "ledger.txt", body: <<
         "header-encrypted entry body\n":utf8,
       >>),
     )
 
   let assert Ok(encoded) =
-    seven_z.encode_with_password_and_header_encryption(
-      archive: archive,
-      password: secret_password,
+    seven_z.encode(
+      archive,
+      method: seven_z.Lzma,
+      encryption: seven_z.EncryptContentsAndHeaders(secret_password),
     )
 
   let assert Ok(decoded) =
-    seven_z.decode_with_password(bytes: encoded, password: secret_password)
+    seven_z.decode_with_password(
+      bytes: encoded,
+      password: secret_password,
+      limits: limit.default(),
+    )
 
-  let assert [member] = archives.entries(decoded)
-  member |> entry.path |> entry.to_string |> should.equal("ledger.txt")
+  let assert [member] = decoded.entries
+  member.path |> should.equal("ledger.txt")
   member |> entry.body |> should.equal(<<"header-encrypted entry body\n":utf8>>)
 }
 
@@ -225,13 +254,14 @@ pub fn encode_with_header_encryption_emits_nid_17_test() -> Nil {
   // for `-mhe=on`.  We can read the next-header start byte directly
   // from the archive without involving a decoder.
   let archive =
-    archives.new(format: seven_z.format())
-    |> archives.add(entry: entry.file(path: "x.txt", body: <<"hello":utf8>>))
+    fixture.new(archive.SevenZ)
+    |> fixture.add(entry: fixture.file(path: "x.txt", body: <<"hello":utf8>>))
 
   let assert Ok(encoded) =
-    seven_z.encode_with_password_and_header_encryption(
-      archive: archive,
-      password: secret_password,
+    seven_z.encode(
+      archive,
+      method: seven_z.Lzma,
+      encryption: seven_z.EncryptContentsAndHeaders(secret_password),
     )
 
   // Signature header bytes 12..19 hold the little-endian 64-bit
@@ -252,15 +282,25 @@ pub fn encode_with_header_encryption_emits_nid_17_test() -> Nil {
 
 pub fn encode_with_password_decode_wrong_password_test() -> Nil {
   let archive =
-    archives.new(format: seven_z.format())
-    |> archives.add(
-      entry: entry.file(path: "x.txt", body: <<"some content":utf8>>),
+    fixture.new(archive.SevenZ)
+    |> fixture.add(
+      entry: fixture.file(path: "x.txt", body: <<"some content":utf8>>),
     )
 
   let assert Ok(encoded) =
-    seven_z.encode_with_password(archive: archive, password: secret_password)
+    seven_z.encode(
+      archive,
+      method: seven_z.Lzma,
+      encryption: seven_z.EncryptContents(secret_password),
+    )
 
-  case seven_z.decode_with_password(bytes: encoded, password: "wrong") {
+  case
+    seven_z.decode_with_password(
+      bytes: encoded,
+      password: "wrong",
+      limits: limit.default(),
+    )
+  {
     Ok(_) -> should.fail()
     _ -> Nil
   }
@@ -276,6 +316,7 @@ pub fn decode_with_wrong_password_surfaces_typed_error_test() -> Nil {
     seven_z.decode_with_password(
       bytes: archive_bytes,
       password: "wrong-password",
+      limits: limit.default(),
     )
 
   // We only care that the outcome is `Error(_)`; the specific typed

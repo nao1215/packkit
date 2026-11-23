@@ -17,14 +17,10 @@
 ////   python3 -c 'import sys, zlib; sys.stdout.buffer.write(zlib.compress(b"hello world"))'  -> zlib
 
 import gleeunit/should
-import packkit/brotli
-import packkit/bzip2
+import packkit
+import packkit/codec
 import packkit/gzip
-import packkit/lz4
-import packkit/lzw
-import packkit/xz
-import packkit/zlib
-import packkit/zstd
+import packkit/limit
 
 const hello: BitArray = <<"hello world":utf8>>
 
@@ -35,7 +31,7 @@ pub fn snapshot_system_gzip_test() -> Nil {
     0xC9, 0xC9, 0x57, 0x28, 0xCF, 0x2F, 0xCA, 0x49, 0x01, 0x00, 0x85, 0x11, 0x4A,
     0x0D, 0x0B, 0x00, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = gzip.decode(bytes: fixture)
+  let assert Ok(decoded) = gzip.decode(fixture, limits: limit.default())
   decoded.payload
   |> should.equal(hello)
 }
@@ -48,7 +44,7 @@ pub fn snapshot_system_bzip2_test() -> Nil {
     0x00, 0x22, 0x03, 0x34, 0x84, 0x30, 0x21, 0xB6, 0x81, 0x54, 0x27, 0x8B, 0xB9,
     0x22, 0x9C, 0x28, 0x48, 0x22, 0x7B, 0x89, 0xBC, 0x00,
   >>
-  let assert Ok(plain) = bzip2.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Bzip2)
   plain
   |> should.equal(hello)
 }
@@ -63,7 +59,7 @@ pub fn snapshot_system_xz_test() -> Nil {
     0xC2, 0x1B, 0xFD, 0x09, 0x1F, 0xB6, 0xF3, 0x7D, 0x01, 0x00, 0x00, 0x00, 0x00,
     0x04, 0x59, 0x5A,
   >>
-  let assert Ok(plain) = xz.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Xz)
   plain
   |> should.equal(hello)
 }
@@ -74,7 +70,7 @@ pub fn snapshot_system_zstd_test() -> Nil {
     0x28, 0xB5, 0x2F, 0xFD, 0x04, 0x58, 0x59, 0x00, 0x00, 0x68, 0x65, 0x6C, 0x6C,
     0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0x68, 0x69, 0x1E, 0xB2,
   >>
-  let assert Ok(plain) = zstd.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zstd)
   plain
   |> should.equal(hello)
 }
@@ -85,7 +81,7 @@ pub fn snapshot_system_brotli_test() -> Nil {
     0x0F, 0x05, 0x80, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C,
     0x64, 0x03,
   >>
-  let assert Ok(plain) = brotli.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Brotli)
   plain
   |> should.equal(hello)
 }
@@ -97,7 +93,7 @@ pub fn snapshot_system_lz4_test() -> Nil {
     0x6C, 0x6C, 0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64, 0x00, 0x00, 0x00, 0x00,
     0x22, 0x66, 0xBB, 0xCE,
   >>
-  let assert Ok(plain) = lz4.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Lz4)
   plain
   |> should.equal(hello)
 }
@@ -108,7 +104,7 @@ pub fn snapshot_system_compress_lzw_test() -> Nil {
     0x1F, 0x9D, 0x90, 0x68, 0xCA, 0xB0, 0x61, 0xF3, 0x06, 0xC4, 0x9D, 0x37, 0x72,
     0xD8, 0x90, 0x01,
   >>
-  let assert Ok(plain) = lzw.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Lzw)
   plain
   |> should.equal(hello)
 }
@@ -119,7 +115,7 @@ pub fn snapshot_python_zlib_test() -> Nil {
     0x78, 0x9C, 0xCB, 0x48, 0xCD, 0xC9, 0xC9, 0x57, 0x28, 0xCF, 0x2F, 0xCA, 0x49,
     0x01, 0x00, 0x1A, 0x0B, 0x04, 0x5D,
   >>
-  let assert Ok(plain) = zlib.decode(bytes: fixture)
+  let assert Ok(plain) = packkit.decompress(fixture, with: codec.Zlib)
   plain
   |> should.equal(hello)
 }

@@ -19,9 +19,9 @@ import gleam/list
 import gleam/option
 import gleam/result
 import gleam/string
-import packkit/archive as archives
-import packkit/entry
-import packkit/error
+import packkit/archive
+import packkit/internal/bytes
+import packkit/internal/entry
 import packkit/limit
 
 const magic: String = "!<arch>\n"
@@ -34,23 +34,12 @@ const end_marker_byte: Int = 0x60
 
 const newline: Int = 0x0A
 
-/// AR archive format marker.
-pub fn format() -> archives.ArchiveFormat {
-  archives.ar()
-}
-
-/// Create an empty AR archive value.
-pub fn new() -> archives.Archive {
-  archives.new(format: format())
-}
-
 /// Encode the logical archive to an `ar` byte stream.
 pub fn encode(
-  archive archive_value: archives.Archive,
-) -> Result(BitArray, error.ArchiveError) {
-  use _ <- result.try(reject_comment(archive_value))
-  archive_value
-  |> archives.entries
+  archive archive_value: archive.Archive,
+) -> Result(BitArray, archive.ArchiveError) {
+  use _ <- result.try(entry.reject_comment(archive_value))
+  archive_value.entries
   |> list.try_map(encode_entry)
   |> result.map(fn(records) {
     [bit_array.from_string(magic), bit_array.concat(records)]
@@ -58,30 +47,14 @@ pub fn encode(
   })
 }
 
-fn reject_comment(
-  archive_value: archives.Archive,
-) -> Result(Nil, error.ArchiveError) {
-  case archives.comment(archive_value) {
-    option.None -> Ok(Nil)
-    option.Some(_) -> Error(error.ArchiveCommentUnsupported(format: "ar"))
-  }
-}
-
-/// Decode an `ar` byte stream using default limits.
-pub fn decode(
-  bytes bytes: BitArray,
-) -> Result(archives.Archive, error.ArchiveError) {
-  decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode an `ar` byte stream using explicit limits.
 pub fn decode_with_limits(
   bytes bytes: BitArray,
   limits limits: limit.Limits,
-) -> Result(archives.Archive, error.ArchiveError) {
+) -> Result(archive.Archive, archive.ArchiveError) {
   use <- bool.guard(
-    when: bit_array.byte_size(bytes) > limit.max_input_bytes(limits),
-    return: Error(error.ArchiveLimitExceeded(
+    when: bit_array.byte_size(bytes) > limits.max_input_bytes,
+    return: Error(archive.LimitExceeded(
       limit: "max_input_bytes",
       actual: bit_array.byte_size(bytes),
     )),
@@ -91,29 +64,32 @@ pub fn decode_with_limits(
   use header_string <- result.try(bytes_to_string(header_bits))
   use <- bool.guard(
     when: header_string != magic,
-    return: Error(error.ArchiveInvalid(message: "missing !<arch> magic")),
+    return: Error(archive.InvalidData(message: "missing !<arch> magic")),
   )
 
   let body_size = bit_array.byte_size(bytes) - magic_size
   let assert Ok(rest) = bit_array.slice(bytes, magic_size, body_size)
   decode_loop(rest, [], 0, option.None, limits)
   |> result.map(list.reverse)
-  |> result.map(archives.from_entries(format: format(), entries: _))
+  |> result.map(archive.Archive(
+    format: archive.Ar,
+    entries: _,
+    comment: option.None,
+  ))
 }
 
 fn decode_loop(
   bytes: BitArray,
-  acc: List(entry.Entry),
+  acc: List(archive.Entry),
   count: Int,
   string_table: option.Option(BitArray),
   limits: limit.Limits,
-) -> Result(List(entry.Entry), error.ArchiveError) {
+) -> Result(List(archive.Entry), archive.ArchiveError) {
   case bit_array.byte_size(bytes) {
     0 -> Ok(acc)
     _ ->
       case bit_array.byte_size(bytes) < header_size {
-        True ->
-          Error(error.ArchiveInvalid(message: "ar entry header truncated"))
+        True -> Error(archive.InvalidData(message: "ar entry header truncated"))
         False -> {
           let assert Ok(header_bits) = bit_array.slice(bytes, 0, header_size)
           use record <- result.try(parse_header(header_bits))
@@ -129,7 +105,7 @@ fn decode_loop(
 
           use <- bool.guard(
             when: bit_array.byte_size(bytes) < payload_offset + payload_size,
-            return: Error(error.ArchiveInvalid(message: "ar entry truncated")),
+            return: Error(archive.InvalidData(message: "ar entry truncated")),
           )
 
           let advance = min(padded_size, bit_array.byte_size(bytes))
@@ -165,9 +141,8 @@ fn decode_loop(
               ))
 
               use <- bool.guard(
-                when: string.byte_size(name)
-                  > limit.max_entry_name_bytes(limits),
-                return: Error(error.ArchiveLimitExceeded(
+                when: string.byte_size(name) > limits.max_entry_name_bytes,
+                return: Error(archive.LimitExceeded(
                   limit: "max_entry_name_bytes",
                   actual: string.byte_size(name),
                 )),
@@ -177,23 +152,26 @@ fn decode_loop(
                 bit_array.slice(bytes, payload_offset, payload_size)
               use base_entry <- result.try(
                 entry.file_checked(path: name, body: body)
-                |> result.map_error(entry_error_to_archive_error(_, name)),
+                |> result.map_error(entry.to_archive_error(_, name)),
               )
 
-              let depth = entry.depth(entry.path(base_entry))
+              let depth = entry.depth(base_entry.path)
               use <- bool.guard(
-                when: depth > limit.max_entry_depth(limits),
-                return: Error(error.ArchiveLimitExceeded(
+                when: depth > limits.max_entry_depth,
+                return: Error(archive.LimitExceeded(
                   limit: "max_entry_depth",
                   actual: depth,
                 )),
               )
 
               let entry_value =
-                base_entry
-                |> entry.with_mode(mode: record.mode)
-                |> entry.with_owner(user_id: record.uid, group_id: record.gid)
-                |> entry.with_modified_at(unix_seconds: record.mtime)
+                archive.Entry(
+                  ..base_entry,
+                  mode: record.mode,
+                  user_id: record.uid,
+                  group_id: record.gid,
+                  modified_at: record.mtime,
+                )
 
               decode_loop(
                 remaining,
@@ -214,7 +192,7 @@ fn resolve_entry_name(
   bytes: BitArray,
   after_header_offset: Int,
   string_table: option.Option(BitArray),
-) -> Result(String, error.ArchiveError) {
+) -> Result(String, archive.ArchiveError) {
   case record.name_extension, record.gnu_offset {
     // BSD long name lives in the bytes immediately after the header.
     n, _ if n > 0 -> {
@@ -223,13 +201,13 @@ fn resolve_entry_name(
         after_header_offset,
         record.name_extension,
       ))
-      bytes_to_string(strip_trailing_nul(ext_bits))
+      bytes_to_string(bytes.strip_trailing_nul(ext_bits))
     }
     // GNU long name reference (`/<offset>`).
     _, option.Some(offset) ->
       case string_table {
         option.None ->
-          Error(error.ArchiveInvalid(
+          Error(archive.InvalidData(
             message: "ar entry references missing GNU string table",
           ))
         option.Some(table) -> gnu_string_at(table, offset)
@@ -241,11 +219,11 @@ fn resolve_entry_name(
 fn gnu_string_at(
   table: BitArray,
   offset: Int,
-) -> Result(String, error.ArchiveError) {
+) -> Result(String, archive.ArchiveError) {
   let size = bit_array.byte_size(table)
   case offset < 0 || offset >= size {
     True ->
-      Error(error.ArchiveInvalid(
+      Error(archive.InvalidData(
         message: "ar GNU string table offset out of range",
       ))
     False -> {
@@ -274,10 +252,9 @@ fn find_gnu_terminator(bytes: BitArray, pos: Int, len: Int) -> Int {
 fn check_member_limit(
   count: Int,
   limits: limit.Limits,
-) -> Result(Nil, error.ArchiveError) {
-  case count > limit.max_members(limits) {
-    True ->
-      Error(error.ArchiveLimitExceeded(limit: "max_members", actual: count))
+) -> Result(Nil, archive.ArchiveError) {
+  case count > limits.max_members {
+    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
     False -> Ok(Nil)
   }
 }
@@ -302,7 +279,7 @@ type ParsedRecord {
   )
 }
 
-fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
+fn parse_header(block: BitArray) -> Result(ParsedRecord, archive.ArchiveError) {
   use raw_name_bits <- result.try(slice_or_error(block, 0, 16))
   use raw_name <- result.try(bytes_to_string(raw_name_bits))
   let trimmed_name = string.trim_end(raw_name)
@@ -315,7 +292,7 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
   use ending_bits <- result.try(slice_or_error(block, 58, 2))
   use <- bool.guard(
     when: ending_bits != <<end_marker_byte, newline>>,
-    return: Error(error.ArchiveInvalid(message: "ar header marker missing")),
+    return: Error(archive.InvalidData(message: "ar header marker missing")),
   )
 
   case trimmed_name {
@@ -361,7 +338,7 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
                 size: size,
               ))
             Error(_) ->
-              Error(error.ArchiveInvalid(
+              Error(archive.InvalidData(
                 message: "invalid BSD long name length in ar header",
               ))
           }
@@ -384,7 +361,7 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
                     size: size,
                   ))
                 Error(_) ->
-                  Error(error.ArchiveInvalid(
+                  Error(archive.InvalidData(
                     message: "invalid GNU long name offset in ar header",
                   ))
               }
@@ -406,19 +383,19 @@ fn parse_header(block: BitArray) -> Result(ParsedRecord, error.ArchiveError) {
   }
 }
 
-fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
-  let kind = entry.kind(value)
-  use <- bool.guard(
-    when: kind != entry.File,
-    return: Error(error.ArchiveEntryRejected(
-      path: entry.to_string(entry.path(value)),
-      reason: "ar only supports regular file entries",
-    )),
-  )
+fn encode_entry(
+  value: archive.Entry,
+) -> Result(BitArray, archive.ArchiveError) {
+  use body <- result.try(case value.kind {
+    archive.File(body) -> Ok(body)
+    archive.Directory | archive.Symlink(_) | archive.Hardlink(_) ->
+      Error(archive.EntryRejected(
+        path: value.path,
+        reason: "ar only supports regular file entries",
+      ))
+  })
 
-  let path = entry.to_string(entry.path(value))
-  let metadata = entry.metadata(value)
-  let body = entry.body(value)
+  let path = value.path
   let body_size = bit_array.byte_size(body)
 
   let name_bytes = bit_array.from_string(path)
@@ -436,25 +413,13 @@ fn encode_entry(value: entry.Entry) -> Result(BitArray, error.ArchiveError) {
   }
 
   use mtime_field <- result.try(checked_decimal_field(
-    entry.modified_at_unix(metadata),
+    value.modified_at,
     12,
     "mtime",
   ))
-  use uid_field <- result.try(checked_decimal_field(
-    entry.user_id(metadata),
-    6,
-    "uid",
-  ))
-  use gid_field <- result.try(checked_decimal_field(
-    entry.group_id(metadata),
-    6,
-    "gid",
-  ))
-  use mode_field <- result.try(checked_octal_field(
-    entry.mode(metadata),
-    8,
-    "mode",
-  ))
+  use uid_field <- result.try(checked_decimal_field(value.user_id, 6, "uid"))
+  use gid_field <- result.try(checked_decimal_field(value.group_id, 6, "gid"))
+  use mode_field <- result.try(checked_octal_field(value.mode, 8, "mode"))
   use size_field <- result.try(checked_decimal_field(total_size, 10, "size"))
 
   let header =
@@ -492,13 +457,13 @@ fn checked_decimal_field(
   value: Int,
   width: Int,
   field: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let raw = int.to_string(value)
   let raw_size = string.byte_size(raw)
   case value < 0 || raw_size > width {
     True -> {
       let max_value = pow_int(10, width) - 1
-      Error(error.ArchiveFieldOverflow(
+      Error(archive.FieldOverflow(
         field: "ar " <> field,
         value: value,
         max: max_value,
@@ -512,13 +477,13 @@ fn checked_octal_field(
   value: Int,
   width: Int,
   field: String,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let raw = int.to_base8(value)
   let raw_size = string.byte_size(raw)
   case value < 0 || raw_size > width {
     True -> {
       let max_value = pow_int(8, width) - 1
-      Error(error.ArchiveFieldOverflow(
+      Error(archive.FieldOverflow(
         field: "ar " <> field,
         value: value,
         max: max_value,
@@ -571,7 +536,7 @@ fn read_decimal_field(
   block: BitArray,
   offset: Int,
   width: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   use slice <- result.try(slice_or_error(block, offset, width))
   use raw <- result.try(bytes_to_string(slice))
   let trimmed = string.trim(raw)
@@ -581,7 +546,7 @@ fn read_decimal_field(
       case int.parse(trimmed) {
         Ok(value) -> Ok(value)
         Error(_) ->
-          Error(error.ArchiveInvalid(message: "invalid decimal ar field"))
+          Error(archive.InvalidData(message: "invalid decimal ar field"))
       }
   }
 }
@@ -590,7 +555,7 @@ fn read_octal_field(
   block: BitArray,
   offset: Int,
   width: Int,
-) -> Result(Int, error.ArchiveError) {
+) -> Result(Int, archive.ArchiveError) {
   use slice <- result.try(slice_or_error(block, offset, width))
   use raw <- result.try(bytes_to_string(slice))
   let trimmed = string.trim(raw)
@@ -600,7 +565,7 @@ fn read_octal_field(
       case int.base_parse(trimmed, 8) {
         Ok(value) -> Ok(value)
         Error(_) ->
-          Error(error.ArchiveInvalid(message: "invalid octal ar field"))
+          Error(archive.InvalidData(message: "invalid octal ar field"))
       }
   }
 }
@@ -609,41 +574,19 @@ fn slice_or_error(
   block: BitArray,
   offset: Int,
   width: Int,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   case bit_array.slice(block, offset, width) {
     Ok(value) -> Ok(value)
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "ar header field out of bounds"))
+      Error(archive.InvalidData(message: "ar header field out of bounds"))
   }
 }
 
-fn bytes_to_string(bytes: BitArray) -> Result(String, error.ArchiveError) {
+fn bytes_to_string(bytes: BitArray) -> Result(String, archive.ArchiveError) {
   case bit_array.to_string(bytes) {
     Ok(value) -> Ok(value)
     Error(_) ->
-      Error(error.ArchiveInvalid(message: "non-UTF-8 ar header string"))
-  }
-}
-
-fn entry_error_to_archive_error(
-  err: entry.EntryError,
-  path: String,
-) -> error.ArchiveError {
-  case err {
-    entry.EmptyPath ->
-      error.ArchiveEntryRejected(path: path, reason: "empty path")
-    entry.AbsolutePath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "absolute path")
-    entry.PathTraversal(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "path traversal")
-    entry.WindowsPath(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "windows path")
-    entry.EmptySegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "empty segment")
-    entry.DotSegment(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "dot segment")
-    entry.ContainsNul(_) ->
-      error.ArchiveEntryRejected(path: path, reason: "nul byte")
+      Error(archive.InvalidData(message: "non-UTF-8 ar header string"))
   }
 }
 
@@ -651,25 +594,6 @@ fn strip_trailing_slash(value: String) -> String {
   case string.ends_with(value, "/") {
     True -> string.drop_end(value, 1)
     False -> value
-  }
-}
-
-fn strip_trailing_nul(bytes: BitArray) -> BitArray {
-  let size = bit_array.byte_size(bytes)
-  strip_trailing_nul_loop(bytes, size)
-}
-
-fn strip_trailing_nul_loop(bytes: BitArray, size: Int) -> BitArray {
-  case size {
-    0 -> <<>>
-    _ ->
-      case bit_array.slice(bytes, size - 1, 1) {
-        Ok(<<0>>) -> strip_trailing_nul_loop(bytes, size - 1)
-        _ -> {
-          let assert Ok(slice) = bit_array.slice(bytes, 0, size)
-          slice
-        }
-      }
   }
 }
 

@@ -2,16 +2,17 @@ import gleam/bit_array
 import gleam/list
 import gleam/result
 import gleeunit/should
+import packkit
 import packkit/archive
-import packkit/checksum
-import packkit/entry
-import packkit/error
+import packkit/fixture
+import packkit/internal/checksum
+import packkit/internal/entry
 import packkit/limit
 import packkit/seven_z
 
 pub fn format_marker_test() -> Nil {
-  seven_z.format()
-  |> archive.name
+  archive.SevenZ
+  |> archive.format_to_string
   |> should.equal("7z")
 }
 
@@ -19,17 +20,29 @@ pub fn encode_rejects_empty_archive_test() -> Nil {
   // 7z requires MainStreamsInfo to be present once the Header NID
   // exists; emitting it for a 0-entry archive would produce a header
   // the standard decoder rejects, so the encoder refuses up front.
-  case seven_z.encode(archive: seven_z.new()) {
-    Error(error.ArchiveEntryRejected(path: "<archive>", reason: _)) -> Nil
+  case
+    seven_z.encode(
+      fixture.new(archive.SevenZ),
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
+  {
+    Error(archive.EntryRejected(path: "<archive>", reason: _)) -> Nil
     _ -> should.fail()
   }
 }
 
 pub fn encode_rejects_non_file_entries_test() -> Nil {
   let assert Ok(dir_entry) = entry.directory_checked(path: "docs")
-  let archive_value = archive.add(seven_z.new(), entry: dir_entry)
-  case seven_z.encode(archive: archive_value) {
-    Error(error.ArchiveEntryRejected(path: "docs", reason: _)) -> Nil
+  let archive_value = fixture.add(fixture.new(archive.SevenZ), entry: dir_entry)
+  case
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
+  {
+    Error(archive.EntryRejected(path: "docs", reason: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -38,13 +51,19 @@ pub fn encode_single_file_roundtrips_test() -> Nil {
   let payload = <<"hello from packkit 7z encoder":utf8>>
   let assert Ok(file_entry) =
     entry.file_checked(path: "hello.txt", body: payload)
-  let archive_value = archive.add(seven_z.new(), entry: file_entry)
-  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
-  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
-  let entries = archive.entries(decoded)
+  let archive_value =
+    fixture.add(fixture.new(archive.SevenZ), entry: file_entry)
+  let assert Ok(bytes) =
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.SevenZ)
+  let entries = decoded.entries
   case entries {
     [single] -> {
-      entry.path(single) |> entry.to_string |> should.equal("hello.txt")
+      single.path |> should.equal("hello.txt")
       entry.body(single) |> should.equal(payload)
     }
     _ -> should.fail()
@@ -59,21 +78,26 @@ pub fn encode_multi_file_roundtrips_test() -> Nil {
   let assert Ok(b) = entry.file_checked(path: "b.txt", body: body_b)
   let assert Ok(c) = entry.file_checked(path: "c.txt", body: body_c)
   let archive_value =
-    seven_z.new()
-    |> archive.add(entry: a)
-    |> archive.add(entry: b)
-    |> archive.add(entry: c)
-  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
-  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
-  let entries = archive.entries(decoded)
+    fixture.new(archive.SevenZ)
+    |> fixture.add(entry: a)
+    |> fixture.add(entry: b)
+    |> fixture.add(entry: c)
+  let assert Ok(bytes) =
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.SevenZ)
+  let entries = decoded.entries
   list.length(entries) |> should.equal(3)
   case entries {
     [restored_a, restored_b, restored_c] -> {
-      entry.path(restored_a) |> entry.to_string |> should.equal("a.txt")
+      restored_a.path |> should.equal("a.txt")
       entry.body(restored_a) |> should.equal(body_a)
-      entry.path(restored_b) |> entry.to_string |> should.equal("b.txt")
+      restored_b.path |> should.equal("b.txt")
       entry.body(restored_b) |> should.equal(body_b)
-      entry.path(restored_c) |> entry.to_string |> should.equal("c.txt")
+      restored_c.path |> should.equal("c.txt")
       entry.body(restored_c) |> should.equal(body_c)
     }
     _ -> should.fail()
@@ -98,14 +122,13 @@ pub fn decode_single_uncompressed_file_test() -> Nil {
     0x92, 0x4A, 0xEA, 0xDC, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xB4, 0x81,
     0x00, 0x00,
   >>
-  let assert Ok(arch) = seven_z.decode(bytes: fixture)
-  let entries = archive.entries(arch)
+  let assert Ok(arch) = packkit.read(fixture, format: archive.SevenZ)
+  let entries = arch.entries
   list.length(entries)
   |> should.equal(1)
   case entries {
     [single] -> {
-      entry.path(single)
-      |> entry.to_string
+      single.path
       |> should.equal("hello.txt")
       entry.body(single)
       |> should.equal(<<"hello world from 7z":utf8>>)
@@ -135,8 +158,8 @@ pub fn decode_lzma_compressed_file_test() -> Nil {
     0x4D, 0xEA, 0xDC, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xB4, 0x81, 0x00,
     0x00,
   >>
-  let assert Ok(arch) = seven_z.decode(bytes: fixture)
-  let entries = archive.entries(arch)
+  let assert Ok(arch) = packkit.read(fixture, format: archive.SevenZ)
+  let entries = arch.entries
   list.length(entries)
   |> should.equal(1)
   let pangram_unit = "The quick brown fox jumps over the lazy dog. "
@@ -154,8 +177,7 @@ pub fn decode_lzma_compressed_file_test() -> Nil {
   >>
   case entries {
     [single] -> {
-      entry.path(single)
-      |> entry.to_string
+      single.path
       |> should.equal("big.txt")
       entry.body(single)
       |> should.equal(expected)
@@ -185,15 +207,15 @@ pub fn decode_encoded_header_archive_test() -> Nil {
     0x05, 0x5D, 0x00, 0x10, 0x00, 0x00, 0x0C, 0x80, 0x9A, 0x0A, 0x01, 0xC3, 0x8B,
     0x3E, 0x4C, 0x00, 0x00,
   >>
-  case seven_z.decode(bytes: fixture) {
+  case packkit.read(fixture, format: archive.SevenZ) {
     Ok(arch) -> {
-      list.length(archive.entries(arch))
+      list.length(arch.entries)
       |> should.equal(3)
     }
     Error(err) ->
       should.equal(
         Error(err),
-        Error(error.ArchiveInvalid(message: "<expected Ok or known error>")),
+        Error(archive.InvalidData(message: "<expected Ok or known error>")),
       )
   }
 }
@@ -222,10 +244,11 @@ pub fn decode_enforces_max_output_bytes_test() -> Nil {
     0x4D, 0xEA, 0xDC, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xB4, 0x81, 0x00,
     0x00,
   >>
-  let tight = limit.default() |> limit.with_max_output_bytes(bytes: 64)
-  case seven_z.decode_with_limits(bytes: fixture, limits: tight) {
-    Error(error.ArchiveLimitExceeded(limit: "max_output_bytes", actual: _)) ->
-      Nil
+  let tight = limit.Limits(..limit.default(), max_output_bytes: 64)
+  case
+    packkit.read_with_limits(fixture, format: archive.SevenZ, limits: tight)
+  {
+    Error(archive.LimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -251,22 +274,26 @@ pub fn decode_enforces_max_members_test() -> Nil {
     0x05, 0x5D, 0x00, 0x10, 0x00, 0x00, 0x0C, 0x80, 0x9A, 0x0A, 0x01, 0xC3, 0x8B,
     0x3E, 0x4C, 0x00, 0x00,
   >>
-  let tight = limit.default() |> limit.with_max_members(count: 2)
-  case seven_z.decode_with_limits(bytes: fixture, limits: tight) {
-    Error(error.ArchiveLimitExceeded(limit: "max_members", actual: 3)) -> Nil
+  let tight = limit.Limits(..limit.default(), max_members: 2)
+  case
+    packkit.read_with_limits(fixture, format: archive.SevenZ, limits: tight)
+  {
+    Error(archive.LimitExceeded(limit: "max_members", actual: 3)) -> Nil
     _ -> should.fail()
   }
 }
 
 pub fn decode_rejects_missing_magic_test() -> Nil {
-  case seven_z.decode(bytes: <<0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>) {
-    Error(error.ArchiveInvalid(message: m)) ->
+  case
+    packkit.read(<<0x00, 0x00, 0x00, 0x00, 0x00, 0x00>>, format: archive.SevenZ)
+  {
+    Error(archive.InvalidData(message: m)) ->
       m
       |> should.equal("invalid 7z signature header")
     other -> {
       other
       |> should.equal(
-        Error(error.ArchiveInvalid(message: "invalid 7z signature header")),
+        Error(archive.InvalidData(message: "invalid 7z signature header")),
       )
     }
   }
@@ -298,13 +325,10 @@ pub fn decode_system_archive_with_empty_file_test() -> Nil {
     0x05, 0x5D, 0x00, 0x10, 0x00, 0x00, 0x0C, 0x7E, 0x0A, 0x01, 0xF3, 0x3C, 0x64,
     0x3F, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
-  let entries = archive.entries(decoded)
-  let assert Ok(empty) =
-    list.find(entries, fn(e) {
-      entry.path(e) |> entry.to_string == "empty2.txt"
-    })
-  entry.kind(empty) |> should.equal(entry.File)
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.SevenZ)
+  let entries = decoded.entries
+  let assert Ok(empty) = list.find(entries, fn(e) { e.path == "empty2.txt" })
+  fixture.kind(empty) |> should.equal(fixture.File)
   entry.body(empty) |> should.equal(<<>>)
 }
 
@@ -324,11 +348,11 @@ const expected_greeting: BitArray = <<"hello, 7z copy coder!\n":utf8>>
 
 fn decode_first_entry_body(
   fixture: BitArray,
-) -> Result(BitArray, error.ArchiveError) {
-  use archive_value <- result.try(seven_z.decode(bytes: fixture))
-  case archive.entries(archive_value) {
+) -> Result(BitArray, archive.ArchiveError) {
+  use archive_value <- result.try(packkit.read(fixture, format: archive.SevenZ))
+  case archive_value.entries {
     [single, ..] -> Ok(entry.body(single))
-    [] -> Error(error.ArchiveInvalid(message: "no entries"))
+    [] -> Error(archive.InvalidData(message: "no entries"))
   }
 }
 
@@ -416,10 +440,11 @@ pub fn decode_deflate_coder_enforces_max_output_bytes_test() -> Nil {
     0xA0, 0xEC, 0xDC, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xA4, 0x81, 0x00,
     0x00,
   >>
-  let tight = limit.default() |> limit.with_max_output_bytes(bytes: 16)
-  case seven_z.decode_with_limits(bytes: fixture, limits: tight) {
-    Error(error.ArchiveLimitExceeded(limit: "max_output_bytes", actual: _)) ->
-      Nil
+  let tight = limit.Limits(..limit.default(), max_output_bytes: 16)
+  case
+    packkit.read_with_limits(fixture, format: archive.SevenZ, limits: tight)
+  {
+    Error(archive.LimitExceeded(limit: "max_output_bytes", actual: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -448,8 +473,8 @@ pub fn decode_deflate_coder_rejects_corrupted_stream_test() -> Nil {
     0xA0, 0xEC, 0xDC, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xA4, 0x81, 0x00,
     0x00,
   >>
-  case seven_z.decode(bytes: fixture) {
-    Error(error.ArchiveInvalid(message: _)) -> Nil
+  case packkit.read(fixture, format: archive.SevenZ) {
+    Error(archive.InvalidData(message: _)) -> Nil
     _ -> should.fail()
   }
 }
@@ -465,16 +490,19 @@ pub fn decode_deflate_coder_rejects_corrupted_stream_test() -> Nil {
 
 pub fn roundtrip_preserves_seven_z_entry_mtime_test() -> Nil {
   let stamped =
-    entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
-    |> entry.with_modified_at(unix_seconds: 1_749_990_896)
-  let archive_value = archive.add(seven_z.new(), entry: stamped)
-  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
-  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
-  case archive.entries(decoded) {
+    fixture.file(path: "stamped.txt", body: <<"hi":utf8>>)
+    |> fixture.with_modified_at(unix_seconds: 1_749_990_896)
+  let archive_value = fixture.add(fixture.new(archive.SevenZ), entry: stamped)
+  let assert Ok(bytes) =
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.SevenZ)
+  case decoded.entries {
     [restored] -> {
-      restored
-      |> entry.metadata
-      |> entry.modified_at_unix
+      restored.modified_at
       |> should.equal(1_749_990_896)
     }
     _ -> should.fail()
@@ -486,15 +514,18 @@ pub fn roundtrip_seven_z_without_mtime_skips_mtime_block_test() -> Nil {
   // optional Mtime block — the round-trip output stays bit-stable
   // against the pre-mtime encoder, and the decoded entry retains
   // `modified_at_unix = 0`.
-  let plain = entry.file(path: "stamped.txt", body: <<"hi":utf8>>)
-  let archive_value = archive.add(seven_z.new(), entry: plain)
-  let assert Ok(bytes) = seven_z.encode(archive: archive_value)
-  let assert Ok(decoded) = seven_z.decode(bytes: bytes)
-  case archive.entries(decoded) {
+  let plain = fixture.file(path: "stamped.txt", body: <<"hi":utf8>>)
+  let archive_value = fixture.add(fixture.new(archive.SevenZ), entry: plain)
+  let assert Ok(bytes) =
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
+  let assert Ok(decoded) = packkit.read(bytes, format: archive.SevenZ)
+  case decoded.entries {
     [restored] -> {
-      restored
-      |> entry.metadata
-      |> entry.modified_at_unix
+      restored.modified_at
       |> should.equal(0)
     }
     _ -> should.fail()
@@ -521,16 +552,14 @@ pub fn decodes_system_seven_z_with_mtime_test() -> Nil {
     0xE6, 0xF1, 0xDD, 0xDB, 0x01, 0x15, 0x06, 0x01, 0x00, 0x20, 0x80, 0xA4, 0x81,
     0x00, 0x00,
   >>
-  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
-  case archive.entries(decoded) {
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.SevenZ)
+  case decoded.entries {
     [single] -> {
-      entry.to_string(entry.path(single))
+      single.path
       |> should.equal("greeting.txt")
       entry.body(single)
       |> should.equal(<<"mtime test\n":utf8>>)
-      single
-      |> entry.metadata
-      |> entry.modified_at_unix
+      single.modified_at
       |> should.equal(1_749_990_896)
     }
     _ -> should.fail()
@@ -566,10 +595,10 @@ pub fn decode_system_archive_with_delta_lzma2_chain_test() -> Nil {
     0x81, 0x00, 0x00,
   >>
   let expected = <<"AAAAA\nBBBBB\nCCCCC\nDDDDD\nEEEEE\n":utf8>>
-  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
-  case archive.entries(decoded) {
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.SevenZ)
+  case decoded.entries {
     [single] -> {
-      entry.to_string(entry.path(single))
+      single.path
       |> should.equal("pattern.dat")
       entry.body(single)
       |> should.equal(expected)
@@ -617,10 +646,10 @@ pub fn decode_system_archive_with_bcj_x86_lzma2_chain_test() -> Nil {
     0x89, 0xE5, 0x48, 0x83, 0xEC, 0x10, 0xC7, 0x45, 0xFC, 0x00, 0x00, 0x00, 0x00,
     0xB8, 0x00, 0x00, 0x00, 0x00, 0xC9, 0xC3, 0xE8, 0x00, 0x00, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
-  case archive.entries(decoded) {
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.SevenZ)
+  case decoded.entries {
     [single] -> {
-      entry.to_string(entry.path(single))
+      single.path
       |> should.equal("tiny.bin")
       entry.body(single)
       |> should.equal(expected)
@@ -665,13 +694,13 @@ pub fn decode_system_multi_folder_archive_test() -> Nil {
     0x00, 0x01, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5D, 0x00, 0x10, 0x00, 0x00, 0x0C,
     0x6E, 0x0A, 0x01, 0xB4, 0xDA, 0xD0, 0xBF, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
-  let entries = archive.entries(decoded)
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.SevenZ)
+  let entries = decoded.entries
   list.length(entries) |> should.equal(2)
   let assert [first, second] = entries
-  entry.to_string(entry.path(first)) |> should.equal("a.txt")
+  first.path |> should.equal("a.txt")
   entry.body(first) |> should.equal(<<"alpha\n":utf8>>)
-  entry.to_string(entry.path(second)) |> should.equal("b.txt")
+  second.path |> should.equal("b.txt")
   entry.body(second) |> should.equal(<<"bravo charlie\n":utf8>>)
 }
 
@@ -703,13 +732,13 @@ pub fn decode_system_non_solid_archive_with_delta_chain_test() -> Nil {
     0x00, 0x07, 0x0B, 0x01, 0x00, 0x01, 0x23, 0x03, 0x01, 0x01, 0x05, 0x5D, 0x00,
     0x10, 0x00, 0x00, 0x0C, 0x7E, 0x0A, 0x01, 0xE7, 0x70, 0xAD, 0x09, 0x00, 0x00,
   >>
-  let assert Ok(decoded) = seven_z.decode(bytes: fixture)
-  let entries = archive.entries(decoded)
+  let assert Ok(decoded) = packkit.read(fixture, format: archive.SevenZ)
+  let entries = decoded.entries
   list.length(entries) |> should.equal(2)
   let assert [first, second] = entries
-  entry.to_string(entry.path(first)) |> should.equal("a.dat")
+  first.path |> should.equal("a.dat")
   entry.body(first) |> should.equal(<<"AAAA\nBBBB\n":utf8>>)
-  entry.to_string(entry.path(second)) |> should.equal("b.dat")
+  second.path |> should.equal("b.dat")
   entry.body(second) |> should.equal(<<"CCCCCCCC\nDDDDDDDD\n":utf8>>)
 }
 
@@ -724,25 +753,26 @@ pub fn decode_system_non_solid_archive_with_delta_chain_test() -> Nil {
 fn seven_z_roundtrip_with_method(
   body: BitArray,
   method: seven_z.Method,
-) -> Result(BitArray, error.ArchiveError) {
+) -> Result(BitArray, archive.ArchiveError) {
   let assert Ok(file_entry) =
     entry.file_checked(path: "payload.bin", body: body)
-  let archive_value = archive.add(seven_z.new(), entry: file_entry)
-  use bytes <- result.try(seven_z.encode_with_method(
-    archive: archive_value,
+  let archive_value =
+    fixture.add(fixture.new(archive.SevenZ), entry: file_entry)
+  use bytes <- result.try(seven_z.encode(
+    archive_value,
     method: method,
+    encryption: seven_z.Unencrypted,
   ))
-  use decoded <- result.try(seven_z.decode(bytes: bytes))
-  case archive.entries(decoded) {
+  use decoded <- result.try(packkit.read(bytes, format: archive.SevenZ))
+  case decoded.entries {
     [single] -> Ok(entry.body(single))
-    _ -> Error(error.ArchiveInvalid(message: "expected exactly one entry"))
+    _ -> Error(archive.InvalidData(message: "expected exactly one entry"))
   }
 }
 
 pub fn encode_with_method_copy_roundtrips_test() -> Nil {
   let payload = <<"copy-method round trip payload":utf8>>
-  let assert Ok(restored) =
-    seven_z_roundtrip_with_method(payload, seven_z.copy())
+  let assert Ok(restored) = seven_z_roundtrip_with_method(payload, seven_z.Copy)
   restored |> should.equal(payload)
 }
 
@@ -752,24 +782,23 @@ pub fn encode_with_method_deflate_roundtrips_test() -> Nil {
   // codec rather than the stored-block fallback path).
   let payload = repeat_bytes(<<"deflate-method payload ":utf8>>, 30)
   let assert Ok(restored) =
-    seven_z_roundtrip_with_method(payload, seven_z.deflate())
+    seven_z_roundtrip_with_method(payload, seven_z.Deflate)
   restored |> should.equal(payload)
 }
 
 pub fn encode_with_method_bzip2_roundtrips_test() -> Nil {
   let payload = repeat_bytes(<<"bzip2-method payload ":utf8>>, 30)
   let assert Ok(restored) =
-    seven_z_roundtrip_with_method(payload, seven_z.bzip2())
+    seven_z_roundtrip_with_method(payload, seven_z.Bzip2)
   restored |> should.equal(payload)
 }
 
 pub fn encode_with_method_lzma_roundtrips_test() -> Nil {
-  // `seven_z.lzma()` is the explicit constructor for what `encode/1`
+  // `seven_z.Lzma` is the explicit constructor for what `encode/1`
   // emits by default; both paths must produce a round-trip-able
   // archive.
   let payload = repeat_bytes(<<"lzma-method payload ":utf8>>, 30)
-  let assert Ok(restored) =
-    seven_z_roundtrip_with_method(payload, seven_z.lzma())
+  let assert Ok(restored) = seven_z_roundtrip_with_method(payload, seven_z.Lzma)
   restored |> should.equal(payload)
 }
 
@@ -779,10 +808,20 @@ pub fn encode_with_method_default_matches_encode_test() -> Nil {
   // share `encode_via_method(MethodLzma)`.
   let payload = <<"default method equality fixture":utf8>>
   let assert Ok(file_entry) = entry.file_checked(path: "a.bin", body: payload)
-  let archive_value = archive.add(seven_z.new(), entry: file_entry)
-  let assert Ok(default_bytes) = seven_z.encode(archive: archive_value)
+  let archive_value =
+    fixture.add(fixture.new(archive.SevenZ), entry: file_entry)
+  let assert Ok(default_bytes) =
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
   let assert Ok(explicit_bytes) =
-    seven_z.encode_with_method(archive: archive_value, method: seven_z.lzma())
+    seven_z.encode(
+      archive_value,
+      method: seven_z.Lzma,
+      encryption: seven_z.Unencrypted,
+    )
   default_bytes |> should.equal(explicit_bytes)
 }
 
@@ -807,9 +846,10 @@ pub fn decode_external_file_name_table_test() -> Nil {
     0x00, 0x00, 0x00,
   >>
 
-  let assert Ok(archive_value) = seven_z.decode(bytes: archive_bytes)
-  let assert [member] = archive.entries(archive_value)
-  member |> entry.path |> entry.to_string |> should.equal("x.txt")
+  let assert Ok(archive_value) =
+    packkit.read(archive_bytes, format: archive.SevenZ)
+  let assert [member] = archive_value.entries
+  member.path |> should.equal("x.txt")
   member |> entry.body |> should.equal(<<"hi\n":utf8>>)
 }
 
@@ -828,9 +868,10 @@ pub fn decode_bcj2_folder_test() -> Nil {
     0xFF, 0x51, 0xDD, 0x58, 0x0D, 0xEE,
   >>
 
-  let assert Ok(archive_value) = seven_z.decode(bytes: archive_bytes)
-  let assert [member] = archive.entries(archive_value)
-  member |> entry.path |> entry.to_string |> should.equal("small.bin")
+  let assert Ok(archive_value) =
+    packkit.read(archive_bytes, format: archive.SevenZ)
+  let assert [member] = archive_value.entries
+  member.path |> should.equal("small.bin")
   bit_array.byte_size(entry.body(member)) |> should.equal(1024)
   checksum.sha256(entry.body(member)) |> should.equal(expected_sha256)
 }
@@ -887,9 +928,10 @@ pub fn decode_three_coder_linear_chain_test() -> Nil {
   let archive_bytes = three_coder_fixture_bytes()
   let expected_payload = build_modular_payload(0, 256, <<>>)
 
-  let assert Ok(archive_value) = seven_z.decode(bytes: archive_bytes)
-  let assert [member] = archive.entries(archive_value)
-  member |> entry.path |> entry.to_string |> should.equal("payload.bin")
+  let assert Ok(archive_value) =
+    packkit.read(archive_bytes, format: archive.SevenZ)
+  let assert [member] = archive_value.entries
+  member.path |> should.equal("payload.bin")
   member |> entry.body |> should.equal(expected_payload)
 }
 
@@ -930,4 +972,14 @@ fn repeat_bytes_loop(chunk: BitArray, times: Int, acc: BitArray) -> BitArray {
     0 -> acc
     _ -> repeat_bytes_loop(chunk, times - 1, bit_array.concat([acc, chunk]))
   }
+}
+
+pub fn encode_rejects_archive_comment_test() -> Nil {
+  // 7z has no archive comment; the comment used to be dropped without
+  // an error.
+  fixture.new(archive.SevenZ)
+  |> fixture.add_file(path: "a", body: <<"a":utf8>>)
+  |> fixture.with_comment(comment: "note")
+  |> packkit.write
+  |> should.equal(Error(archive.CommentUnsupported(format: archive.SevenZ)))
 }

@@ -4,8 +4,8 @@
 
 import gleam/string
 import gleeunit/should
-import packkit/error
-import packkit/zstd
+import packkit
+import packkit/codec
 
 pub fn zstd_rejects_first_block_of_repeat_mode_with_clear_error_test() -> Nil {
   // Repeat_Mode reuses the previous block's FSE table, but the
@@ -25,8 +25,8 @@ pub fn zstd_rejects_first_block_of_repeat_mode_with_clear_error_test() -> Nil {
   let stream = <<
     0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x01, 0x30,
   >>
-  case zstd.decode(bytes: stream) {
-    Error(error.CodecInvalidData(message: msg)) ->
+  case packkit.decompress(stream, with: codec.Zstd) {
+    Error(codec.InvalidData(message: msg)) ->
       case string.contains(does: msg, contain: "Repeat_Mode") {
         True -> Nil
         False -> should.fail()
@@ -40,8 +40,8 @@ pub fn zstd_rejects_first_block_ll_repeat_mode_test() -> Nil {
   let stream = <<
     0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x01, 0xC0,
   >>
-  case zstd.decode(bytes: stream) {
-    Error(error.CodecInvalidData(message: msg)) ->
+  case packkit.decompress(stream, with: codec.Zstd) {
+    Error(codec.InvalidData(message: msg)) ->
       case string.contains(does: msg, contain: "Repeat_Mode") {
         True -> Nil
         False -> should.fail()
@@ -55,8 +55,8 @@ pub fn zstd_rejects_first_block_ml_repeat_mode_test() -> Nil {
   let stream = <<
     0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x01, 0x1D, 0x00, 0x00, 0x00, 0x01, 0x0C,
   >>
-  case zstd.decode(bytes: stream) {
-    Error(error.CodecInvalidData(message: msg)) ->
+  case packkit.decompress(stream, with: codec.Zstd) {
+    Error(codec.InvalidData(message: msg)) ->
       case string.contains(does: msg, contain: "Repeat_Mode") {
         True -> Nil
         False -> should.fail()
