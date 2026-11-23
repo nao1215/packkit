@@ -1,5 +1,5 @@
 name = "packkit"
-version = "0.5.0"
+version = "0.5.1"
 description = "Compression and archive formats (gzip, zstd, xz, tar, zip, 7z and more) in pure Gleam for Erlang and JavaScript"
 licences = ["MIT"]
 repository = { type = "github", user = "nao1215", repo = "packkit" }
