@@ -60,6 +60,8 @@ list.length(decoded.entries)
 
 - Reading a tar or ar entry whose mode does not fit in 16 bits, such as a tar header with mode `7777777`, panicked. The mode is now kept as it is.
 - Writing a 7z archive with a comment dropped the comment silently. It now returns `CommentUnsupported`, like tar, cpio and ar.
+- The cpio writer put the whole mode next to the file type bits, so a mode read from ZIP such as `0o100644` produced an archive packkit could not read. It now keeps only the permission bits.
+- ZIP returns `FieldOverflow` for a modification time or owner id that does not fit in 32 bits, and 7z for a time past the FILETIME range, instead of cutting the value down.
 
 ## [0.4.0] - 2026-11-19
 
