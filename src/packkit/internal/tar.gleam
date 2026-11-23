@@ -570,8 +570,8 @@ fn split_name_field(
   case size <= name_size {
     True ->
       Ok(#(
-        right_pad(canonical_bytes, name_size, 0),
-        right_pad(<<>>, prefix_size, 0),
+        bytes.pad_end(canonical_bytes, name_size, 0),
+        bytes.pad_end(<<>>, prefix_size, 0),
       ))
     False -> attempt_prefix_split(canonical, size)
   }
@@ -592,8 +592,8 @@ fn attempt_prefix_split(
       case find_prefix_split(segments) {
         Some(#(prefix, rest)) ->
           Ok(#(
-            right_pad(bit_array.from_string(rest), name_size, 0),
-            right_pad(bit_array.from_string(prefix), prefix_size, 0),
+            bytes.pad_end(bit_array.from_string(rest), name_size, 0),
+            bytes.pad_end(bit_array.from_string(prefix), prefix_size, 0),
           ))
         None ->
           Error(archive.EntryRejected(
@@ -671,7 +671,7 @@ fn fit_field(
         path: value,
         reason: kind <> " longer than " <> int.to_string(width) <> " bytes",
       ))
-    False -> Ok(right_pad(bytes, width, 0))
+    False -> Ok(bytes.pad_end(bytes, width, 0))
   }
 }
 
@@ -713,7 +713,7 @@ fn pow_int_loop(base: Int, exponent: Int, acc: Int) -> Int {
 }
 
 fn checksum_blank_field() -> BitArray {
-  byte_repeat(0x20, 8)
+  bytes.repeat(0x20, 8)
 }
 
 fn checksum_value_field(value: Int) -> BitArray {
@@ -723,7 +723,7 @@ fn checksum_value_field(value: Int) -> BitArray {
 
 fn magic_field() -> BitArray {
   bit_array.from_string("ustar")
-  |> right_pad(6, 0)
+  |> bytes.pad_end(6, 0)
 }
 
 fn version_field() -> BitArray {
@@ -731,11 +731,11 @@ fn version_field() -> BitArray {
 }
 
 fn uname_field() -> BitArray {
-  byte_repeat(0, 32)
+  bytes.repeat(0, 32)
 }
 
 fn gname_field() -> BitArray {
-  byte_repeat(0, 32)
+  bytes.repeat(0, 32)
 }
 
 fn devmajor_field() -> BitArray {
@@ -747,46 +747,24 @@ fn devminor_field() -> BitArray {
 }
 
 fn tail_padding() -> BitArray {
-  byte_repeat(0, 12)
+  bytes.repeat(0, 12)
 }
 
 fn end_marker() -> BitArray {
-  byte_repeat(0, block_size * 2)
+  bytes.repeat(0, block_size * 2)
 }
 
 fn pad_to_block(body: BitArray) -> BitArray {
   let size = bit_array.byte_size(body)
   let padded_size = round_up_to_block(size)
   let padding = padded_size - size
-  bit_array.concat([body, byte_repeat(0, padding)])
+  bit_array.concat([body, bytes.repeat(0, padding)])
 }
 
 fn round_up_to_block(size: Int) -> Int {
   case size % block_size {
     0 -> size
     rem -> size + { block_size - rem }
-  }
-}
-
-fn right_pad(value: BitArray, width: Int, fill: Int) -> BitArray {
-  let size = bit_array.byte_size(value)
-  case size >= width {
-    True -> {
-      let assert Ok(slice) = bit_array.slice(value, 0, width)
-      slice
-    }
-    False -> bit_array.concat([value, byte_repeat(fill, width - size)])
-  }
-}
-
-fn byte_repeat(byte: Int, count: Int) -> BitArray {
-  byte_repeat_loop(byte, count, <<>>)
-}
-
-fn byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 

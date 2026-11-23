@@ -3291,7 +3291,7 @@ fn finalize_literals(
   case is_rle {
     True ->
       case bytes {
-        <<byte, rest:bytes>> -> Ok(#(zstd_repeat_byte(byte, size, <<>>), rest))
+        <<byte, rest:bytes>> -> Ok(#(bytes.repeat(byte, size), rest))
         _ -> Error(codec.InvalidData(message: "truncated zstd RLE literals"))
       }
     False -> {
@@ -3305,13 +3305,6 @@ fn finalize_literals(
         bit_array.slice(bytes, size, bit_array.byte_size(bytes) - size)
       Ok(#(chunk, rest))
     }
-  }
-}
-
-fn zstd_repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> zstd_repeat_byte(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 
@@ -4274,15 +4267,8 @@ fn decode_rle_block(
   block_size: Int,
 ) -> Result(#(BitArray, BitArray), codec.CodecError) {
   case bytes {
-    <<byte, rest:bytes>> -> Ok(#(repeat_byte(byte, block_size, <<>>), rest))
+    <<byte, rest:bytes>> -> Ok(#(bytes.repeat(byte, block_size), rest))
     _ -> Error(codec.InvalidData(message: "truncated zstd RLE block"))
-  }
-}
-
-fn repeat_byte(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> repeat_byte(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 

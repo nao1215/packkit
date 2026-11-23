@@ -53,6 +53,7 @@ import packkit/codec
 import packkit/internal/brotli_context as brotli_ctx
 import packkit/internal/brotli_dictionary as brotli_dict
 import packkit/internal/brotli_transform as brotli_xfm
+import packkit/internal/bytes
 import packkit/limit
 
 /// Encode `bytes` as a Brotli stream made up of uncompressed
@@ -3148,7 +3149,7 @@ fn decode_context_map(
   size: Int,
 ) -> Result(#(BitArray, Reader), codec.CodecError) {
   case ntrees <= 1 {
-    True -> Ok(#(byte_repeat(0, size), reader))
+    True -> Ok(#(bytes.repeat(0, size), reader))
     False -> decode_nontrivial_context_map(reader, ntrees, size)
   }
 }
@@ -3249,17 +3250,6 @@ fn prepend_zeros(n: Int, acc: List(Int)) -> List(Int) {
 
 fn bytes_from_int_list(values: List(Int)) -> BitArray {
   list.fold(values, <<>>, fn(acc, v) { <<acc:bits, v>> })
-}
-
-fn byte_repeat(byte: Int, count: Int) -> BitArray {
-  byte_repeat_loop(byte, count, <<>>)
-}
-
-fn byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    n if n <= 0 -> acc
-    _ -> byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
-  }
 }
 
 // -- Inverse Move-to-Front transform (RFC 7932 §7.3) -------------------

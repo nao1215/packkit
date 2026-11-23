@@ -73,27 +73,25 @@ pub fn decode_with_limits(
         return: Error(codec.DictionaryRequired),
       )
 
-      let payload_size = bit_array.byte_size(rest)
-      use <- bool.guard(
-        when: payload_size < 4,
-        return: Error(codec.InvalidData(
-          message: "zlib: stream missing Adler-32 trailer",
-        )),
-      )
-
-      let deflate_size = payload_size - 4
-      let assert Ok(deflate_bits) = bit_array.slice(rest, 0, deflate_size)
-      let assert Ok(checksum_bits) = bit_array.slice(rest, deflate_size, 4)
+      // Clamped at 0, so a stream shorter than the trailer does not
+      // match below and takes the error branch.
+      let deflate_size = int.max(bit_array.byte_size(rest) - 4, 0)
+      use #(deflate_bits, stored) <- result.try(case rest {
+        <<deflate_bits:bytes-size(deflate_size), stored:size(32)-big>> ->
+          Ok(#(deflate_bits, stored))
+        _ ->
+          Error(codec.InvalidData(
+            message: "zlib: stream missing Adler-32 trailer",
+          ))
+      })
 
       use plain <- result.try(deflate.decode_with_limits(
         bytes: deflate_bits,
         limits: limits,
       ))
 
-      let expected = checksum.adler32(plain)
-      let assert <<stored:size(32)-big>> = checksum_bits
       use <- bool.guard(
-        when: stored != expected,
+        when: stored != checksum.adler32(plain),
         return: Error(codec.InvalidData(message: "zlib: Adler-32 mismatch")),
       )
 

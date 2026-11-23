@@ -371,24 +371,13 @@ fn hex_digits_loop(value: Int, remaining: Int, acc: BitArray) -> BitArray {
 
 fn align_padding(position: Int) -> BitArray {
   let aligned = pad_to_align(position)
-  byte_repeat(0, aligned - position)
+  bytes.repeat(0, aligned - position)
 }
 
 fn pad_to_align(position: Int) -> Int {
   case position % align {
     0 -> position
     rem -> position + { align - rem }
-  }
-}
-
-fn byte_repeat(byte: Int, count: Int) -> BitArray {
-  byte_repeat_loop(byte, count, <<>>)
-}
-
-fn byte_repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
-  case count {
-    0 -> acc
-    _ -> byte_repeat_loop(byte, count - 1, <<acc:bits, byte>>)
   }
 }
 

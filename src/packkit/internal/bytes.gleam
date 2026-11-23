@@ -34,3 +34,24 @@ fn strip_trailing_nul_loop(bytes: BitArray, size: Int) -> BitArray {
       }
   }
 }
+
+/// Returns `count` copies of `byte`, or an empty bit array when `count` is
+/// not positive.
+pub fn repeat(byte: Int, count: Int) -> BitArray {
+  repeat_loop(byte, count, <<>>)
+}
+
+fn repeat_loop(byte: Int, count: Int, acc: BitArray) -> BitArray {
+  case count <= 0 {
+    True -> acc
+    False -> repeat_loop(byte, count - 1, <<acc:bits, byte>>)
+  }
+}
+
+/// Cuts `value` to `width` bytes, or pads it on the right with `fill`.
+pub fn pad_end(value: BitArray, width: Int, fill: Int) -> BitArray {
+  case value {
+    <<head:bytes-size(width), _:bytes>> -> head
+    _ -> <<value:bits, repeat(fill, width - bit_array.byte_size(value)):bits>>
+  }
+}
