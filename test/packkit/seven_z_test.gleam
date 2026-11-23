@@ -2,7 +2,6 @@ import gleam/bit_array
 import gleam/list
 import gleam/option
 import gleam/result
-import gleam/string
 import gleeunit/should
 import packkit
 import packkit/archive
@@ -1029,16 +1028,20 @@ pub fn lone_surrogate_in_a_name_is_invalid_test() -> Nil {
   let assert <<
     signature:bytes-size(8),
     _start_crc:size(32),
-    offset:size(64)-little,
-    size:size(64)-little,
+    offset:size(32)-little,
+    0:size(32),
+    size:size(32)-little,
+    0:size(32),
     _next_crc:size(32),
     packed:bytes-size(offset),
     header:bytes-size(size),
   >> = bytes
   let header = replace_once(header, <<"a", 0, "b", 0>>, <<0x00, 0xD8, "b", 0>>)
   let start = <<
-    offset:size(64)-little,
-    size:size(64)-little,
+    offset:size(32)-little,
+    0:size(32),
+    size:size(32)-little,
+    0:size(32),
     { checksum.crc32(data: header) }:size(32)-little,
   >>
   let fixed = <<
@@ -1048,9 +1051,9 @@ pub fn lone_surrogate_in_a_name_is_invalid_test() -> Nil {
     packed:bits,
     header:bits,
   >>
-  case packkit.read(fixed, format: archive.SevenZ) {
-    Error(archive.InvalidData(_)) -> Nil
-    other -> panic as { "expected InvalidData, got " <> string.inspect(other) }
+  assert case packkit.read(fixed, format: archive.SevenZ) {
+    Error(archive.InvalidData(_)) -> True
+    _ -> False
   }
 }
 

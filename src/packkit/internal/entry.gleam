@@ -199,18 +199,17 @@ pub fn check_member_limit(
   count: Int,
   limits: Limits,
 ) -> Result(Nil, ArchiveError) {
-  case count > limits.max_members {
-    True -> Error(archive.LimitExceeded(limit: "max_members", actual: count))
-    False -> Ok(Nil)
-  }
+  use <- bool.guard(
+    when: count > limits.max_members,
+    return: Error(archive.LimitExceeded(limit: "max_members", actual: count)),
+  )
+  Ok(Nil)
 }
 
 /// Drops one trailing `/`, which tar and ZIP put after directory names.
 pub fn strip_trailing_slash(path: String) -> String {
-  case string.ends_with(path, "/") {
-    True -> string.drop_end(path, 1)
-    False -> path
-  }
+  use <- bool.guard(when: !string.ends_with(path, "/"), return: path)
+  string.drop_end(path, 1)
 }
 
 /// Returns `LimitExceeded` when the archive is larger than

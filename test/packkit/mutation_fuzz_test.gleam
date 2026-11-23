@@ -306,19 +306,10 @@ pub fn fuzz_archives_under_tiny_limits_test() -> Nil {
   [archive.Tar, archive.Cpio, archive.Ar, archive.Zip, archive.SevenZ]
   |> list.each(fn(format) {
     let bytes = written(format)
-    case packkit.read_with_limits(bytes, format:, limits: tiny) {
-      Error(archive.LimitExceeded(limit:, actual:)) -> {
-        assert limit_name_is_known(limit)
-        assert actual > 1
-      }
-      other -> panic as { "expected a limit error, got " <> describe(other) }
+    assert case packkit.read_with_limits(bytes, format:, limits: tiny) {
+      Error(archive.LimitExceeded(limit:, actual:)) ->
+        limit_name_is_known(limit) && actual > 1
+      _ -> False
     }
   })
-}
-
-fn describe(result: Result(a, b)) -> String {
-  case result {
-    Ok(_) -> "Ok"
-    Error(error) -> string.inspect(error)
-  }
 }

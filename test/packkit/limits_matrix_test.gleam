@@ -55,7 +55,14 @@ fn check_archive(
     case decode(limits) {
       Error(archive.LimitExceeded(limit: got, actual: _)) if got == name ->
         Error(Nil)
-      other -> Ok(label <> " " <> name <> ": " <> describe(other))
+      other ->
+        Ok(
+          label
+          <> " "
+          <> name
+          <> ": "
+          <> describe(other, archive.error_to_string),
+        )
     }
   })
 }
@@ -70,23 +77,37 @@ pub fn archive_readers_enforce_every_limit_test() -> Nil {
       })
     })
   let zip_methods =
-    [zip.Store, zip.Deflate, zip.Bzip2, zip.Lzma, zip.Zstd, zip.Xz]
-    |> list.flat_map(fn(method) {
+    [
+      #("store", zip.Store),
+      #("deflate", zip.Deflate),
+      #("bzip2", zip.Bzip2),
+      #("lzma", zip.Lzma),
+      #("zstd", zip.Zstd),
+      #("xz", zip.Xz),
+    ]
+    |> list.flat_map(fn(pair) {
+      let #(label, method) = pair
       let assert Ok(bytes) = zip.encode(sample(archive.Zip), method:)
-      check_archive("zip " <> string.inspect(method), bytes, fn(limits) {
+      check_archive("zip " <> label, bytes, fn(limits) {
         zip.decode(bytes:, limits:)
       })
     })
   let seven_z_methods =
-    [seven_z.Lzma, seven_z.Copy, seven_z.Deflate, seven_z.Bzip2]
-    |> list.flat_map(fn(method) {
+    [
+      #("lzma", seven_z.Lzma),
+      #("copy", seven_z.Copy),
+      #("deflate", seven_z.Deflate),
+      #("bzip2", seven_z.Bzip2),
+    ]
+    |> list.flat_map(fn(pair) {
+      let #(label, method) = pair
       let assert Ok(bytes) =
         seven_z.encode(
           sample(archive.SevenZ),
           method:,
           encryption: seven_z.Unencrypted,
         )
-      check_archive("7z " <> string.inspect(method), bytes, fn(limits) {
+      check_archive("7z " <> label, bytes, fn(limits) {
         seven_z.decode(bytes:, limits:)
       })
     })
@@ -97,18 +118,21 @@ pub fn archive_readers_enforce_every_limit_test() -> Nil {
 // one method and one test per encryption mode to stay fast.
 
 pub fn seven_z_encrypted_contents_enforce_every_limit_test() -> Nil {
-  check_encrypted_seven_z(seven_z.EncryptContents("pw"))
+  check_encrypted_seven_z("contents", seven_z.EncryptContents("pw"))
 }
 
 pub fn seven_z_encrypted_headers_enforce_every_limit_test() -> Nil {
-  check_encrypted_seven_z(seven_z.EncryptContentsAndHeaders("pw"))
+  check_encrypted_seven_z("headers", seven_z.EncryptContentsAndHeaders("pw"))
 }
 
-fn check_encrypted_seven_z(encryption: seven_z.Encryption) -> Nil {
+fn check_encrypted_seven_z(
+  label: String,
+  encryption: seven_z.Encryption,
+) -> Nil {
   let assert Ok(bytes) =
     seven_z.encode(sample(archive.SevenZ), method: seven_z.Copy, encryption:)
   let failures =
-    check_archive(string.inspect(encryption), bytes, fn(limits) {
+    check_archive("7z encrypted " <> label, bytes, fn(limits) {
       seven_z.decode_with_password(bytes:, password: "pw", limits:)
     })
   assert failures == []
@@ -150,13 +174,13 @@ pub fn codecs_enforce_input_and_output_limits_test() -> Nil {
             Error(Nil)
           other ->
             Ok(
-              string.inspect(codec)
+              codec_name(codec)
               <> " "
               <> name
               <> " ("
               <> int.to_string(bit_array.byte_size(packed))
               <> " bytes): "
-              <> describe(other),
+              <> describe(other, codec.error_to_string),
             )
         }
       })
@@ -164,9 +188,25 @@ pub fn codecs_enforce_input_and_output_limits_test() -> Nil {
   assert failures == []
 }
 
-fn describe(result: Result(a, e)) -> String {
+fn describe(result: Result(a, e), to_string: fn(e) -> String) -> String {
   case result {
     Ok(_) -> "Ok"
-    Error(error) -> string.inspect(error)
+    Error(error) -> to_string(error)
+  }
+}
+
+fn codec_name(codec: Codec) -> String {
+  case codec {
+    codec.Identity -> "identity"
+    codec.Deflate -> "deflate"
+    codec.Zlib -> "zlib"
+    codec.Gzip -> "gzip"
+    codec.Lz4 -> "lz4"
+    codec.Snappy -> "snappy"
+    codec.Bzip2 -> "bzip2"
+    codec.Lzw -> "lzw"
+    codec.Xz -> "xz"
+    codec.Zstd -> "zstd"
+    codec.Brotli -> "brotli"
   }
 }

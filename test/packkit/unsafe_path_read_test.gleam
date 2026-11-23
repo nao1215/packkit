@@ -99,16 +99,20 @@ pub fn seven_z_rejects_parent_segment_test() -> Nil {
   let assert <<
     signature:bytes-size(8),
     _start_crc:size(32),
-    offset:size(64)-little,
-    size:size(64)-little,
+    offset:size(32)-little,
+    0:size(32),
+    size:size(32)-little,
+    0:size(32),
     _next_crc:size(32),
     packed:bytes-size(offset),
     header:bytes-size(size),
   >> = bytes
   let header = replace_all(header, utf16le("zz/"), utf16le("../"))
   let start = <<
-    offset:size(64)-little,
-    size:size(64)-little,
+    offset:size(32)-little,
+    0:size(32),
+    size:size(32)-little,
+    0:size(32),
     { checksum.crc32(data: header) }:size(32)-little,
   >>
   let fixed = <<
