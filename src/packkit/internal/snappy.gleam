@@ -1,14 +1,10 @@
-//// Snappy raw-block and framed codec.
+//// Snappy framed codec (`sNaPpY` stream identifier and chunked layout).
 ////
-//// `snappy.raw_decode` and `snappy.raw_encode` operate on the original
-//// Snappy block format documented in `snappy-format-description`.
-//// `snappy.decode` and `snappy.encode` operate on the streaming
-//// framed form (`sNaPpY` stream identifier and chunked layout).  The
-//// raw encoder runs a greedy 4-byte hash-chain match-finder and
-//// emits literal + copy-1 / copy-2 / copy-4 sequences in the
-//// canonical block layout; the framed encoder dispatches each chunk
-//// through the raw encoder and picks the smaller of the compressed
-//// (`0x00`) and uncompressed (`0x01`) chunk types.
+//// Compressed chunks hold a raw block in the format described in
+//// `snappy-format-description`. The raw encoder runs a greedy 4-byte
+//// hash-chain match-finder and emits literal + copy-1 / copy-2 /
+//// copy-4 sequences; the framed encoder picks the smaller of the
+//// compressed (`0x00`) and uncompressed (`0x01`) chunk types.
 
 import gleam/bit_array
 import gleam/bool
@@ -62,11 +58,6 @@ pub fn decode_with_limits(
   }
 }
 
-/// Decode a single Snappy raw block.
-pub fn raw_decode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
-  raw_decode_with_limits(bytes: bytes, limits: limit.default())
-}
-
 /// Decode a Snappy raw block using explicit resource limits.
 fn raw_decode_with_limits(
   bytes bytes: BitArray,
@@ -93,18 +84,6 @@ fn raw_decode_with_limits(
         message: "snappy: raw output length disagrees with declared length",
       ))
   }
-}
-
-/// Encode `bytes` as a Snappy raw block.  Runs a greedy LZ77 match-
-/// finder (4-byte hash table, 16-bit hash) and emits literal +
-/// copy-1 / copy-2 / copy-4 sequences in the canonical block layout.
-/// Inputs of fewer than 4 bytes — where no copy can fit the 4-byte
-/// minimum match — degenerate to a single literal run.
-pub fn raw_encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
-  let length = bit_array.byte_size(bytes)
-  let length_varint = write_varint(length)
-  let body = compress_raw_body(bytes, length)
-  Ok(bit_array.concat([length_varint, body]))
 }
 
 fn encode_uncompressed_chunks(

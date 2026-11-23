@@ -130,39 +130,10 @@ pub fn crc32_xz_block_header_test() -> Nil {
 
 // -- SHA-1 + HMAC-SHA1 + PBKDF2 test vectors --------------------------
 //
-// SHA-1 vectors are from FIPS 180-4 Appendix A; HMAC-SHA1 from
-// RFC 2202 §3; PBKDF2-HMAC-SHA1 from RFC 6070 §2.  Pinning the
+// SHA-1 is private and reached through HMAC-SHA1 (RFC 2202 §3) and
+// PBKDF2-HMAC-SHA1 (RFC 6070 §2).  Pinning the
 // official vectors here guards against subtle byte-order / padding
 // bugs in the primitive that ZIP AE-x decryption depends on end-to-end.
-
-pub fn sha1_empty_test() -> Nil {
-  // FIPS 180-4 Appendix A, "" → da39a3ee5e6b4b0d3255bfef95601890afd80709
-  checksum.sha1(data: <<>>)
-  |> should.equal(<<
-    0xDA, 0x39, 0xA3, 0xEE, 0x5E, 0x6B, 0x4B, 0x0D, 0x32, 0x55, 0xBF, 0xEF, 0x95,
-    0x60, 0x18, 0x90, 0xAF, 0xD8, 0x07, 0x09,
-  >>)
-}
-
-pub fn sha1_abc_test() -> Nil {
-  // FIPS 180-4 Appendix A, "abc" → a9993e364706816aba3e25717850c26c9cd0d89d
-  checksum.sha1(data: <<"abc":utf8>>)
-  |> should.equal(<<
-    0xA9, 0x99, 0x3E, 0x36, 0x47, 0x06, 0x81, 0x6A, 0xBA, 0x3E, 0x25, 0x71, 0x78,
-    0x50, 0xC2, 0x6C, 0x9C, 0xD0, 0xD8, 0x9D,
-  >>)
-}
-
-pub fn sha1_two_block_test() -> Nil {
-  // Standard 448-bit (56-byte) message; exercises two SHA-1 blocks.
-  checksum.sha1(data: <<
-    "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq":utf8,
-  >>)
-  |> should.equal(<<
-    0x84, 0x98, 0x3E, 0x44, 0x1C, 0x3B, 0xD2, 0x6E, 0xBA, 0xAE, 0x4A, 0xA1, 0xF9,
-    0x51, 0x29, 0xE5, 0xE5, 0x46, 0x70, 0xF1,
-  >>)
-}
 
 pub fn hmac_sha1_rfc2202_case_1_test() -> Nil {
   // RFC 2202 §3 test case 1.

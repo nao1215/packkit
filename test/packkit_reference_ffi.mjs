@@ -38,8 +38,6 @@ export function adler32(h) {
 
 export const sha256 = (h) =>
   hex(crypto.createHash("sha256").update(unhex(h)).digest());
-export const sha1 = (h) =>
-  hex(crypto.createHash("sha1").update(unhex(h)).digest());
 export const hmac_sha1 = (k, d) =>
   hex(crypto.createHmac("sha1", unhex(k)).update(unhex(d)).digest());
 export const pbkdf2_hmac_sha1 = (p, s, iter, len) =>

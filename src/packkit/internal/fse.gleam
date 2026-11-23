@@ -1,20 +1,19 @@
 //// Finite State Entropy (FSE) decoder primitives shared between the
 //// Zstandard sequences section and any future LZFSE-style codec.
 ////
-//// This module currently provides the three predefined FSE
-//// distributions that Zstandard uses for literal_length, match_length,
-//// and offset symbols (RFC 8478 §3.1.1.3.2.2), plus a state-table
-//// builder that turns a normalized distribution into the per-state
-//// (symbol, nb_bits, baseline) triple used by the streaming decoder.
-//// The state-driven decode loop itself can be added in a follow-up
-//// commit once the surrounding zstd block parser is ready to call it.
+//// This module provides the three predefined FSE distributions that
+//// Zstandard uses for literal_length, match_length, and offset symbols
+//// (RFC 8478 §3.1.1.3.2.2), a state-table builder that turns a
+//// normalized distribution into the per-state (symbol, nb_bits,
+//// baseline) triple, and the backward bit reader the zstd sequences
+//// decoder uses.
 
 import gleam/dict
 import gleam/int
 import gleam/result
 
 /// Predefined Literals_Length distribution at accuracy_log 6.
-pub fn predefined_literal_length() -> List(Int) {
+fn predefined_literal_length() -> List(Int) {
   [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3,
     2, 1, 1, 1, 1, 1, -1, -1, -1, -1,
@@ -24,7 +23,7 @@ pub fn predefined_literal_length() -> List(Int) {
 /// Predefined Match_Length distribution at accuracy_log 6.
 /// Matches `ML_defaultNorm` in the zstd reference (lib/common/zstd_internal.h):
 /// the seven highest codes (46..52) are less-probable placeholders, not five.
-pub fn predefined_match_length() -> List(Int) {
+fn predefined_match_length() -> List(Int) {
   [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
@@ -33,7 +32,7 @@ pub fn predefined_match_length() -> List(Int) {
 }
 
 /// Predefined Offset distribution at accuracy_log 5.
-pub fn predefined_offset() -> List(Int) {
+fn predefined_offset() -> List(Int) {
   [
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1,
     -1, -1, -1, -1,

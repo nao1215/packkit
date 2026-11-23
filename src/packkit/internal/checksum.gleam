@@ -758,7 +758,7 @@ fn sha256_k(round: Int) -> Int {
 
 /// Compute the SHA-1 digest of `data` (FIPS 180-4 §6.1).  Returns a
 /// 20-byte `BitArray`.  Used by `hmac_sha1` for ZIP AE-x.
-pub fn sha1(data data: BitArray) -> BitArray {
+fn sha1(data data: BitArray) -> BitArray {
   let padded = sha256_pad(data)
   let #(h0, h1, h2, h3, h4) =
     sha1_process_blocks(

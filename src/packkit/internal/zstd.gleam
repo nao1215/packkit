@@ -76,7 +76,7 @@ pub fn encode(bytes bytes: BitArray) -> Result(BitArray, codec.CodecError) {
 }
 
 /// Build the Zstandard frame header for a payload of `size` bytes.
-/// Exposed for tests that need to assert on the FCS layout for sizes
+/// Public for tests that need to assert on the FCS layout for sizes
 /// too large to materialise in memory (e.g. 4 GiB+ frames where the
 /// header used to silently truncate the FCS field to its low 32 bits).
 pub fn frame_header_for_size(size: Int) -> Result(BitArray, codec.CodecError) {
