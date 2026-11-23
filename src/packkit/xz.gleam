@@ -25,14 +25,8 @@ pub fn codec() -> codecs.Codec {
   codecs.xz()
 }
 
-/// Encode `bytes` as an xz stream.  The encoder produces a single
-/// block whose LZMA2 filter chain contains real LZMA1-compressed
-/// chunks — each chunk routes through the literal-only LZMA1 encoder
-/// in `packkit/internal/lzma`, so the output is a fully conforming
-/// `.xz` file that any decoder accepts.  Compression ratio is bounded
-/// by the literal-only LZMA1 encoder (no LZ77 match search yet);
-/// plugging in a hash-chain match finder is the next obvious
-/// incremental improvement.
+/// Encode `bytes` as an xz stream with one block whose LZMA2 chunks
+/// are compressed by the LZ77 LZMA1 encoder in `packkit/internal/lzma`.
 pub fn encode(bytes bytes: BitArray) -> Result(BitArray, error.CodecError) {
   let size = bit_array.byte_size(bytes)
   let stream_header = encode_stream_header()
@@ -95,7 +89,7 @@ fn encode_block_header(
 
 // Maximum uncompressed bytes per LZMA-compressed LZMA2 chunk.  The
 // chunk header carries a 16-bit (compressed_size - 1) field, capping
-// the compressed payload at 64 KiB; with our literal-only LZMA1
+// the compressed payload at 64 KiB; with our LZMA1
 // encoder hitting ~1.125x expansion in the worst case, an input chunk
 // of 32 KiB encodes to at most ~37 KiB — well within the cap and
 // leaving room for the eventual LZ77 / Huffman uplift.
@@ -138,10 +132,9 @@ fn emit_lzma_chunks(
       let csize_minus_1 = csize - 1
       // Control byte: 0xE0 reset everything (state + properties +
       // dictionary) and pack the top 5 bits of (usize - 1) in the
-      // bottom 5 bits.  Resetting per chunk is wasteful for an LZMA
-      // encoder with LZ77 history, but our literal-only encoder has
-      // no history to carry between chunks anyway, so the simpler
-      // form is exactly equivalent.
+      // bottom 5 bits.  Resetting per chunk costs some ratio because
+      // the match window does not carry across chunks, but keeps each
+      // chunk independent.
       let control =
         int.bitwise_or(
           0xE0,
@@ -411,7 +404,7 @@ fn decode_block(
         Error(_) ->
           Error(error.CodecInvalidData(message: "truncated xz block header"))
         Ok(header_chunk) -> {
-          use #(flags, comp_size, uncomp_size, filters, _padding) <- result.try(
+          use #(_flags, comp_size, uncomp_size, filters, _padding) <- result.try(
             parse_block_header(header_chunk, header_size),
           )
           // Multi-filter chains are supported when:
@@ -424,7 +417,6 @@ fn decode_block(
           use #(lzma2_props, pre_filters) <- result.try(split_filter_chain(
             filters,
           ))
-          let _ = flags
           // Slice the compressed data immediately after the header.
           // When the xz block header carries the optional
           // `compressed_size` field we slice exactly that many bytes;

@@ -194,7 +194,6 @@ fn decode_blocks_with_remainder(
 /// the next byte boundary after the stream CRC, so any partial bits
 /// still sitting in `reader.buffer` are padding and we discard them.
 fn byte_aligned_remainder(reader: Reader) -> BitArray {
-  let _ = reader.buffer
   reader.source
 }
 
@@ -294,7 +293,6 @@ fn decode_block(
     selectors_arr,
     eob,
     symbols,
-    num_syms,
     0,
     0,
     1,
@@ -700,7 +698,6 @@ fn decode_huffman_stream(
   selectors: dict.Dict(Int, Int),
   eob: Int,
   mtf: List(Int),
-  num_syms: Int,
   symbol_count: Int,
   pending_run: Int,
   run_weight: Int,
@@ -725,7 +722,6 @@ fn decode_huffman_stream(
   {
     Error(err) -> Error(err)
     Ok(HuffmanStreamDone(final_out_rev, final_out_len, final_reader)) -> {
-      let _ = num_syms
       let l_string =
         list_to_indexed_dict(list.reverse(final_out_rev), 0, dict.new())
       Ok(#(l_string, final_out_len, final_reader))
@@ -745,7 +741,6 @@ fn decode_huffman_stream(
         selectors,
         eob,
         next_mtf,
-        num_syms,
         next_symbol_count,
         next_pending_run,
         next_run_weight,

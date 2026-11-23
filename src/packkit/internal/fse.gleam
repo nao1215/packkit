@@ -11,7 +11,6 @@
 
 import gleam/dict
 import gleam/int
-import gleam/list
 import gleam/result
 
 /// Predefined Literals_Length distribution at accuracy_log 6.
@@ -314,11 +313,6 @@ pub fn predefined_offset_table() -> dict.Dict(Int, StateEntry) {
   build_state_table(predefined_offset(), predefined_offset_log())
 }
 
-/// Total number of state cells implied by an accuracy_log.
-pub fn state_count(accuracy_log: Int) -> Int {
-  int.bitwise_shift_left(1, accuracy_log)
-}
-
 // -- backward bit reader ------------------------------------------------
 
 /// Bit reader that consumes the FSE / Huffman bitstream from its end,
@@ -571,15 +565,4 @@ pub fn decode_state(
   }
   use #(extra, reader) <- result.try(read_backward_bits(reader, entry.nb_bits))
   Ok(#(entry.symbol, entry.baseline + extra, reader))
-}
-
-/// Sum the absolute counts in a normalized distribution.  Useful for
-/// validating that the distribution matches its declared table size.
-pub fn distribution_total(normalized: List(Int)) -> Int {
-  list.fold(normalized, 0, fn(acc, n) {
-    case n {
-      -1 -> acc + 1
-      v -> acc + v
-    }
-  })
 }

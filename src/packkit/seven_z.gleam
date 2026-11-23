@@ -3217,7 +3217,7 @@ fn dispatch_coder(
   limits: limit.Limits,
 ) -> Result(BitArray, error.ArchiveError) {
   case spec.id {
-    Lzma2 -> decode_lzma2_payload(packed, spec.properties, unpack_sizes)
+    Lzma2 -> decode_lzma2_stream(packed, <<>>)
     Lzma -> decode_raw_lzma(packed, spec.properties, unpack_sizes)
     Copy -> decode_copy_coder(packed, unpack_sizes)
     Deflate -> decode_deflate_coder(packed, unpack_sizes, limits)
@@ -3801,23 +3801,9 @@ fn verify_unpack_size(
   }
 }
 
-fn decode_lzma2_payload(
-  packed: BitArray,
-  _props: BitArray,
-  unpack_sizes: List(Int),
-) -> Result(BitArray, error.ArchiveError) {
-  let total = case unpack_sizes {
-    [size, ..] -> size
-    [] -> 0
-  }
-  use bytes <- result.try(decode_lzma2_stream(packed, <<>>, total))
-  Ok(bytes)
-}
-
 fn decode_lzma2_stream(
   payload: BitArray,
   output: BitArray,
-  target: Int,
 ) -> Result(BitArray, error.ArchiveError) {
   case payload {
     <<0x00, _:bytes>> -> Ok(output)
@@ -3831,11 +3817,7 @@ fn decode_lzma2_stream(
                 bit_array.slice(rest, size, bit_array.byte_size(rest) - size)
               {
                 Ok(after) ->
-                  decode_lzma2_stream(
-                    after,
-                    bit_array.concat([output, chunk]),
-                    target,
-                  )
+                  decode_lzma2_stream(after, bit_array.concat([output, chunk]))
                 Error(_) ->
                   Error(error.ArchiveInvalid(
                     message: "truncated 7z LZMA2 uncompressed chunk",
@@ -3854,7 +3836,6 @@ fn decode_lzma2_stream(
     <<control, usize_high, usize_low, csize_high, csize_low, rest:bytes>>
       if control >= 0x80
     -> {
-      let _ = target
       let usize =
         int.bitwise_or(
           int.bitwise_shift_left(int.bitwise_and(control, 0x1F), 16),
@@ -3886,7 +3867,6 @@ fn decode_lzma2_stream(
                                   decode_lzma2_stream(
                                     after_chunk,
                                     bit_array.concat([output, decoded]),
-                                    target,
                                   )
                                 Error(err) -> Error(codec_to_archive(err))
                               }

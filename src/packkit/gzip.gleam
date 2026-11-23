@@ -24,8 +24,6 @@ const magic_byte_2: Int = 0x8B
 
 const cm_deflate: Int = 8
 
-const ftext_flag: Int = 0x01
-
 const fhcrc_flag: Int = 0x02
 
 const fextra_flag: Int = 0x04
@@ -577,8 +575,6 @@ fn decode_header_and_payload(
     |> apply_optional_name(name_value)
     |> apply_optional_comment(comment_value)
     |> apply_extra(extra_value)
-
-  let _ = int.bitwise_and(flg, ftext_flag)
 
   // Decode the deflate stream and learn exactly where it ends so the
   // 8-byte CRC/ISIZE trailer can be read at the right offset and the

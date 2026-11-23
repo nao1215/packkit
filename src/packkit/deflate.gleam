@@ -238,7 +238,7 @@ fn build_tree(lengths: List(Int)) -> Result(Tree, error.CodecError) {
   let max_sym = find_max_symbol(lengths, 0, -1, 0)
   let counts = count_lengths(lengths)
   use _ <- result.try(validate_counts(counts, 0, 1, 0))
-  let symbols = sort_symbols_by_length(lengths, counts)
+  let symbols = sort_symbols_by_length(lengths)
   let counts_normalized = case
     list.length(symbols) == 1,
     list_get(counts, 1, 0) == 1
@@ -332,29 +332,12 @@ fn validate_counts(
   }
 }
 
-fn sort_symbols_by_length(lengths: List(Int), counts: List(Int)) -> List(Int) {
-  let offsets = build_offsets(counts, 0, 1, [])
+fn sort_symbols_by_length(lengths: List(Int)) -> List(Int) {
   let pairs = enumerate_lengths(lengths, 0, [])
   // For each length L (1..15), append the symbols (in input order) with
   // that length.  This produces symbols sorted first by length, then by
   // symbol number, which matches the canonical Huffman ordering.
-  let _ = offsets
   bucket_sort_symbols(pairs, 1, [])
-}
-
-fn build_offsets(
-  counts: List(Int),
-  cumulative: Int,
-  index: Int,
-  acc: List(Int),
-) -> List(Int) {
-  case index > max_bits {
-    True -> list.reverse(acc)
-    False -> {
-      let used = list_get(counts, index, 0)
-      build_offsets(counts, cumulative + used, index + 1, [cumulative, ..acc])
-    }
-  }
 }
 
 fn enumerate_lengths(

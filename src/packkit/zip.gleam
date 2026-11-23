@@ -739,9 +739,9 @@ fn encode_entry(
 
   // PKZIP general purpose flag bit 1 means "the LZMA stream omits the
   // EOS marker and the decoder must rely on the central-directory
-  // uncompressed size to know when to stop."  Our LZMA encoder is
-  // literal-only and never emits an EOS marker so we always set the
-  // bit when the method is LZMA.
+  // uncompressed size to know when to stop."  Our LZMA encoder never
+  // emits an EOS marker, so we always set the bit when the method is
+  // LZMA.
   //
   // Bit 11 is the Language Encoding Flag (a.k.a. EFS bit, APPNOTE
   // §4.4.4): when set, the entry's filename and comment are encoded
@@ -2209,16 +2209,15 @@ fn parse_pkware_lzma_props(
 
 /// Build a PKWARE method-14 payload by gluing the 4-byte SDK preamble
 /// + 5-byte property block in front of an LZMA1 raw range-coded
-/// stream produced by `packkit/internal/lzma.encode_literal_only`.
+/// stream produced by `packkit/internal/lzma.encode_with_lz77`.
 /// The general-purpose flag bit 1 (set in the entry's local + central
 /// headers) tells the reader to use the uncompressed size from the
-/// central directory instead of looking for an in-stream EOS marker —
-/// which our literal-only encoder never emits.
+/// central directory instead of looking for an in-stream EOS marker,
+/// which our encoder never emits.
 fn encode_pkware_lzma(plain: BitArray) -> BitArray {
   // Standard LZMA defaults (matching what `xz`/`7z` ship for new
-  // archives): lc=3, lp=0, pb=2.  Dictionary size is 64 KiB; the
-  // encoder does not allocate a dictionary in literal-only mode but
-  // the value is part of the wrapper for downstream tools.
+  // archives): lc=3, lp=0, pb=2.  Dictionary size is 64 KiB, which
+  // covers the encoder's 32 KiB match window.
   let props = lzma.Properties(lc: 3, lp: 0, pb: 2)
   let stream = lzma.encode_with_lz77(bytes: plain, props: props)
   let prop_byte = lzma.properties_to_byte(props)

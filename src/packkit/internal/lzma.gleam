@@ -377,7 +377,6 @@ fn decode_match(
   decoder: Decoder,
   pos_state: Int,
 ) -> Result(Decoder, error.CodecError) {
-  let _ = pos_state
   let decoder =
     Decoder(
       ..decoder,
@@ -866,22 +865,6 @@ pub fn properties_to_byte(props: Properties) -> Int {
   props.pb * 45 + props.lp * 9 + props.lc
 }
 
-/// Encode `bytes` as an LZMA1 range-coded payload that emits every
-/// input byte as a literal.  The output is the raw range-coded stream
-/// (no LZMA `.lzma`/`.xz`/PKWARE header), suitable to drop into any
-/// wrapper that carries the LZMA properties and uncompressed size out
-/// of band.  Decoding via `new` + `decode_into(_, byte_size(bytes))`
-/// returns the original payload.
-pub fn encode_literal_only(
-  bytes bytes: BitArray,
-  props props: Properties,
-) -> BitArray {
-  let encoder = new_encoder(props)
-  let encoder = encode_literal_only_loop(encoder, bytes)
-  let encoder = finish_encoder(encoder)
-  list_reverse_to_bit_array(encoder.out_bytes_rev, <<>>)
-}
-
 type Encoder {
   Encoder(
     range: Int,
@@ -918,51 +901,6 @@ fn new_encoder(props: Properties) -> Encoder {
     output_len: 0,
     out_bytes_rev: [],
   )
-}
-
-fn encode_literal_only_loop(encoder: Encoder, input: BitArray) -> Encoder {
-  case input {
-    <<byte, rest:bytes>> -> {
-      let pos_state =
-        int.bitwise_and(encoder.output_len, mask_for(encoder.props.pb))
-      // is_match bit = 0 (we never emit a match in this mode).
-      let encoder =
-        encode_bit(
-          encoder,
-          prob_key(t_is_match, encoder.state * num_pos_states_max + pos_state),
-          0,
-        )
-      let encoder = encode_literal_byte(encoder, byte)
-      let encoder =
-        Encoder(
-          ..encoder,
-          output_rev: [byte, ..encoder.output_rev],
-          output_len: encoder.output_len + 1,
-        )
-      encode_literal_only_loop(encoder, rest)
-    }
-    _ -> encoder
-  }
-}
-
-fn encode_literal_byte(encoder: Encoder, byte: Int) -> Encoder {
-  let prev_byte = case encoder.output_rev {
-    [head, ..] -> head
-    [] -> 0
-  }
-  let lit_pos_state =
-    int.bitwise_and(encoder.output_len, mask_for(encoder.props.lp))
-  let lit_high = int.bitwise_shift_right(prev_byte, 8 - encoder.props.lc)
-  let context_index =
-    int.bitwise_or(
-      int.bitwise_shift_left(lit_pos_state, encoder.props.lc),
-      lit_high,
-    )
-  let prob_base = context_index * 0x300
-  // state < 7 always (we never emit matches), so the decoder uses the
-  // unmatched literal path — emit 8 bits MSB-first.
-  let encoder = encode_literal_bits(encoder, prob_base, 1, byte, 8)
-  Encoder(..encoder, state: literal_state_after(encoder.state))
 }
 
 fn encode_literal_bits(
@@ -1143,10 +1081,7 @@ const lzma_lz77_max_distance: Int = 0x8000
 const lzma_lz77_max_match: Int = 273
 
 /// Encode `bytes` as a raw LZMA1 range-coded stream with LZ77 match
-/// finding.  Compatible with the same `lzma.new` + `lzma.decode_into`
-/// decoder used by `encode_literal_only`; the only difference is the
-/// presence of matches in the bitstream, which is a strict superset
-/// of literal-only output.
+/// finding.  Decode the result with `new` and `decode_into`.
 pub fn encode_with_lz77(
   bytes bytes: BitArray,
   props props: Properties,

@@ -17,7 +17,7 @@ pub const num_transforms: Int = 121
 /// Entries are length-prefixed; offset `0xD8` (216) is the implicit
 /// empty string referenced by id 49 in `transforms`, whose 0-length
 /// prefix byte is exactly the trailing NUL.
-pub const prefix_suffix_bytes: BitArray = <<
+const prefix_suffix_bytes: BitArray = <<
   1,
   32,
   2,
@@ -240,7 +240,7 @@ pub const prefix_suffix_bytes: BitArray = <<
 /// Byte offset within `prefix_suffix_bytes` of the length-prefixed
 /// string with the supplied id (0..49).  The id 49 names the empty
 /// string and is the most common entry in `transforms`.
-pub fn prefix_suffix_offset(id: Int) -> Int {
+fn prefix_suffix_offset(id: Int) -> Int {
   case id {
     0 -> 0
     1 -> 2
@@ -296,7 +296,7 @@ pub fn prefix_suffix_offset(id: Int) -> Int {
   }
 }
 
-pub type Op {
+type Op {
   Identity
   OmitLast(n: Int)
   OmitFirst(n: Int)
@@ -304,7 +304,7 @@ pub type Op {
   UppercaseAll
 }
 
-pub fn prefix_id_of(idx: Int) -> Int {
+fn prefix_id_of(idx: Int) -> Int {
   case idx {
     0 -> 49
     1 -> 49
@@ -431,7 +431,7 @@ pub fn prefix_id_of(idx: Int) -> Int {
   }
 }
 
-pub fn suffix_id_of(idx: Int) -> Int {
+fn suffix_id_of(idx: Int) -> Int {
   case idx {
     0 -> 49
     1 -> 0
@@ -558,7 +558,7 @@ pub fn suffix_id_of(idx: Int) -> Int {
   }
 }
 
-pub fn op_of(idx: Int) -> Op {
+fn op_of(idx: Int) -> Op {
   case idx {
     0 -> Identity
     1 -> Identity
@@ -732,7 +732,7 @@ fn apply_op(word: BitArray, op: Op) -> BitArray {
           slice
         }
       }
-    UppercaseFirst -> uppercase_first(word, len)
+    UppercaseFirst -> uppercase_first(word)
     UppercaseAll -> uppercase_all(word, 0, len)
   }
 }
@@ -741,7 +741,7 @@ fn apply_op(word: BitArray, op: Op) -> BitArray {
 /// UTF-8 (0xC0..0xDF lead) flip bit 5 of the trailing byte; for
 /// 3-byte UTF-8 (0xE0..0xEF lead) flip bit 0 of the third byte
 /// (matches brotli's "arbitrary 3-byte transform").
-fn uppercase_first(word: BitArray, len: Int) -> BitArray {
+fn uppercase_first(word: BitArray) -> BitArray {
   case word {
     <<>> -> <<>>
     <<b, rest:bytes>> if b < 0xC0 -> {
@@ -752,11 +752,9 @@ fn uppercase_first(word: BitArray, len: Int) -> BitArray {
       <<new_b, rest:bits>>
     }
     <<b, c, rest:bytes>> if b < 0xE0 -> {
-      let _ = len
       <<b, int.bitwise_exclusive_or(c, 32), rest:bits>>
     }
     <<b, c, d, rest:bytes>> -> {
-      let _ = len
       <<b, c, int.bitwise_exclusive_or(d, 5), rest:bits>>
     }
     _ -> word
@@ -769,7 +767,7 @@ fn uppercase_all(word: BitArray, taken: Int, total: Int) -> BitArray {
     False -> {
       let assert Ok(head) = bit_array.slice(word, 0, taken)
       let assert Ok(tail) = bit_array.slice(word, taken, total - taken)
-      let new_tail = uppercase_first(tail, total - taken)
+      let new_tail = uppercase_first(tail)
       let step = uppercase_step(tail)
       uppercase_all(bit_array.concat([head, new_tail]), taken + step, total)
     }
