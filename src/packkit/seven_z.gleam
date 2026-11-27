@@ -3653,6 +3653,7 @@ fn decode_raw_lzma(
 fn codec_to_archive(err: codec.CodecError) -> archive.ArchiveError {
   case err {
     codec.Unsupported(feature) -> archive.Unsupported(feature: feature)
+    codec.EmptyInput -> archive.InvalidData(message: "empty codec input")
     codec.InvalidData(message) -> archive.InvalidData(message: message)
     codec.LimitExceeded(limit, actual) ->
       archive.LimitExceeded(limit: limit, actual: actual)

@@ -262,13 +262,14 @@ fn trailer_bytes(plain: BitArray) -> BitArray {
 ///
 /// A stream of several members, such as the output of `cat a.gz b.gz`,
 /// returns the header of the first member and the payloads of all
-/// members joined. Returns `InvalidData` when a header, CRC-32 or size
-/// check fails.
+/// members joined. Returns `EmptyInput` for empty input and
+/// `InvalidData` when a header, CRC-32 or size check fails.
 ///
 pub fn decode(
   bytes: BitArray,
   limits limits: limit.Limits,
 ) -> Result(Decoded, codec.CodecError) {
+  use <- bool.guard(when: bytes == <<>>, return: Error(codec.EmptyInput))
   use _ <- result.try(bytes.check_input(bytes, limits))
 
   decode_first_member_and_continue(bytes, limits)

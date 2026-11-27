@@ -29,8 +29,8 @@ import packkit/archive.{
   SevenZ, Tar, Zip,
 }
 import packkit/codec.{
-  type Codec, Brotli, Bzip2, Deflate, Gzip, Identity, LimitExceeded, Lz4, Lzw,
-  Snappy, Xz, Zlib, Zstd,
+  type Codec, Brotli, Bzip2, Deflate, EmptyInput, Gzip, Identity, LimitExceeded,
+  Lz4, Lzw, Snappy, Xz, Zlib, Zstd,
 }
 import packkit/gzip
 import packkit/internal/ar
@@ -97,7 +97,8 @@ pub fn compress(
 
 /// Decompresses `bytes` with `codec` under the default `Limits`.
 ///
-/// Returns `InvalidData` when the bytes are not a valid stream and
+/// Returns `EmptyInput` when `bytes` is empty and `codec` is not
+/// `Identity`, `InvalidData` when the bytes are not a valid stream and
 /// `LimitExceeded` when the input or output is larger than the limits.
 ///
 /// ## Examples
@@ -121,6 +122,10 @@ pub fn decompress_with_limits(
   with codec: Codec,
   limits limits: Limits,
 ) -> Result(BitArray, codec.CodecError) {
+  use <- bool.guard(
+    when: bytes == <<>> && codec != Identity,
+    return: Error(EmptyInput),
+  )
   case codec {
     Identity -> {
       let size = bit_array.byte_size(bytes)

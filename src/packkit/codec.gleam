@@ -31,6 +31,9 @@ pub type Codec {
 
 /// Errors from compressing and decompressing.
 pub type CodecError {
+  /// The input was empty. Every format except `Identity` needs at least
+  /// a header, so empty input is never a valid stream.
+  EmptyInput
   /// The bytes are not a valid stream of the requested format.
   InvalidData(message: String)
   /// The input went over one of the `Limits`.
@@ -53,6 +56,7 @@ pub type CodecError {
 ///
 pub fn error_to_string(error: CodecError) -> String {
   case error {
+    EmptyInput -> "codec: empty input"
     InvalidData(message) -> "codec: invalid data: " <> message
     LimitExceeded(limit, actual) ->
       "codec: limit "
