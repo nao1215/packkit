@@ -10,10 +10,11 @@
 
 import gleam/bit_array
 import gleam/list
+import gleam/option
+import gleam/result
 import gleeunit/should
 import metamon
 import metamon/generator
-import metamon/generator/range
 import packkit
 import packkit/archive
 import packkit/codec
@@ -32,12 +33,12 @@ import packkit/internal/zstd
 import packkit/limit
 
 fn bytes_gen() -> generator.Generator(BitArray) {
-  generator.bit_array(range.linear(0, 256))
+  generator.bit_array(generator.linear_range(from: 0, to: 256))
 }
 
 pub fn property_deflate_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "deflate",
     encode: fn(b) {
       let assert Ok(out) = deflate.encode(bytes: b)
@@ -49,7 +50,7 @@ pub fn property_deflate_round_trip_test() -> Nil {
 
 pub fn property_zlib_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "zlib",
     encode: fn(b) {
       let assert Ok(out) = zlib.encode(bytes: b)
@@ -61,7 +62,7 @@ pub fn property_zlib_round_trip_test() -> Nil {
 
 pub fn property_gzip_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "gzip",
     encode: gzip.encode_without_header,
     decode: decoder(codec.Gzip),
@@ -70,7 +71,7 @@ pub fn property_gzip_round_trip_test() -> Nil {
 
 pub fn property_lz4_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "lz4",
     encode: fn(b) {
       let assert Ok(out) = lz4.encode(bytes: b)
@@ -82,7 +83,7 @@ pub fn property_lz4_round_trip_test() -> Nil {
 
 pub fn property_snappy_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "snappy",
     encode: fn(b) {
       let assert Ok(out) = snappy.encode(bytes: b)
@@ -94,7 +95,7 @@ pub fn property_snappy_round_trip_test() -> Nil {
 
 pub fn property_bzip2_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "bzip2",
     encode: fn(b) {
       let assert Ok(out) = bzip2.encode(bytes: b)
@@ -106,7 +107,7 @@ pub fn property_bzip2_round_trip_test() -> Nil {
 
 pub fn property_lzw_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "lzw",
     encode: fn(b) {
       let assert Ok(out) = lzw.encode(bytes: b)
@@ -118,7 +119,7 @@ pub fn property_lzw_round_trip_test() -> Nil {
 
 pub fn property_xz_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "xz",
     encode: fn(b) {
       let assert Ok(out) = xz.encode(bytes: b)
@@ -130,7 +131,7 @@ pub fn property_xz_round_trip_test() -> Nil {
 
 pub fn property_zstd_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "zstd",
     encode: fn(b) {
       let assert Ok(out) = zstd.encode(bytes: b)
@@ -142,7 +143,7 @@ pub fn property_zstd_round_trip_test() -> Nil {
 
 pub fn property_brotli_round_trip_test() -> Nil {
   metamon.forall_round_trip(
-    gen: bytes_gen(),
+    generator: bytes_gen(),
     name: "brotli",
     encode: fn(b) {
       let assert Ok(out) = brotli.encode(bytes: b)
@@ -161,22 +162,22 @@ pub fn property_brotli_round_trip_test() -> Nil {
 pub fn property_deflate_preserves_length_test() -> Nil {
   metamon.forall(bytes_gen(), fn(payload) {
     let assert Ok(encoded) = deflate.encode(bytes: payload)
-    case packkit.decompress(encoded, with: codec.Deflate) {
-      Ok(decoded) ->
-        bit_array.byte_size(decoded) == bit_array.byte_size(payload)
-      _ -> False
-    }
+    assert result.map(
+        packkit.decompress(encoded, with: codec.Deflate),
+        bit_array.byte_size,
+      )
+      == Ok(bit_array.byte_size(payload))
   })
 }
 
 pub fn property_lzw_preserves_length_test() -> Nil {
   metamon.forall(bytes_gen(), fn(payload) {
     let assert Ok(encoded) = lzw.encode(bytes: payload)
-    case packkit.decompress(encoded, with: codec.Lzw) {
-      Ok(decoded) ->
-        bit_array.byte_size(decoded) == bit_array.byte_size(payload)
-      _ -> False
-    }
+    assert result.map(
+        packkit.decompress(encoded, with: codec.Lzw),
+        bit_array.byte_size,
+      )
+      == Ok(bit_array.byte_size(payload))
   })
 }
 
@@ -237,21 +238,12 @@ fn repeat(value: a, n: Int) -> List(a) {
 fn check_single_entry_recipe_round_trip(
   recipe_value: packkit.Recipe,
   body: BitArray,
-) -> Bool {
+) -> Nil {
   let arc = fixture.new(archive.Tar) |> fixture.add_file(path: "f", body: body)
 
-  case packkit.pack(arc, using: recipe_value) {
-    Ok(packed) ->
-      case packkit.unpack(packed, using: recipe_value) {
-        Ok(unpacked) ->
-          case unpacked.entries {
-            [single] -> entry.body(single) == body
-            _ -> False
-          }
-        _ -> False
-      }
-    _ -> False
-  }
+  let assert Ok(packed) = packkit.pack(arc, using: recipe_value)
+  let assert Ok(unpacked) = packkit.unpack(packed, using: recipe_value)
+  assert list.map(unpacked.entries, entry.body) == [body]
 }
 
 pub fn property_recipe_tar_gzip_round_trip_test() -> Nil {
@@ -299,18 +291,11 @@ pub fn property_recipe_zip_round_trip_test() -> Nil {
     let arc =
       fixture.new(archive.Zip)
       |> fixture.add(entry: fixture.file(path: "f", body: body))
-    case packkit.pack(arc, using: packkit.Recipe(archive.Zip, [])) {
-      Ok(packed) ->
-        case packkit.unpack(packed, using: packkit.Recipe(archive.Zip, [])) {
-          Ok(unpacked) ->
-            case unpacked.entries {
-              [single] -> entry.body(single) == body
-              _ -> False
-            }
-          _ -> False
-        }
-      _ -> False
-    }
+    let assert Ok(packed) =
+      packkit.pack(arc, using: packkit.Recipe(archive.Zip, []))
+    let assert Ok(unpacked) =
+      packkit.unpack(packed, using: packkit.Recipe(archive.Zip, []))
+    assert list.map(unpacked.entries, entry.body) == [body]
   })
 }
 
@@ -335,12 +320,8 @@ pub fn property_entry_by_path_matches_list_find_on_entries_test() -> Nil {
       arc.entries
       |> list.find(fn(e) { e.path == "a" })
 
-    case via_helper, via_list_find {
-      Ok(x), Ok(y) -> entry.body(x) == entry.body(y)
-      Ok(_), _ -> False
-      _, Ok(_) -> False
-      _, _ -> True
-    }
+    assert option.from_result(result.map(via_helper, entry.body))
+      == option.from_result(result.map(via_list_find, entry.body))
   })
 }
 

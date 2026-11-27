@@ -16,7 +16,6 @@ import gleam/option.{None}
 import gleam/string
 import metamon
 import metamon/generator.{type Generator}
-import metamon/generator/range
 import packkit
 import packkit/archive.{type Archive, type ArchiveFormat, Archive}
 import packkit/codec.{type Codec}
@@ -43,18 +42,26 @@ type Mutation {
 }
 
 fn mutation() -> Generator(Mutation) {
-  let at = generator.int(range.constant(0, 100_000))
+  let at = generator.int(generator.range(from: 0, to: 100_000))
   generator.one_of([
-    generator.map2(at, generator.byte(), Flip),
+    generator.map2(at, byte(), Flip),
     generator.map(at, Truncate),
-    generator.map2(at, generator.bit_array(range.constant(1, 8)), Insert),
+    generator.map2(
+      at,
+      generator.bit_array(bytes: generator.range(from: 1, to: 8)),
+      Insert,
+    ),
     generator.map2(
       at,
       generator.element_of([0xFFFFFFFF, 0x7FFFFFFF, 0x80000000, 0x00FFFFFF]),
       Huge,
     ),
-    generator.map2(at, generator.int(range.constant(1, 64)), Delete),
+    generator.map2(at, generator.int(generator.range(from: 1, to: 64)), Delete),
   ])
+}
+
+fn byte() -> Generator(Int) {
+  generator.int(generator.range(from: 0, to: 255))
 }
 
 fn apply(bytes: BitArray, mutation: Mutation) -> BitArray {
@@ -105,7 +112,7 @@ fn replace(bytes: BitArray, at: Int, with: BitArray) -> BitArray {
 fn mutated(seeds: List(BitArray)) -> Generator(BitArray) {
   generator.map2(
     generator.element_of(seeds),
-    generator.list_of(mutation(), range.constant(1, 4)),
+    generator.list_of(mutation(), length: generator.range(from: 1, to: 4)),
     fn(seed, mutations) { list.fold(mutations, seed, apply) },
   )
 }
@@ -119,18 +126,13 @@ fn plain_inputs() -> List(BitArray) {
   ]
 }
 
-fn limit_name_is_known(name: String) -> Bool {
-  list.contains(
-    [
-      "max_input_bytes",
-      "max_output_bytes",
-      "max_members",
-      "max_entry_name_bytes",
-      "max_entry_depth",
-    ],
-    name,
-  )
-}
+const limit_names = [
+  "max_input_bytes",
+  "max_output_bytes",
+  "max_members",
+  "max_entry_name_bytes",
+  "max_entry_depth",
+]
 
 // Codecs ----------------------------------------------------------------
 
@@ -151,11 +153,15 @@ fn fuzz_codec(codec: Codec) -> Nil {
 
 fn codec_result_keeps_limits(
   result: Result(BitArray, codec.CodecError),
-) -> Bool {
+) -> Nil {
   case result {
-    Ok(out) -> bit_array.byte_size(out) <= fuzz_limits.max_output_bytes
-    Error(codec.LimitExceeded(limit:, actual: _)) -> limit_name_is_known(limit)
-    Error(_) -> True
+    Ok(out) -> {
+      assert bit_array.byte_size(out) <= fuzz_limits.max_output_bytes
+    }
+    Error(codec.LimitExceeded(limit:, actual: _)) -> {
+      assert list.contains(limit_names, limit)
+    }
+    Error(_) -> Nil
   }
 }
 
@@ -229,24 +235,25 @@ fn fuzz_archive(format: ArchiveFormat, seeds: List(BitArray)) -> Nil {
 
 fn archive_result_keeps_limits(
   result: Result(Archive, archive.ArchiveError),
-) -> Bool {
+) -> Nil {
   case result {
     Ok(read) -> {
       let total =
         list.fold(read.entries, 0, fn(total, e) {
           total + bit_array.byte_size(entry.body(e))
         })
-      list.length(read.entries) <= fuzz_limits.max_members
-      && total <= fuzz_limits.max_output_bytes
-      && list.all(read.entries, fn(e) {
-        string.byte_size(e.path) <= fuzz_limits.max_entry_name_bytes
-        && entry.depth(e.path) <= fuzz_limits.max_entry_depth
-        && entry.check_path(e.path) == Ok(Nil)
+      assert list.length(read.entries) <= fuzz_limits.max_members
+      assert total <= fuzz_limits.max_output_bytes
+      list.each(read.entries, fn(e) {
+        assert string.byte_size(e.path) <= fuzz_limits.max_entry_name_bytes
+        assert entry.depth(e.path) <= fuzz_limits.max_entry_depth
+        assert entry.check_path(e.path) == Ok(Nil)
       })
     }
-    Error(archive.LimitExceeded(limit:, actual: _)) ->
-      limit_name_is_known(limit)
-    Error(_) -> True
+    Error(archive.LimitExceeded(limit:, actual: _)) -> {
+      assert list.contains(limit_names, limit)
+    }
+    Error(_) -> Nil
   }
 }
 
@@ -306,10 +313,9 @@ pub fn fuzz_archives_under_tiny_limits_test() -> Nil {
   [archive.Tar, archive.Cpio, archive.Ar, archive.Zip, archive.SevenZ]
   |> list.each(fn(format) {
     let bytes = written(format)
-    assert case packkit.read_with_limits(bytes, format:, limits: tiny) {
-      Error(archive.LimitExceeded(limit:, actual:)) ->
-        limit_name_is_known(limit) && actual > 1
-      _ -> False
-    }
+    let assert Error(archive.LimitExceeded(limit:, actual:)) =
+      packkit.read_with_limits(bytes, format:, limits: tiny)
+    assert list.contains(limit_names, limit)
+    assert actual > 1
   })
 }
