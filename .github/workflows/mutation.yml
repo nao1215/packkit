@@ -4,7 +4,7 @@ name: Mutation testing
 # `gleam run -m metamon/mutation`. A survivor that doc/mutation/baseline.json
 # does not list fails the job. The weekly run mutates every module; it has
 # about 3100 mutants, so it is split into 16 parts that run in parallel and a
-# job that joins them.
+# job that joins them. A part takes about 170 minutes (2026-11-27).
 
 on:
   pull_request:
@@ -78,7 +78,7 @@ jobs:
     name: Mutation testing (part ${{ matrix.part }} of 16)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
