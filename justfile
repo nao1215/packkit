@@ -69,5 +69,16 @@ all: clean deps
   @echo ""
   @echo "All checks passed."
 
+# Mutation testing of every module, failing on survivors the baseline lacks.
+# Slow (about 3100 mutants): CI runs it weekly in 16 parts.
+# The Brotli dictionary is generated data, so it is not mutated.
+mutation workers="8":
+  gleam run -m metamon/mutation -- run --workers {{workers}} --exclude src/packkit/internal/brotli_dictionary.gleam
+  gleam run -m metamon/mutation -- gate
+
+# Record build/mutation/results.json as the baseline and refresh doc/testing.md
+mutation-record:
+  gleam run -m metamon/mutation -- baseline
+
 clean:
   gleam clean
