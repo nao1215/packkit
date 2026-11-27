@@ -30,6 +30,7 @@ import gleam/order
 import gleam/result
 import packkit/codec
 import packkit/internal/bytes
+import packkit/internal/checksum
 import packkit/internal/fse
 import packkit/internal/huf
 import packkit/internal/lz77
@@ -2502,7 +2503,7 @@ fn decode_data_frame(
     limits,
     initial_block_state,
   ))
-  use rest <- result.try(consume_checksum_returning_rest(rest, checksum_flag))
+  use rest <- result.try(verify_content_checksum(rest, checksum_flag, output))
   let next_size = accumulated_size + bit_array.byte_size(output)
   case next_size > limits.max_output_bytes {
     True ->
@@ -2557,15 +2558,25 @@ fn skip_skippable_frame(
   }
 }
 
-fn consume_checksum_returning_rest(
+// RFC 8878 §3.1.1: the Content_Checksum is the low 32 bits of the
+// XXH64 (seed 0) of the frame's decompressed content, little-endian.
+fn verify_content_checksum(
   bytes: BitArray,
   checksum_flag: Bool,
+  output: BitArray,
 ) -> Result(BitArray, codec.CodecError) {
   case checksum_flag {
     False -> Ok(bytes)
     True ->
       case bytes {
-        <<_crc:bytes-size(4), rest:bytes>> -> Ok(rest)
+        <<stored:little-unsigned-size(32), rest:bytes>> -> {
+          let #(low, _high) = checksum.xxh64(output)
+          case stored == low {
+            True -> Ok(rest)
+            False ->
+              Error(codec.InvalidData(message: "zstd content checksum mismatch"))
+          }
+        }
         _ ->
           Error(codec.InvalidData(
             message: "zstd content checksum is shorter than 4 bytes",

@@ -7,6 +7,10 @@ The `Unreleased` section is the staging area for post-release changes
 
 ## Unreleased
 
+### Fixed
+
+- The Zstandard decoder now checks the Content_Checksum (the low 32 bits of XXH64 of the frame's content) when the frame sets the checksum flag. A corrupted frame returned different bytes instead of `InvalidData`.
+
 ## [0.5.1] - 2026-11-23
 
 ### Fixed

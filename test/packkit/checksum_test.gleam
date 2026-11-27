@@ -231,3 +231,37 @@ pub fn pbkdf2_hmac_sha1_rfc6070_case_4_test() -> Nil {
     0xF7, 0x21, 0xD0, 0x65, 0xA4, 0x29, 0xC1,
   >>)
 }
+
+fn counting_bytes(n: Int) -> BitArray {
+  counting_bytes_loop(0, n, <<>>)
+}
+
+fn counting_bytes_loop(i: Int, n: Int, acc: BitArray) -> BitArray {
+  case i >= n {
+    True -> acc
+    False -> counting_bytes_loop(i + 1, n, <<acc:bits, { i % 256 }>>)
+  }
+}
+
+// XXH64 with seed 0, as `#(low_u32, high_u32)`. The first three are the
+// published xxHash vectors. The counting inputs cross the 4-byte,
+// 8-byte and 32-byte paths; their low halves match the Content_Checksum
+// that `zstd --check` writes for the same bytes.
+pub fn xxh64_reference_vectors_test() -> Nil {
+  assert checksum.xxh64(<<>>) == #(0x51D8E999, 0xEF46DB37)
+  assert checksum.xxh64(<<"a">>) == #(0xA98C6E5B, 0xD24EC4F1)
+  assert checksum.xxh64(<<"abc">>) == #(0xAD770999, 0x44BC2CF5)
+  assert checksum.xxh64(counting_bytes(1)) == #(0xDB052768, 0xE934A84A)
+  assert checksum.xxh64(counting_bytes(3)) == #(0x33BC65DD, 0xE5C7BB45)
+  assert checksum.xxh64(counting_bytes(4)) == #(0x4453CC1E, 0xFFCED860)
+  assert checksum.xxh64(counting_bytes(7)) == #(0x630C72D2, 0x14CC643F)
+  assert checksum.xxh64(counting_bytes(8)) == #(0x14B81B8D, 0x884A1736)
+  assert checksum.xxh64(counting_bytes(11)) == #(0x95365ACA, 0x652A564A)
+  assert checksum.xxh64(counting_bytes(31)) == #(0x9B4D8EE1, 0xC346D2B5)
+  assert checksum.xxh64(counting_bytes(32)) == #(0x16FF32B4, 0xCBF59C51)
+  assert checksum.xxh64(counting_bytes(33)) == #(0xCAFB8EAD, 0x0C535D1A)
+  assert checksum.xxh64(counting_bytes(63)) == #(0xA95F8E4F, 0xE26AA9E2)
+  assert checksum.xxh64(counting_bytes(64)) == #(0xDB6713F0, 0xF7C67301)
+  assert checksum.xxh64(counting_bytes(100)) == #(0x32166597, 0x6AC1E580)
+  assert checksum.xxh64(counting_bytes(1000)) == #(0x0EBA4078, 0x6EF436B0)
+}

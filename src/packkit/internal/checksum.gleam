@@ -300,6 +300,226 @@ fn mod(value: Int, divisor: Int) -> Int {
   value - { value / divisor } * divisor
 }
 
+// -- XXH64 --------------------------------------------------------------
+
+// A 64-bit value split into two unsigned 32-bit halves, so every
+// intermediate stays below 2^53 and the arithmetic is exact on the
+// JavaScript target.
+type U64 {
+  U64(high: Int, low: Int)
+}
+
+const xxh64_prime1 = U64(high: 0x9E3779B1, low: 0x85EBCA87)
+
+const xxh64_prime2 = U64(high: 0xC2B2AE3D, low: 0x27D4EB4F)
+
+const xxh64_prime3 = U64(high: 0x165667B1, low: 0x9E3779F9)
+
+const xxh64_prime4 = U64(high: 0x85EBCA77, low: 0xC2B2AE63)
+
+const xxh64_prime5 = U64(high: 0x27D4EB2F, low: 0x165667C5)
+
+// prime1 + prime2 and 0 - prime1, modulo 2^64: the seed-0 start values
+// of the first and fourth accumulators.
+const xxh64_lane1_seed = U64(high: 0x60EA27EE, low: 0xADC0B5D6)
+
+const xxh64_lane4_seed = U64(high: 0x61C8864E, low: 0x7A143579)
+
+/// Compute the XXH64 hash of `data` with seed 0, the hash the
+/// Zstandard frame format (RFC 8878 §3.1.1) stores the low 32 bits of
+/// as its Content_Checksum.
+///
+/// Like `crc64_xz`, the result is a `#(low_u32, high_u32)` pair so it
+/// stays exact on the JavaScript target.
+pub fn xxh64(data data: BitArray) -> #(Int, Int) {
+  let total = bit_array.byte_size(data)
+  let #(acc, tail) = case total >= 32 {
+    True ->
+      xxh64_stripes(
+        data,
+        xxh64_lane1_seed,
+        xxh64_prime2,
+        U64(high: 0, low: 0),
+        xxh64_lane4_seed,
+      )
+    False -> #(xxh64_prime5, data)
+  }
+  let length = U64(high: total / 0x1_0000_0000, low: total % 0x1_0000_0000)
+  let hash = xxh64_avalanche(xxh64_tail(tail, u64_add(acc, length)))
+  #(hash.low, hash.high)
+}
+
+// Consumes 32-byte stripes into four accumulators, then merges them.
+fn xxh64_stripes(
+  data: BitArray,
+  v1: U64,
+  v2: U64,
+  v3: U64,
+  v4: U64,
+) -> #(U64, BitArray) {
+  case data {
+    <<
+      a_low:size(32)-little,
+      a_high:size(32)-little,
+      b_low:size(32)-little,
+      b_high:size(32)-little,
+      c_low:size(32)-little,
+      c_high:size(32)-little,
+      d_low:size(32)-little,
+      d_high:size(32)-little,
+      rest:bytes,
+    >> ->
+      xxh64_stripes(
+        rest,
+        xxh64_round(v1, U64(high: a_high, low: a_low)),
+        xxh64_round(v2, U64(high: b_high, low: b_low)),
+        xxh64_round(v3, U64(high: c_high, low: c_low)),
+        xxh64_round(v4, U64(high: d_high, low: d_low)),
+      )
+    _ -> {
+      let merged =
+        u64_add(
+          u64_add(u64_rotl(v1, 1), u64_rotl(v2, 7)),
+          u64_add(u64_rotl(v3, 12), u64_rotl(v4, 18)),
+        )
+        |> xxh64_merge(v1)
+        |> xxh64_merge(v2)
+        |> xxh64_merge(v3)
+        |> xxh64_merge(v4)
+      #(merged, data)
+    }
+  }
+}
+
+fn xxh64_round(acc: U64, lane: U64) -> U64 {
+  u64_mul(u64_rotl(u64_add(acc, u64_mul(lane, xxh64_prime2)), 31), xxh64_prime1)
+}
+
+fn xxh64_merge(acc: U64, lane: U64) -> U64 {
+  let mixed = u64_xor(acc, xxh64_round(U64(high: 0, low: 0), lane))
+  u64_add(u64_mul(mixed, xxh64_prime1), xxh64_prime4)
+}
+
+fn xxh64_tail(data: BitArray, hash: U64) -> U64 {
+  case data {
+    <<low:size(32)-little, high:size(32)-little, rest:bytes>> -> {
+      let lane = xxh64_round(U64(high: 0, low: 0), U64(high: high, low: low))
+      let next =
+        u64_add(
+          u64_mul(u64_rotl(u64_xor(hash, lane), 27), xxh64_prime1),
+          xxh64_prime4,
+        )
+      xxh64_tail(rest, next)
+    }
+    <<word:size(32)-little, rest:bytes>> -> {
+      let lane = u64_mul(U64(high: 0, low: word), xxh64_prime1)
+      let next =
+        u64_add(
+          u64_mul(u64_rotl(u64_xor(hash, lane), 23), xxh64_prime2),
+          xxh64_prime3,
+        )
+      xxh64_tail(rest, next)
+    }
+    <<byte, rest:bytes>> -> {
+      let lane = u64_mul(U64(high: 0, low: byte), xxh64_prime5)
+      let next = u64_mul(u64_rotl(u64_xor(hash, lane), 11), xxh64_prime1)
+      xxh64_tail(rest, next)
+    }
+    _ -> hash
+  }
+}
+
+fn xxh64_avalanche(hash: U64) -> U64 {
+  let hash = u64_mul(u64_xor(hash, u64_shr(hash, 33)), xxh64_prime2)
+  let hash = u64_mul(u64_xor(hash, u64_shr(hash, 29)), xxh64_prime3)
+  u64_xor(hash, u64_shr(hash, 32))
+}
+
+fn u64_add(a: U64, b: U64) -> U64 {
+  let low = a.low + b.low
+  U64(
+    high: int.bitwise_and(a.high + b.high + low / 0x1_0000_0000, u32_mask),
+    low: int.bitwise_and(low, u32_mask),
+  )
+}
+
+fn u64_xor(a: U64, b: U64) -> U64 {
+  U64(
+    high: int.bitwise_exclusive_or(a.high, b.high),
+    low: int.bitwise_exclusive_or(a.low, b.low),
+  )
+}
+
+// Rotates left by 1 to 63 bits.
+fn u64_rotl(value: U64, by: Int) -> U64 {
+  case by >= 32 {
+    True -> u64_rotl_small(U64(high: value.low, low: value.high), by - 32)
+    False -> u64_rotl_small(value, by)
+  }
+}
+
+fn u64_rotl_small(value: U64, by: Int) -> U64 {
+  case by {
+    0 -> value
+    _ ->
+      U64(
+        high: int.bitwise_or(
+          shift_left_u32(value.high, by),
+          int.bitwise_shift_right(value.low, 32 - by),
+        ),
+        low: int.bitwise_or(
+          shift_left_u32(value.low, by),
+          int.bitwise_shift_right(value.high, 32 - by),
+        ),
+      )
+  }
+}
+
+// Shifts right by 1 to 63 bits.
+fn u64_shr(value: U64, by: Int) -> U64 {
+  use <- bool.guard(
+    when: by >= 32,
+    return: U64(high: 0, low: int.bitwise_shift_right(value.high, by - 32)),
+  )
+  U64(
+    high: int.bitwise_shift_right(value.high, by),
+    low: int.bitwise_or(
+      int.bitwise_shift_right(value.low, by),
+      shift_left_u32(value.high, 32 - by),
+    ),
+  )
+}
+
+// `value << by` truncated to 32 bits, masking first so the shifted
+// value never leaves the safe-integer range.
+fn shift_left_u32(value: Int, by: Int) -> Int {
+  let kept = int.bitwise_and(value, int.bitwise_shift_right(u32_mask, by))
+  int.bitwise_shift_left(kept, by)
+}
+
+fn u64_mul(a: U64, b: U64) -> U64 {
+  let #(high, low) = u32_mul_wide(a.low, b.low)
+  let #(_, cross1) = u32_mul_wide(a.high, b.low)
+  let #(_, cross2) = u32_mul_wide(a.low, b.high)
+  U64(high: int.bitwise_and(high + cross1 + cross2, u32_mask), low: low)
+}
+
+// The full 64-bit product of two unsigned 32-bit values as
+// `#(high, low)`, built from 16-bit halves.
+fn u32_mul_wide(a: Int, b: Int) -> #(Int, Int) {
+  let a_low = int.bitwise_and(a, 0xFFFF)
+  let a_high = int.bitwise_shift_right(a, 16)
+  let b_low = int.bitwise_and(b, 0xFFFF)
+  let b_high = int.bitwise_shift_right(b, 16)
+  let middle = a_low * b_high + a_high * b_low
+  let low_sum = a_low * b_low + int.bitwise_and(middle, 0xFFFF) * 0x1_0000
+  let carry = low_sum / 0x1_0000_0000
+  #(
+    int.bitwise_and(a_high * b_high + middle / 0x1_0000 + carry, u32_mask),
+    int.bitwise_and(low_sum, u32_mask),
+  )
+}
+
 // -- SHA-256 (FIPS 180-4) -----------------------------------------------
 
 /// Opaque incremental SHA-256 state.  Built via `sha256_init`,
