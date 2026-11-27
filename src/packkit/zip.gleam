@@ -2101,6 +2101,8 @@ fn codec_to_archive_error(
   path: String,
 ) -> archive.ArchiveError {
   case err {
+    codec.EmptyInput ->
+      archive.EntryRejected(path: path, reason: "deflate data is empty")
     codec.InvalidData(message) ->
       archive.EntryRejected(
         path: path,

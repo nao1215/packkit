@@ -10,6 +10,7 @@ The `Unreleased` section is the staging area for post-release changes
 ### Fixed
 
 - The Zstandard decoder now checks the Content_Checksum (the low 32 bits of XXH64 of the frame's content) when the frame sets the checksum flag. A corrupted frame returned different bytes instead of `InvalidData`.
+- `packkit.decompress` and `gzip.decode` return the new `codec.EmptyInput` error for empty input with every codec except `Identity`, instead of `InvalidData` with a different truncation message per format such as `"gzip header truncated"`. Code that matches every `CodecError` variant needs an arm for `EmptyInput`.
 
 ## [0.5.1] - 2026-11-23
 
