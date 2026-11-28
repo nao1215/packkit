@@ -27,18 +27,42 @@
 
 ## Mutation testing
 
-There is no mutation testing tool for Gleam, so `gleam_mutate.py` (from the mutation-testing lab in nao1215/debimate, with integer comparison and arithmetic operators added) is run by hand on a copy of the project. It rewrites one operator or boolean result at a time (`==`/`!=`, `<`/`<=`, `>`/`>=`, `+`/`-`, `&&`/`||`, `-> True`/`-> False`, a dropped `!`) and runs `gleam test` on the Erlang target. The score is killed / (killed + lived).
+`gleam run -m metamon/mutation -- run` changes one operator, `!` or boolean literal in a module under `src/` at a time and runs `gleam test --target erlang` on each change; `gleam run -m metamon/mutation -- gate` then fails on a survivor that `doc/mutation/baseline.json` does not list. `src/packkit/internal/brotli_dictionary.gleam`, a generated table, is left out. `.github/workflows/mutation.yml` mutates the modules a pull request or push changes and runs the gate; the weekly run mutates every module in 16 parts that take about 170 minutes each. `just mutation` and `just mutation-record` run the same steps locally.
 
-packkit has about 3000 mutants and the suite takes about 40 seconds, so the run is limited to the modules the reference differential test covers (`deflate`, `zlib`, `gzip`, `checksum`, 410 mutants) and to the tests that exercise them (`checksum_test`, `deflate_*`, `gzip_*`, `zlib_*`, `property_test`, `stream_test` and `packkit_reference_differential_test`).
+The baseline comes from the first full run on CI (2026-11-28, run 46076770221). To record a new one, download the `mutation-results` artifact of a weekly run to `build/mutation/results.json` and run `just mutation-record`, which also rewrites the table below. A loaded machine can time out tests that pass on CI, so record the baseline from a CI run.
 
-| Date | Files | Killed | Lived | Score |
-|---|---|---:|---:|---:|
-| 2026-11-19 | `deflate`, `zlib`, `gzip`, `checksum`, before the reference differential test | 238 | 172 | 58.0% |
-| 2026-11-19 | the same, with the random-input differential tests | 253 | 157 | 61.7% |
-| 2026-11-19 | the same, plus the distance and length code boundaries | 286 | 124 | 69.8% |
-
-The random inputs repeat phrases at only a few distances, so the encoder's distance-code table kept 34 survivors until `deflate_handles_every_distance_and_length_code_boundary_test` planted a match at the first and last distance of every bucket. The remaining survivors, grouped:
-
-- `deflate` (99): the LZ77 match finder (`collect_lz77_tokens`, `emit_lz77`, `insert_hashes_in_range`), where a weaker search still emits a valid, only larger, stream; redundant lower-bound guards in the code tables that earlier arms already exclude; and decoder paths for malformed dynamic headers.
-- `gzip` (18): validation of header extra subfields and modification times at their limits, and multi-member limits.
-- `checksum` (4) and `zlib` (3): Adler-32's 5552-byte batching, which only matters for longer inputs, and limit checks at exactly the limit.
+<!-- mutation:start -->
+| Module | Killed | Lived | Timed out | Score |
+|---|---:|---:|---:|---:|
+| `packkit` | 17 | 4 | 0 | 81.0% |
+| `packkit/archive` | 1 | 0 | 0 | 100.0% |
+| `packkit/gzip` | 15 | 13 | 0 | 53.6% |
+| `packkit/internal/aes` | 12 | 1 | 0 | 92.3% |
+| `packkit/internal/ar` | 16 | 15 | 0 | 51.6% |
+| `packkit/internal/bcj` | 65 | 95 | 0 | 40.6% |
+| `packkit/internal/bcj2` | 14 | 13 | 0 | 51.9% |
+| `packkit/internal/brotli` | 237 | 166 | 0 | 58.8% |
+| `packkit/internal/brotli_context` | 3 | 0 | 0 | 100.0% |
+| `packkit/internal/brotli_transform` | 1 | 11 | 0 | 8.3% |
+| `packkit/internal/bytes` | 12 | 7 | 0 | 63.2% |
+| `packkit/internal/bzip2` | 150 | 55 | 1 | 73.3% |
+| `packkit/internal/checksum` | 56 | 7 | 0 | 88.9% |
+| `packkit/internal/cpio` | 37 | 11 | 0 | 77.1% |
+| `packkit/internal/deflate` | 282 | 78 | 0 | 78.3% |
+| `packkit/internal/entry` | 8 | 3 | 0 | 72.7% |
+| `packkit/internal/fse` | 52 | 12 | 0 | 81.3% |
+| `packkit/internal/huf` | 63 | 22 | 0 | 74.1% |
+| `packkit/internal/lz4` | 27 | 29 | 0 | 48.2% |
+| `packkit/internal/lz77` | 27 | 21 | 0 | 56.3% |
+| `packkit/internal/lzma` | 192 | 52 | 3 | 78.9% |
+| `packkit/internal/lzw` | 35 | 35 | 0 | 50.0% |
+| `packkit/internal/snappy` | 22 | 43 | 0 | 33.8% |
+| `packkit/internal/tar` | 38 | 23 | 0 | 62.3% |
+| `packkit/internal/xxh32` | 10 | 0 | 0 | 100.0% |
+| `packkit/internal/xz` | 73 | 20 | 0 | 78.5% |
+| `packkit/internal/zlib` | 9 | 0 | 0 | 100.0% |
+| `packkit/internal/zstd` | 113 | 244 | 0 | 31.7% |
+| `packkit/seven_z` | 156 | 112 | 0 | 58.2% |
+| `packkit/zip` | 109 | 158 | 0 | 40.8% |
+| all | 1852 | 1250 | 4 | 59.8% |
+<!-- mutation:end -->
