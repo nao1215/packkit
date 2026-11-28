@@ -77,6 +77,9 @@ mutation workers="8":
   gleam run -m metamon/mutation -- gate
 
 # Record build/mutation/results.json as the baseline and refresh doc/testing.md
+coverage:
+  gleam run -m metamon/mutation -- coverage
+
 mutation-record:
   gleam run -m metamon/mutation -- baseline
 

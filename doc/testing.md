@@ -25,6 +25,10 @@
 
 `.github/workflows/nightly-property.yml` runs the whole suite ten times with `METAMON_RUNS_MULTIPLIER=10`, each pass with a new seed. A failure report prints its seed, so the case can be replayed with `metamon.Config(..metamon.default_config(), seed: Some(seed))` and kept as a regression test.
 
+## Coverage
+
+`gleam run -m metamon/mutation -- coverage` runs the Erlang tests with every module under `src/` measured by Erlang's `cover` and writes `build/coverage/lcov.info` with the line numbers of the Gleam source. It needs Gleam 1.19 or later, newer than the 1.14 lane of CI. `.github/workflows/coverage.yml` runs it on pull requests and pushes to main and reports it with octocov; the badge comes from nao1215/octocovs-central-repo. `just coverage` runs it locally. On 2026-11-28 it reached 83.6% of lines (8229 of 9846).
+
 ## Mutation testing
 
 `gleam run -m metamon/mutation -- run` changes one operator, `!` or boolean literal in a module under `src/` at a time and runs `gleam test --target erlang` on each change; `gleam run -m metamon/mutation -- gate` then fails on a survivor that `doc/mutation/baseline.json` does not list. `src/packkit/internal/brotli_dictionary.gleam`, a generated table, is left out. `.github/workflows/mutation.yml` mutates the modules a pull request or push changes and runs the gate; the weekly run mutates every module in 16 parts that take about 170 minutes each. `just mutation` and `just mutation-record` run the same steps locally.
